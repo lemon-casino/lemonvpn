@@ -183,7 +183,7 @@ async fn run_job(
     } else {
         "[::]:0".parse().expect("valid bind address")
     };
-    let socket = UdpSocket::bind(local)?;
+    let socket = bind_socket(local)?;
     let crypto =
         quinn::crypto::rustls::QuicClientConfig::try_from(crate::tls::quic_config(insecure))
             .map_err(|_| invalid("QUIC TLS 配置无效"))?;
@@ -314,6 +314,18 @@ async fn authenticate(
 /// Auth request: HEADERS frame for `POST https://hysteria/auth` with the
 /// password in `hysteria-auth` (protocol/http.go:8-10); advertised receive
 /// bandwidth "0" = unset, which the official server treats as unlimited.
+/// TUN 模式下 UDP 出站绑定物理网卡,避免回流进隧道。
+fn bind_socket(local: SocketAddr) -> io::Result<UdpSocket> {
+    #[cfg(windows)]
+    {
+        crate::tun::bind_udp_physical(local)
+    }
+    #[cfg(not(windows))]
+    {
+        UdpSocket::bind(local)
+    }
+}
+
 fn auth_request_frame(password: &str) -> Vec<u8> {
     let padding = random_padding(AUTH_PADDING_MIN, AUTH_PADDING_MAX);
     let section = qpack_encode_request_fields(&[

@@ -60,13 +60,25 @@ pub fn dial(host: &str, port: u16) -> io::Result<TcpStream> {
     );
 
     for addr in addrs {
-        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+        match dial_physical(addr) {
             Ok(stream) => return Ok(stream),
             Err(err) => last = err,
         }
     }
 
     Err(last)
+}
+
+/// TUN 模式开启时,引擎自身的拨号绑定物理网卡,避免回流进隧道。
+fn dial_physical(addr: SocketAddr) -> io::Result<TcpStream> {
+    #[cfg(windows)]
+    {
+        crate::tun::connect_physical(addr, CONNECT_TIMEOUT)
+    }
+    #[cfg(not(windows))]
+    {
+        TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+    }
 }
 
 /// Reads a request header block up to and including the terminating CRLFCRLF.

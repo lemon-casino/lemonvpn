@@ -21,6 +21,13 @@ sha3 = "0.10"
 # blocking std IO through a loopback socket pair.
 tokio = { version = "1", default-features = false, features = ["rt", "sync", "net", "io-util", "time"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# TUN mode: user-space TCP termination (smoltcp) over a wintun adapter, and
+# outbound sockets bound to the physical interface to avoid routing loops.
+smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
+socket2 = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+wintun = "0.5"
 
 [dev-dependencies]
 # Self-signed certificates for the local TLS test servers.

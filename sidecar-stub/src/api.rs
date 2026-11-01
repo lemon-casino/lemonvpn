@@ -209,6 +209,18 @@ pub fn handle(
                 Err((status, code, message)) => error(&mut client, status, code, &message, cors),
             };
         }
+        ("POST", "/api/v1/tun/set") => {
+            let body = match read_body(&mut client, headers) {
+                Ok(body) => body,
+                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
+            };
+            return match tun_set(&body) {
+                Ok(body) => {
+                    http::respond_with(&mut client, 200, &body, &format!("{CACHE_HEADERS}{cors}"))
+                }
+                Err((status, code, message)) => error(&mut client, status, code, &message, cors),
+            };
+        }
         ("DELETE", path) if path.starts_with("/api/v1/providers/") => {
             let id = share::percent_decode(&path["/api/v1/providers/".len()..]);
             return http::respond_with(
@@ -289,6 +301,7 @@ pub fn handle(
         "/api/v1/capabilities" => capabilities(),
         "/api/v1/runtime" => runtime(),
         "/api/v1/datapath" => datapath(),
+        "/api/v1/tun" => tun_status_body(),
         "/api/v1/runtime/traffic/history" => match history(query) {
             Ok(body) => body,
             Err(message) => return error(&mut client, 400, "invalid_request", message, cors),
@@ -456,7 +469,7 @@ fn version() -> String {
 
 fn capabilities() -> String {
     format!(
-        r#"{{"observed_at":"{observed}","profiles":["base"],"limits":{{"max_request_target_bytes":8192,"max_header_bytes":16384,"max_json_body_bytes":1048576}},"resources":{{"runtime":{{"available":true}},"traffic_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"datapath":{{"available":true,"kinds":["userspace"],"details":[]}},"connections":{{"available":true,"can_close":false}},"config":{{"available":true,"writable":true,"create":false,"max_bytes":{max_bytes},"max_sources":1}},"config_validate":{{"available":true,"modes":["syntax"],"max_bytes":{max_bytes},"max_sources":1}},"runtime_memory":{{"available":true,"metrics":["process.rss_bytes"]}},"runtime_outbounds":{{"available":true}},"memory_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"rules":{{"available":true,"max_rules":{max_bytes}}},"flows":{{"available":true,"recording":"on","scopes":["userspace_tcp"],"max_flows":{max_flows},"max_steps_per_flow":1,"retention_seconds":{retention},"snapshot_ttl_seconds":30,"max_page_size":1000}},"nodes":{{"available":true,"can_manage":true}},{providers},"groups":{{"available":true,"config_patch":false,"selection":false,"max_patch_operations":0}},{dns},{probes},"events":{events},"logs":{logs}}}}}"#,
+        r#"{{"observed_at":"{observed}","profiles":["base"],"limits":{{"max_request_target_bytes":8192,"max_header_bytes":16384,"max_json_body_bytes":1048576}},"resources":{{"runtime":{{"available":true}},"traffic_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"datapath":{{"available":true,"kinds":["userspace"],"details":[]}},"connections":{{"available":true,"can_close":false}},"config":{{"available":true,"writable":true,"create":false,"max_bytes":{max_bytes},"max_sources":1}},"config_validate":{{"available":true,"modes":["syntax"],"max_bytes":{max_bytes},"max_sources":1}},"runtime_memory":{{"available":true,"metrics":["process.rss_bytes"]}},"runtime_outbounds":{{"available":true}},"memory_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"rules":{{"available":true,"max_rules":{max_bytes}}},"flows":{{"available":true,"recording":"on","scopes":["userspace_tcp"],"max_flows":{max_flows},"max_steps_per_flow":1,"retention_seconds":{retention},"snapshot_ttl_seconds":30,"max_page_size":1000}},"nodes":{{"available":true,"can_manage":true}},{tun},{providers},"groups":{{"available":true,"config_patch":false,"selection":false,"max_patch_operations":0}},{dns},{probes},"events":{events},"logs":{logs}}}}}"#,
         observed = state::iso8601(SystemTime::now()),
         window = state::WINDOW_SECONDS,
         points = state::MAX_POINTS,
@@ -464,11 +477,64 @@ fn capabilities() -> String {
         max_flows = flows::MAX_FLOWS,
         retention = flows::RETENTION.as_secs(),
         providers = providers::capabilities_json(),
+        tun = tun_capability(),
         dns = dns::capabilities_json(),
         probes = probes::capabilities_json(),
         events = events_capability(),
         logs = logs_capability(),
     )
+}
+
+/// TUN 模式仅存在于 Windows;状态与能力都如实上报。
+#[cfg(windows)]
+fn tun_status_body() -> String {
+    crate::tun::status_json()
+}
+
+#[cfg(not(windows))]
+fn tun_status_body() -> String {
+    r#"{"enabled":false,"supported":false}"#.to_owned()
+}
+
+#[cfg(windows)]
+fn tun_capability() -> String {
+    format!(
+        r#"{{"available":true,"enabled":{},"udp":"dns_only"}}"#,
+        crate::tun::active()
+    )
+}
+
+#[cfg(not(windows))]
+fn tun_capability() -> String {
+    r#"{"available":false}"#.to_owned()
+}
+
+/// 应一次 TUN 开关请求,返回响应体或 (status, code, message)。
+#[cfg(windows)]
+fn tun_set(body: &str) -> Result<String, (u16, &'static str, String)> {
+    let enabled = match json::bool_field(body, "enabled") {
+        Ok(Some(value)) => value,
+        Ok(None) => return Err((400, "invalid_request", "缺少 enabled 布尔字段".to_owned())),
+        Err(message) => return Err((400, "invalid_request", message)),
+    };
+    let result = if enabled {
+        crate::tun::enable()
+    } else {
+        crate::tun::disable()
+    };
+    match result {
+        Ok(()) => Ok(crate::tun::status_json()),
+        Err(err) => Err((500, "internal_error", err.to_string())),
+    }
+}
+
+#[cfg(not(windows))]
+fn tun_set(_body: &str) -> Result<String, (u16, &'static str, String)> {
+    Err((
+        501,
+        "unsupported_operation",
+        "TUN 模式仅支持 Windows".to_owned(),
+    ))
 }
 
 fn read_body(client: &mut TcpStream, headers: &str) -> Result<String, String> {

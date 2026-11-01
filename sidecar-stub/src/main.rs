@@ -32,6 +32,8 @@ mod socks5;
 mod state;
 mod tls;
 mod trojan;
+#[cfg(windows)]
+mod tun;
 mod tunnel;
 mod vless;
 mod vmess;
