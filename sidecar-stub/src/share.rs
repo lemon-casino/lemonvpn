@@ -228,7 +228,7 @@ fn host_port(value: &str) -> Result<(String, u16), String> {
     Ok((host, port))
 }
 
-fn query_params(query: &str) -> BTreeMap<String, String> {
+pub(crate) fn query_params(query: &str) -> BTreeMap<String, String> {
     query
         .split('&')
         .filter(|pair| !pair.is_empty())

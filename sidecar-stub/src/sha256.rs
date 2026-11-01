@@ -13,10 +13,39 @@ const K: [u32; 64] = [
 ];
 
 pub fn digest(data: &[u8]) -> [u8; 32] {
-    let mut state: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-    ];
+    digest_with(
+        data,
+        [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ],
+    )
+}
 
+/// SHA-224: SHA-256 with a different initial state, truncated to 28 bytes.
+/// Trojan keys its challenge with `hex(sha224(password))`.
+pub fn sha224(data: &[u8]) -> [u8; 28] {
+    let full = digest_with(
+        data,
+        [
+            0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7,
+            0xbefa4fa4,
+        ],
+    );
+    let mut out = [0u8; 28];
+    out.copy_from_slice(&full[..28]);
+    out
+}
+
+pub fn sha224_hex(data: &[u8]) -> String {
+    let mut out = String::with_capacity(56);
+    for byte in sha224(data) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn digest_with(data: &[u8], mut state: [u32; 8]) -> [u8; 32] {
     let mut message = data.to_vec();
     let bit_len = (data.len() as u64).wrapping_mul(8);
     message.push(0x80);
@@ -84,7 +113,7 @@ pub fn hex(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::hex;
+    use super::{hex, sha224_hex};
 
     #[test]
     fn matches_known_vectors() {
@@ -99,6 +128,22 @@ mod tests {
         assert_eq!(
             hex(b"The quick brown fox jumps over the lazy dog"),
             "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
+        );
+    }
+
+    #[test]
+    fn sha224_matches_known_vectors() {
+        assert_eq!(
+            sha224_hex(b""),
+            "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"
+        );
+        assert_eq!(
+            sha224_hex(b""),
+            "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"
+        );
+        assert_eq!(
+            sha224_hex(b"abc"),
+            "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7"
         );
     }
 }
