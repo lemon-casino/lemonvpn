@@ -5,3 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+# Subscriptions are fetched over HTTPS and the TLS-based outbounds (VLESS/Trojan/
+# Shadowsocks) need the same client. Everything else stays std-only.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+webpki-roots = "0.26"

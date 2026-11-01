@@ -107,11 +107,19 @@ pub struct Diagnostic {
 #[derive(Clone, Debug)]
 pub struct Node {
     pub name: String,
-    pub protocol: &'static str,
+    pub protocol: String,
     pub host: String,
     pub port: u16,
     pub username: Option<String>,
     pub password: Option<String>,
+    /// The share link a provider or inline node was parsed from. The protocol
+    /// outbounds re-parse it for transport details this struct does not model.
+    #[allow(dead_code)]
+    pub link: Option<String>,
+    /// The provider that owns this node; `None` for nodes from `config.dae`.
+    pub provider: Option<String>,
+    /// The subscription tag shown as the node's source.
+    pub subscription_tag: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,13 +171,7 @@ pub struct Upstream {
 pub enum Target {
     Direct,
     Block,
-    Socks5 {
-        name: String,
-        host: String,
-        port: u16,
-        username: Option<String>,
-        password: Option<String>,
-    },
+    Node(Box<Node>),
 }
 
 pub struct Config {
@@ -269,6 +271,21 @@ pub fn refresh() {
     );
 }
 
+/// Rebuilds the accepted snapshot after the provider store changed. The source
+/// file, its digest and the revision stay as they were.
+pub fn reload_providers() {
+    let mut config = current();
+    let content = config.content.clone();
+    let modified = config.modified;
+    *config = build(content, modified);
+}
+
+/// Every node name the merged configuration currently offers.
+pub fn node_names() -> Vec<String> {
+    refresh();
+    current().nodes.iter().map(|node| node.name.clone()).collect()
+}
+
 /// The first matching rule, or the fallback. Reads the accepted snapshot.
 pub fn decide(host: &str) -> Decision {
     refresh();
@@ -309,16 +326,7 @@ fn resolve_outbound(
         _ => {}
     }
     if let Some(node) = config.nodes.iter().find(|node| node.name == name) {
-        return Some((
-            Target::Socks5 {
-                name: node.name.clone(),
-                host: node.host.clone(),
-                port: node.port,
-                username: node.username.clone(),
-                password: node.password.clone(),
-            },
-            vec![node.name.clone()],
-        ));
+        return Some((Target::Node(Box::new(node.clone())), vec![node.name.clone()]));
     }
     let group = config.groups.iter().find(|group| group.name == name)?;
     if visiting.iter().any(|seen| seen == name) {
@@ -588,6 +596,13 @@ fn nodes_body(config: &Config, group_id: Option<&str>) -> String {
     )
 }
 
+fn optional(value: &Option<String>) -> String {
+    value
+        .as_deref()
+        .map(json::quoted)
+        .unwrap_or_else(|| "null".to_owned())
+}
+
 fn node_entry(node: &Node, groups: &[&Group]) -> String {
     let group_ids = groups
         .iter()
@@ -595,10 +610,12 @@ fn node_entry(node: &Node, groups: &[&Group]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        r#"{{"id":"node-{}","name":"{}","protocol":"{}","stream_transport":"tcp","subscription_tag":null,"provider_id":null,"group_ids":[{}],"health":{}}}"#,
+        r#"{{"id":"node-{}","name":"{}","protocol":"{}","stream_transport":"tcp","subscription_tag":{},"provider_id":{},"group_ids":[{}],"health":{}}}"#,
         json::escape(&node.name),
         json::escape(&node.name),
-        node.protocol,
+        json::escape(&node.protocol),
+        optional(&node.subscription_tag),
+        optional(&node.provider),
         group_ids,
         crate::probes::health_json(&format!("node-{}", node.name))
     )
@@ -724,12 +741,16 @@ fn group_body(config: &Config, id: &str) -> Option<String> {
     ))
 }
 
-fn config_path() -> PathBuf {
-    let directory = match std::env::var_os("LEMONVPN_DATA_DIR") {
+/// Where the source, the provider store and the other state files live.
+pub fn data_dir() -> PathBuf {
+    match std::env::var_os("LEMONVPN_DATA_DIR") {
         Some(directory) => PathBuf::from(directory),
         None => default_data_dir(),
-    };
-    directory.join(SOURCE_PATH)
+    }
+}
+
+fn config_path() -> PathBuf {
+    data_dir().join(SOURCE_PATH)
 }
 
 fn default_data_dir() -> PathBuf {
@@ -786,6 +807,11 @@ enum Ctx {
 fn build(content: String, modified: Option<SystemTime>) -> Config {
     let sha256 = sha256::hex(content.as_bytes());
     let mut parsed = parse(&content);
+    // Provider nodes join the same table as the source's own nodes, so group
+    // filters and routing see one flat roster. The source file and its digest
+    // are untouched; the merged view is what every reader gets.
+    let names: Vec<String> = parsed.nodes.iter().map(|node| node.name.clone()).collect();
+    parsed.nodes.extend(crate::providers::nodes(&names));
     let fallback = match parsed.fallback.take() {
         Some(rule) => rule,
         None => {
@@ -1174,11 +1200,14 @@ fn parse_node_line(text: &str, line: u32, parsed: &mut Parsed) {
     match parse_node_url(&value) {
         Ok((host, port, username, password)) => parsed.nodes.push(Node {
             name: name.to_owned(),
-            protocol: "socks5",
+            protocol: "socks5".to_owned(),
             host,
             port,
             username,
             password,
+            link: None,
+            provider: None,
+            subscription_tag: None,
         }),
         Err(message) => parsed.diagnostics.push(diagnostic(line, "node_url", message)),
     }
@@ -1500,7 +1529,7 @@ mod tests {
         let decision = super::decide_from(&config, "www.example.com");
         assert_eq!(decision.outbound, "proxy");
         assert_eq!(decision.chain, vec!["edge"]);
-        assert!(matches!(decision.target, Target::Socks5 { ref host, port: 1080, .. } if host == "10.0.0.2"));
+        assert!(matches!(&decision.target, Target::Node(node) if node.host == "10.0.0.2" && node.port == 1080));
     }
 
     #[test]

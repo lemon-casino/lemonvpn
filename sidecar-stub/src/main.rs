@@ -8,10 +8,12 @@
 //! [`proxy::dial`] later; the inbound side stays the same.
 
 mod api;
+mod base64;
 mod config;
 mod connections;
 mod dns;
 mod events;
+mod fetch;
 mod flows;
 mod http;
 mod json;
@@ -19,7 +21,9 @@ mod logs;
 mod outbound;
 mod outbounds;
 mod probes;
+mod providers;
 mod proxy;
+mod share;
 mod sha256;
 mod socks5;
 mod state;
@@ -44,6 +48,7 @@ fn main() {
     // Uptime counts from here, not from the first API read.
     state::started();
     config::start();
+    providers::start();
     let port = port_from_env();
 
     let listener = match TcpListener::bind((BIND_ADDR, port)) {

@@ -21,6 +21,8 @@ use crate::json;
 use crate::logs::{self, Level};
 use crate::outbounds;
 use crate::probes;
+use crate::providers;
+use crate::share;
 use crate::state;
 use crate::state::Sample;
 
@@ -178,6 +180,71 @@ pub fn handle(
                 Err(message) => error(&mut client, 500, "internal_error", &message, cors),
             };
         }
+        ("POST", "/api/v1/providers") => {
+            let body = match read_body(&mut client, headers) {
+                Ok(body) => body,
+                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
+            };
+            return match providers::create(&body) {
+                Ok((body, location)) => http::respond_with(
+                    &mut client,
+                    201,
+                    &body,
+                    &format!("{CACHE_HEADERS}{cors}Location: {location}\r\n"),
+                ),
+                Err((status, code, message)) => error(&mut client, status, code, &message, cors),
+            };
+        }
+        ("POST", path) if path.starts_with("/api/v1/providers/") && path.ends_with("/refresh") => {
+            let id = &path["/api/v1/providers/".len()..path.len() - "/refresh".len()];
+            let id = share::percent_decode(id);
+            return match providers::refresh(&id) {
+                Ok((body, location)) => http::respond_with(
+                    &mut client,
+                    202,
+                    &body,
+                    &format!(
+                        "{CACHE_HEADERS}{cors}Location: {location}\r\nRetry-After: 1\r\n"),
+                ),
+                Err((status, code, message)) => error(&mut client, status, code, &message, cors),
+            };
+        }
+        ("DELETE", path) if path.starts_with("/api/v1/providers/") => {
+            let id = share::percent_decode(&path["/api/v1/providers/".len()..]);
+            return http::respond_with(
+                &mut client,
+                200,
+                &providers::delete(&id),
+                &format!("{CACHE_HEADERS}{cors}"),
+            );
+        }
+        ("POST", "/api/v1/nodes") => {
+            let body = match read_body(&mut client, headers) {
+                Ok(body) => body,
+                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
+            };
+            return match providers::add_node(&body) {
+                Ok((body, location)) => http::respond_with(
+                    &mut client,
+                    201,
+                    &body,
+                    &format!("{CACHE_HEADERS}{cors}Location: {location}\r\n"),
+                ),
+                Err((status, code, message)) => error(&mut client, status, code, &message, cors),
+            };
+        }
+        ("DELETE", path) if path.starts_with("/api/v1/nodes/") => {
+            let id = &path["/api/v1/nodes/".len()..];
+            return match providers::delete_node(id) {
+                Ok(body) => http::respond_with(
+                    &mut client,
+                    200,
+                    &body,
+                    &format!("{CACHE_HEADERS}{cors}"),
+                ),
+                Err((status, code, message)) => error(&mut client, status, code, &message, cors),
+            };
+        }
         ("POST", "/api/v1/dns/cache/flush") => {
             return http::respond_with(
                 &mut client,
@@ -238,6 +305,30 @@ pub fn handle(
         "/api/v1/config" => config::effective_json(),
         "/api/v1/rules" => config::rules_json(),
         "/api/v1/nodes" => config::nodes_json(param(query, "group_id")),
+        "/api/v1/providers" => {
+            let limit = param(query, "limit").and_then(|value| value.parse::<u64>().ok());
+            match providers::list(limit, param(query, "cursor")) {
+                Ok(body) => body,
+                Err((status, code, message)) => {
+                    return error(&mut client, status, code, &message, cors)
+                }
+            }
+        }
+        path if path.starts_with("/api/v1/providers/") => {
+            let id = share::percent_decode(&path["/api/v1/providers/".len()..]);
+            match providers::one(&id) {
+                Some(body) => body,
+                None => {
+                    return error(
+                        &mut client,
+                        404,
+                        "resource_not_found",
+                        "没有这个订阅",
+                        cors,
+                    )
+                }
+            }
+        }
         "/api/v1/groups" => config::groups_json(),
         "/api/v1/dns/log" => match dns::log_json(query) {
             Ok(body) => body,
@@ -365,13 +456,14 @@ fn version() -> String {
 
 fn capabilities() -> String {
     format!(
-        r#"{{"observed_at":"{observed}","profiles":["base"],"limits":{{"max_request_target_bytes":8192,"max_header_bytes":16384,"max_json_body_bytes":1048576}},"resources":{{"runtime":{{"available":true}},"traffic_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"datapath":{{"available":true,"kinds":["userspace"],"details":[]}},"connections":{{"available":true,"can_close":false}},"config":{{"available":true,"writable":true,"create":false,"max_bytes":{max_bytes},"max_sources":1}},"config_validate":{{"available":true,"modes":["syntax"],"max_bytes":{max_bytes},"max_sources":1}},"runtime_memory":{{"available":true,"metrics":["process.rss_bytes"]}},"runtime_outbounds":{{"available":true}},"memory_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"rules":{{"available":true,"max_rules":{max_bytes}}},"flows":{{"available":true,"recording":"on","scopes":["userspace_tcp"],"max_flows":{max_flows},"max_steps_per_flow":1,"retention_seconds":{retention},"snapshot_ttl_seconds":30,"max_page_size":1000}},"nodes":{{"available":true,"can_manage":false}},"groups":{{"available":true,"config_patch":false,"selection":false,"max_patch_operations":0}},{dns},{probes},"events":{events},"logs":{logs}}}}}"#,
+        r#"{{"observed_at":"{observed}","profiles":["base"],"limits":{{"max_request_target_bytes":8192,"max_header_bytes":16384,"max_json_body_bytes":1048576}},"resources":{{"runtime":{{"available":true}},"traffic_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"datapath":{{"available":true,"kinds":["userspace"],"details":[]}},"connections":{{"available":true,"can_close":false}},"config":{{"available":true,"writable":true,"create":false,"max_bytes":{max_bytes},"max_sources":1}},"config_validate":{{"available":true,"modes":["syntax"],"max_bytes":{max_bytes},"max_sources":1}},"runtime_memory":{{"available":true,"metrics":["process.rss_bytes"]}},"runtime_outbounds":{{"available":true}},"memory_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"rules":{{"available":true,"max_rules":{max_bytes}}},"flows":{{"available":true,"recording":"on","scopes":["userspace_tcp"],"max_flows":{max_flows},"max_steps_per_flow":1,"retention_seconds":{retention},"snapshot_ttl_seconds":30,"max_page_size":1000}},"nodes":{{"available":true,"can_manage":true}},{providers},"groups":{{"available":true,"config_patch":false,"selection":false,"max_patch_operations":0}},{dns},{probes},"events":{events},"logs":{logs}}}}}"#,
         observed = state::iso8601(SystemTime::now()),
         window = state::WINDOW_SECONDS,
         points = state::MAX_POINTS,
         max_bytes = config::MAX_BYTES,
         max_flows = flows::MAX_FLOWS,
         retention = flows::RETENTION.as_secs(),
+        providers = providers::capabilities_json(),
         dns = dns::capabilities_json(),
         probes = probes::capabilities_json(),
         events = events_capability(),

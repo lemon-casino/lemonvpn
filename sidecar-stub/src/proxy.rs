@@ -32,21 +32,7 @@ pub fn connect(decision: &config::Decision, host: &str, port: u16) -> io::Result
             io::ErrorKind::PermissionDenied,
             "blocked by rule",
         )),
-        config::Target::Socks5 {
-            name,
-            host: node_host,
-            port: node_port,
-            username,
-            password,
-        } => crate::outbound::socks5(
-            name,
-            node_host,
-            *node_port,
-            username.as_deref(),
-            password.as_deref(),
-            host,
-            port,
-        ),
+        config::Target::Node(node) => crate::outbound::connect(node, host, port),
     };
     if result.is_err() {
         outbounds::record_error(decision);

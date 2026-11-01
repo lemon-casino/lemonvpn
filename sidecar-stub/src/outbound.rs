@@ -1,10 +1,14 @@
-//! SOCKS5 outbound: connects to a configured node and asks it to CONNECT to the
-//! target. Domain targets stay domains, so the node resolves them and the local
-//! resolver is not involved.
+//! Outbounds: connects to a configured node and asks it to carry the target.
+//!
+//! SOCKS5 keeps domain targets as domains, so the node resolves them and the
+//! local resolver is not involved. Protocols this engine does not carry yet fail
+//! with a clear error instead of pretending the node is healthy.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
+
+use crate::config;
 
 const VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
@@ -20,6 +24,36 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Dials `host:port` through a SOCKS5 node. The node endpoint itself is dialed
 /// directly; only the target travels inside the tunnel.
+/// Opens `host:port` through `node`, dialing the node at its configured host.
+pub fn connect(node: &config::Node, host: &str, port: u16) -> io::Result<TcpStream> {
+    connect_via(node, &node.host, host, port)
+}
+
+/// Opens `host:port` through `node`, dialing `address` instead of the node's
+/// configured host. Probes use it to pick one resolved address per attempt.
+pub fn connect_via(
+    node: &config::Node,
+    address: &str,
+    host: &str,
+    port: u16,
+) -> io::Result<TcpStream> {
+    match node.protocol.as_str() {
+        "socks5" => socks5(
+            &node.name,
+            address,
+            node.port,
+            node.username.as_deref(),
+            node.password.as_deref(),
+            host,
+            port,
+        ),
+        protocol => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("节点协议 {protocol} 的出站尚未实现"),
+        )),
+    }
+}
+
 pub fn socks5(
     name: &str,
     node_host: &str,

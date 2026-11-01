@@ -49,6 +49,7 @@ struct Operation {
     created_at: SystemTime,
     status: &'static str,
     result: Option<String>,
+    error: Option<(String, String)>,
     finished_at: Option<SystemTime>,
 }
 
@@ -110,8 +111,16 @@ pub fn operation_json(id: &str) -> Option<String> {
         .finished_at
         .map_or_else(|| "null".to_owned(), |at| format!("\"{}\"", state::iso8601(at)));
     let result = operation.result.as_deref().unwrap_or("null");
+    let error = match &operation.error {
+        Some((code, message)) => format!(
+            r#"{{"code":"{}","message":"{}"}}"#,
+            json::escape(code),
+            json::escape(message)
+        ),
+        None => "null".to_owned(),
+    };
     Some(format!(
-        r#"{{"operation_id":"{}","kind":"{}","status":"{}","created_at":"{at}","started_at":"{at}","finished_at":{finished},"result":{result},"error":null}}"#,
+        r#"{{"operation_id":"{}","kind":"{}","status":"{}","created_at":"{at}","started_at":"{at}","finished_at":{finished},"result":{result},"error":{error}}}"#,
         json::escape(&operation.id),
         operation.kind,
         operation.status,
@@ -418,15 +427,7 @@ fn probe_http(node: &config::Node, version: &'static str) -> Outcome {
     for ip in addresses {
         let family = if ip.is_ipv4() { "ipv4" } else { "ipv6" };
         let started = Instant::now();
-        let attempt = outbound::socks5(
-            &node.name,
-            &ip.to_string(),
-            node.port,
-            node.username.as_deref(),
-            node.password.as_deref(),
-            HTTP_HOST,
-            HTTP_PORT,
-        )
+        let attempt = outbound::connect_via(node, &ip.to_string(), HTTP_HOST, HTTP_PORT)
         .and_then(|mut stream| {
             stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
             stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
@@ -477,15 +478,7 @@ fn probe_dns(node: &config::Node, version: &'static str) -> Outcome {
     for ip in addresses {
         let family = if ip.is_ipv4() { "ipv4" } else { "ipv6" };
         let started = Instant::now();
-        let attempt = outbound::socks5(
-            &node.name,
-            &ip.to_string(),
-            node.port,
-            node.username.as_deref(),
-            node.password.as_deref(),
-            &upstream.host,
-            upstream.port,
-        )
+        let attempt = outbound::connect_via(node, &ip.to_string(), &upstream.host, upstream.port)
         .and_then(|mut stream| {
             stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
             stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
@@ -671,7 +664,7 @@ fn record_health(
     }
 }
 
-fn create_operation(kind: &'static str) -> String {
+pub fn create_operation(kind: &'static str) -> String {
     let mut store = store();
     prune(&mut store);
     store.next += 1;
@@ -682,6 +675,7 @@ fn create_operation(kind: &'static str) -> String {
         created_at: SystemTime::now(),
         status: "running",
         result: None,
+        error: None,
         finished_at: None,
     });
     id
@@ -695,16 +689,29 @@ pub fn reload_accepted(result: String) -> Accepted {
     accepted(id, "reload")
 }
 
-fn finish_operation(id: &str, result: String) {
+pub fn finish_operation(id: &str, result: String) {
     let mut store = store();
     if let Some(operation) = store.operations.iter_mut().find(|operation| operation.id == id) {
         operation.status = "succeeded";
         operation.result = Some(result);
+        operation.error = None;
         operation.finished_at = Some(SystemTime::now());
     }
 }
 
-fn accepted(id: String, kind: &str) -> Accepted {
+/// Finishes an operation that produced no result. The error is the contract's
+/// `SafeError`: a stable code and a message with no raw configuration in it.
+pub fn fail_operation(id: &str, code: &str, message: &str) {
+    let mut store = store();
+    if let Some(operation) = store.operations.iter_mut().find(|operation| operation.id == id) {
+        operation.status = "failed";
+        operation.result = None;
+        operation.error = Some((code.to_owned(), message.to_owned()));
+        operation.finished_at = Some(SystemTime::now());
+    }
+}
+
+pub fn accepted(id: String, kind: &str) -> Accepted {
     let href = format!("/api/v1/operations/{id}");
     Accepted {
         body: format!(
