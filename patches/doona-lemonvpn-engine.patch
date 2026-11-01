@@ -1,0 +1,59 @@
+diff --git a/src/api/engines/index.ts b/src/api/engines/index.ts
+index 88191130..7b7854c5 100644
+--- a/src/api/engines/index.ts
++++ b/src/api/engines/index.ts
+@@ -1,5 +1,6 @@
+ import type {Version} from '../model';
+ import {honk} from './honk';
++import {lemonvpn} from './lemonvpn';
+ import type {Engine} from './types';
+ 
+ export type {Engine, EngineAction, EngineConfig, EngineReason, EngineSubject} from './types';
+@@ -25,6 +26,8 @@ export function engineOf(version: Pick<Version, 'engine'> | undefined): Engine {
+   switch (version?.engine.name) {
+     case 'honk':
+       return honk;
++    case 'lemonvpn':
++      return lemonvpn;
+     default:
+       return unknown;
+   }
+diff --git a/src/api/engines/lemonvpn.ts b/src/api/engines/lemonvpn.ts
+new file mode 100644
+index 00000000..cd1b40d6
+--- /dev/null
++++ b/src/api/engines/lemonvpn.ts
+@@ -0,0 +1,20 @@
++import type {Engine} from './types';
++
++// LemonVPN's engine serves the native API and reads the same configuration text
++// honk does, so the pages that read or write that text apply. It implements none of honk's
++// other extensions, so those stay off: no global settings, no restart command,
++// no node links, no redacted sections and no hook states it cannot check.
++export const lemonvpn: Engine = {
++  id: 'lemonvpn',
++  flowDemandGraceSeconds: null,
++  reason: () => undefined,
++  holdsCredentials: () => false,
++  snippet: settings => settings.map(({key, value}) => `${key}: ${value}`).join('\n'),
++  redactedSections: () => [],
++  daeText: true,
++  nodeLinkSchemes: null,
++  globalSettings: null,
++  restartOnly: [],
++  restartCommand: null,
++  uncheckedHooks: []
++};
+diff --git a/src/api/engines/types.ts b/src/api/engines/types.ts
+index 754b4622..28d53604 100644
+--- a/src/api/engines/types.ts
++++ b/src/api/engines/types.ts
+@@ -103,7 +103,7 @@ export type EngineConfig = {
+ // An engine's explanations for what the native API contract states without a reason. An engine that does not know a
+ // reason says nothing, so the page falls back to what the contract says.
+ export type Engine = {
+-  id: 'honk' | 'unknown';
++  id: 'honk' | 'lemonvpn' | 'unknown';
+   // Seconds the engine keeps recording flow demand after the last client read or stream; null when it does not say.
+   flowDemandGraceSeconds: number | null;
+   // Why `subject` is off, given that the capabilities show it is; undefined when the engine does not say.

@@ -1,0 +1,2 @@
+# Patch files are applied with `git apply`; CRLF checkout would break them.
+*.patch -text

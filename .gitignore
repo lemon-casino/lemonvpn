@@ -10,6 +10,9 @@
 /target/
 /node_modules/
 /dist/
+/app/node_modules/
+/app/src-tauri/target/
+/sidecar-stub/target/
 
 # OS and editor noise
 Thumbs.db

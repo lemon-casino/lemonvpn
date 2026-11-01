@@ -1,0 +1,29 @@
+diff --git a/tools/catalogue-parts.mjs b/tools/catalogue-parts.mjs
+index d543a418..8192afcf 100644
+--- a/tools/catalogue-parts.mjs
++++ b/tools/catalogue-parts.mjs
+@@ -19,12 +19,14 @@ function files(path) {
+ }
+ const extensions = ['', '.ts', '.tsx', '/index.ts', '/index.tsx'];
+ const assetImport = /\.(?:css|svg|webp|png|json|woff2)(?:\?.*)?$/;
++// Module ids are written with forward slashes on every platform, as the entry below is.
++const moduleId = path => path.replaceAll('\\', '/');
+ function resolveImport(root, from, specifier) {
+   if (!specifier.startsWith('.')) return null;
+   const base = resolve(root, dirname(from), specifier);
+   for (const extension of extensions) {
+     const path = base + extension;
+-    if (/\.tsx?$/.test(path) && existsSync(path)) return relative(root, path);
++    if (/\.tsx?$/.test(path) && existsSync(path)) return moduleId(relative(root, path));
+   }
+   return null;
+ }
+@@ -45,7 +47,7 @@ const stageOf = node => {
+ export function scanModules(root, keys) {
+   const modules = new Map();
+   const sources = [...files(join(root, 'src')), ...(existsSync(join(root, 'mock')) ? files(join(root, 'mock')) : [])]
+-    .map(path => relative(root, path))
++    .map(path => moduleId(relative(root, path)))
+     .filter(path => /\.tsx?$/.test(path) && !/\.test\.tsx?$|\.test-env\.ts$|\.d\.ts$/.test(path));
+   for (const path of sources) {
+     const source = ts.createSourceFile(path, readFileSync(join(root, path), 'utf8'), ts.ScriptTarget.Latest, true);

@@ -1,0 +1,16 @@
+diff --git a/vite.config.ts b/vite.config.ts
+index 0c1e0862..9b76060d 100644
+--- a/vite.config.ts
++++ b/vite.config.ts
+@@ -61,6 +61,11 @@ function activityOnly(id: string, getModuleInfo: (id: string) => {importedIds: r
+ }
+ export default defineConfig({
+   base: './',
++  // LemonVPN: the engine sidecar serves the native API on loopback, and doona
++  // reaches a backend on its own origin, so the dev server forwards /api there.
++  server: {
++    proxy: {'/api': `http://127.0.0.1:${process.env.LEMONVPN_ENGINE_PORT ?? '18080'}`}
++  },
+   define: {
+     'import.meta.env.VITE_DOONA_VERSION': JSON.stringify(version),
+     // The links the about box and the sidebar open: doona's own repository, and the organisation whose engine
