@@ -24,6 +24,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub fn trojan(
     _name: &str,
     node_host: &str,
+    node_hostname: &str,
     node_port: u16,
     link: Option<&str>,
     host: &str,
@@ -58,7 +59,7 @@ pub fn trojan(
         .sni
         .as_deref()
         .filter(|sni| !sni.is_empty())
-        .unwrap_or(node_host);
+        .unwrap_or(node_hostname);
     let insecure = share::query_params(query_of(link))
         .get("allowinsecure")
         .is_some_and(|value| value == "1" || value == "true");
@@ -152,6 +153,7 @@ mod tests {
         let error = trojan(
             "t",
             "127.0.0.1",
+            "127.0.0.1",
             1,
             Some("trojan://pw@127.0.0.1:1?security=reality&pbk=x#t"),
             "example.com",
@@ -196,6 +198,7 @@ mod tests {
         let mut outer = trojan(
             "tls-test",
             "127.0.0.1",
+            "node.example",
             port,
             Some(&format!(
                 "trojan://{PASSWORD}@127.0.0.1:{port}?security=tls&sni=node.example&allowInsecure=1#t"

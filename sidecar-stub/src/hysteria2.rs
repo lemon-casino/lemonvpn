@@ -51,6 +51,7 @@ fn io_err<E: std::fmt::Display>(context: &str, error: E) -> io::Error {
 pub(crate) fn hy2(
     _name: &str,
     address: &str,
+    node_hostname: &str,
     node_port: u16,
     link: Option<&str>,
     host: &str,
@@ -74,7 +75,7 @@ pub(crate) fn hy2(
     let server_name = share
         .sni
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| address.to_owned());
+        .unwrap_or_else(|| node_hostname.to_owned());
     let addrs: Vec<SocketAddr> = (address, node_port).to_socket_addrs()?.collect();
     let server = *addrs
         .iter()
@@ -1175,7 +1176,7 @@ mod tests {
     fn quic_tunnel_round_trip() {
         let (port, server) = hy2_server("s3cret", "example.com:443");
         let link = format!("hysteria2://s3cret@127.0.0.1:{port}?insecure=1&sni=hysteria.test#t");
-        let mut outer = hy2("hy2-test", "127.0.0.1", port, Some(&link), "example.com", 443).unwrap();
+        let mut outer = hy2("hy2-test", "127.0.0.1", "127.0.0.1", port, Some(&link), "example.com", 443).unwrap();
         outer.write_all(b"hello").unwrap();
         outer.flush().unwrap();
         outer.shutdown(std::net::Shutdown::Write).unwrap();

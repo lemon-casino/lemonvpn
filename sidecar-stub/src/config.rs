@@ -805,13 +805,24 @@ enum Ctx {
 }
 
 fn build(content: String, modified: Option<SystemTime>) -> Config {
+    let parsed = parse(&content);
+    let names: Vec<String> = parsed.nodes.iter().map(|node| node.name.clone()).collect();
+    build_with_providers(content, modified, &crate::providers::nodes(&names))
+}
+
+/// The provider roster is injected so tests can parse a source without the
+/// machine's on-disk subscription storage leaking into the assertions.
+fn build_with_providers(
+    content: String,
+    modified: Option<SystemTime>,
+    provider_nodes: &[Node],
+) -> Config {
     let sha256 = sha256::hex(content.as_bytes());
     let mut parsed = parse(&content);
     // Provider nodes join the same table as the source's own nodes, so group
     // filters and routing see one flat roster. The source file and its digest
     // are untouched; the merged view is what every reader gets.
-    let names: Vec<String> = parsed.nodes.iter().map(|node| node.name.clone()).collect();
-    parsed.nodes.extend(crate::providers::nodes(&names));
+    parsed.nodes.extend(provider_nodes.iter().cloned());
     let fallback = match parsed.fallback.take() {
         Some(rule) => rule,
         None => {
@@ -1494,7 +1505,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     fn config(source: &str) -> super::Config {
-        build(source.to_owned(), None)
+        super::build_with_providers(source.to_owned(), None, &[])
     }
 
     #[test]

@@ -45,6 +45,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub fn vmess(
     name: &str,
     node_host: &str,
+    node_hostname: &str,
     node_port: u16,
     link: Option<&str>,
     host: &str,
@@ -103,7 +104,7 @@ pub fn vmess(
             .sni
             .as_deref()
             .filter(|sni| !sni.is_empty())
-            .unwrap_or(node_host);
+            .unwrap_or(node_hostname);
         let mut stream = tls::connect(sock, sni, insecure)?;
         stream.write_all(&wire)?;
         stream.flush()?;
@@ -581,6 +582,7 @@ mod tests {
             let error = vmess(
                 "t",
                 "127.0.0.1",
+                "127.0.0.1",
                 1,
                 Some(&link(base(extra))),
                 "example.com",
@@ -675,7 +677,7 @@ mod tests {
             r#"{{"v":"2","ps":"t","add":"127.0.0.1","port":"{port}","id":"{TEST_UUID}","aid":"0","net":"tcp","type":"none","host":"","path":"","tls":""}}"#
         );
         let link = format!("vmess://{}", base64::encode(payload.as_bytes()));
-        let mut outer = vmess("plain-test", "127.0.0.1", port, Some(&link), "example.com", 443)
+        let mut outer = vmess("plain-test", "127.0.0.1", "127.0.0.1", port, Some(&link), "example.com", 443)
             .unwrap();
         outer.write_all(b"hello").unwrap();
         outer.flush().unwrap();

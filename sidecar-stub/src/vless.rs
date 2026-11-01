@@ -24,6 +24,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub fn vless(
     name: &str,
     node_host: &str,
+    node_hostname: &str,
     node_port: u16,
     link: Option<&str>,
     host: &str,
@@ -66,7 +67,7 @@ pub fn vless(
         .sni
         .as_deref()
         .filter(|sni| !sni.is_empty())
-        .unwrap_or(node_host);
+        .unwrap_or(node_hostname);
     let insecure = params
         .get("allowinsecure")
         .is_some_and(|value| value == "1" || value == "true");
@@ -199,6 +200,7 @@ mod tests {
         let mut outer = vless(
             "plain-test",
             "127.0.0.1",
+            "127.0.0.1",
             port,
             Some(&format!("vless://{TEST_UUID}@127.0.0.1:{port}?security=none#t")),
             "example.com",
@@ -253,6 +255,7 @@ mod tests {
         let mut outer = vless(
             "tls-test",
             "127.0.0.1",
+            "node.example",
             port,
             Some(&format!(
                 "vless://{TEST_UUID}@127.0.0.1:{port}?security=tls&sni=node.example&allowInsecure=1#t"
@@ -276,6 +279,7 @@ mod tests {
         let error = vless(
             "vision-test",
             "127.0.0.1",
+            "127.0.0.1",
             1,
             Some(&format!("vless://{TEST_UUID}@127.0.0.1:1?flow=xtls-rprx-vision#t")),
             "example.com",
@@ -286,6 +290,7 @@ mod tests {
 
         let error = vless(
             "reality-test",
+            "127.0.0.1",
             "127.0.0.1",
             1,
             Some(&format!(

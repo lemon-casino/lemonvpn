@@ -50,6 +50,7 @@ pub fn connect_via(
         "vless" => crate::vless::vless(
             &node.name,
             address,
+            &node.host,
             node.port,
             node.link.as_deref(),
             host,
@@ -58,6 +59,7 @@ pub fn connect_via(
         "vmess" => crate::vmess::vmess(
             &node.name,
             address,
+            &node.host,
             node.port,
             node.link.as_deref(),
             host,
@@ -66,6 +68,7 @@ pub fn connect_via(
         "trojan" => crate::trojan::trojan(
             &node.name,
             address,
+            &node.host,
             node.port,
             node.link.as_deref(),
             host,
@@ -82,6 +85,7 @@ pub fn connect_via(
         "hysteria2" | "hy2" => crate::hysteria2::hy2(
             &node.name,
             address,
+            &node.host,
             node.port,
             node.link.as_deref(),
             host,
