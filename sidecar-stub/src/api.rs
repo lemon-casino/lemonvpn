@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config;
 use crate::connections;
+use crate::control;
 use crate::dns;
 use crate::events;
 use crate::flows;
@@ -100,7 +101,11 @@ pub fn handle(
                     cors,
                 );
             }
-            let (valid, diagnostics) = config::validate(&content);
+            let (valid, diagnostics) = if json::field(&body, "mode").as_deref() == Some("full") {
+                config::validate_full(&content)
+            } else {
+                config::validate(&content)
+            };
             let body = format!(
                 r#"{{"valid":{valid},"generation_id":"{}","validated_at":"{}","diagnostics":{diagnostics}}}"#,
                 json::escape(&config::generation()),
@@ -282,6 +287,73 @@ pub fn handle(
                 Err((status, code, message)) => error(&mut client, status, code, &message, cors),
             }
         }
+        ("POST", "/api/v1/operations/reload") => {
+            return control::start_reload(&mut client, cors);
+        }
+        ("POST", "/api/v1/operations/suspend") => {
+            return control::start_suspend(&mut client, cors);
+        }
+        ("POST", "/api/v1/operations/resume") => {
+            return control::start_resume(&mut client, cors);
+        }
+        ("POST", "/api/v1/routing/trace") => {
+            let body = match read_body(&mut client, headers) {
+                Ok(body) => body,
+                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
+            };
+            return control::trace(&mut client, cors, &body);
+        }
+        ("POST", "/api/v1/config/sources") => {
+            let body = match read_body(&mut client, headers) {
+                Ok(body) => body,
+                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
+            };
+            return control::create_source(&mut client, cors, &body);
+        }
+        ("PATCH", "/api/v1/runtime/settings") => {
+            let body = match read_body(&mut client, headers) {
+                Ok(body) => body,
+                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
+            };
+            return control::patch_settings(&mut client, cors, &body);
+        }
+        ("PATCH", "/api/v1/geodata/settings") => {
+            let body = match read_body(&mut client, headers) {
+                Ok(body) => body,
+                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
+            };
+            return control::patch_geodata(&mut client, cors, &body);
+        }
+        ("POST", "/api/v1/geodata/update") => {
+            return control::start_geodata_update(&mut client, cors);
+        }
+        ("PATCH", path) if path.starts_with("/api/v1/groups/") && path.ends_with("/config") => {
+            let id = &path["/api/v1/groups/".len()..path.len() - "/config".len()];
+            let body = match read_body(&mut client, headers) {
+                Ok(body) => body,
+                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
+            };
+            let if_match = http::header_value(headers, "If-Match");
+            return control::patch_group(&mut client, cors, id, &body, if_match);
+        }
+        ("PUT", path) if path.starts_with("/api/v1/groups/") && path.ends_with("/selection") => {
+            let id = &path["/api/v1/groups/".len()..path.len() - "/selection".len()];
+            let body = match read_body(&mut client, headers) {
+                Ok(body) => body,
+                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
+            };
+            return control::select(&mut client, cors, id, &body);
+        }
+        ("DELETE", path)
+            if path.starts_with("/api/v1/groups/") && path.ends_with("/selection") =>
+        {
+            let id = &path["/api/v1/groups/".len()..path.len() - "/selection".len()];
+            return control::clear_selection(&mut client, cors, id);
+        }
+        ("DELETE", path) if path.starts_with("/api/v1/connections/") => {
+            let id = &path["/api/v1/connections/".len()..];
+            return control::close_connection(&mut client, cors, id);
+        }
         _ => {}
     }
 
@@ -414,6 +486,25 @@ pub fn handle(
                 }
             }
         }
+        "/api/v1/runtime/settings" => control::settings_json(),
+        "/api/v1/dns/rules" => control::dns_rules_json(),
+        "/api/v1/geodata" => control::geodata_json(),
+        "/api/v1/geodata/settings" => control::geodata_settings_json(),
+        path if path.starts_with("/api/v1/groups/") && path.ends_with("/config") => {
+            let id = &path["/api/v1/groups/".len()..path.len() - "/config".len()];
+            match control::group_config_json(id) {
+                Some(body) => body,
+                None => {
+                    return error(
+                        &mut client,
+                        404,
+                        "resource_not_found",
+                        "this engine has no such group",
+                        cors,
+                    )
+                }
+            }
+        }
         path if path.starts_with("/api/v1/groups/") => {
             let id = &path["/api/v1/groups/".len()..];
             match config::group_json(id) {
@@ -470,7 +561,7 @@ fn version() -> String {
 
 fn capabilities() -> String {
     format!(
-        r#"{{"observed_at":"{observed}","profiles":["base"],"limits":{{"max_request_target_bytes":8192,"max_header_bytes":16384,"max_json_body_bytes":1048576}},"resources":{{"runtime":{{"available":true}},"traffic_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"datapath":{{"available":true,"kinds":["userspace"],"details":[]}},"connections":{{"available":true,"can_close":false}},"config":{{"available":true,"writable":true,"create":false,"max_bytes":{max_bytes},"max_sources":1}},"config_validate":{{"available":true,"modes":["syntax"],"max_bytes":{max_bytes},"max_sources":1}},"runtime_memory":{{"available":true,"metrics":["process.rss_bytes"]}},"runtime_outbounds":{{"available":true}},"memory_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"rules":{{"available":true,"max_rules":{max_bytes}}},"flows":{{"available":true,"recording":"on","scopes":["userspace_tcp"],"max_flows":{max_flows},"max_steps_per_flow":1,"retention_seconds":{retention},"snapshot_ttl_seconds":30,"max_page_size":1000}},"nodes":{{"available":true,"can_manage":true}},{tun},{providers},"groups":{{"available":true,"config_patch":false,"selection":false,"max_patch_operations":0}},{dns},{probes},"events":{events},"logs":{logs}}}}}"#,
+        r#"{{"observed_at":"{observed}","profiles":["base"],"limits":{{"max_request_target_bytes":8192,"max_header_bytes":16384,"max_json_body_bytes":1048576}},"resources":{{"runtime":{{"available":true}},"traffic_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"datapath":{{"available":true,"kinds":["userspace"],"details":[]}},"connections":{{"available":true,"can_close":true}},"config":{{"available":true,"writable":true,"create":true,"max_bytes":{max_bytes},"max_sources":4}},"config_validate":{{"available":true,"modes":["syntax","full"],"max_bytes":{max_bytes},"max_sources":4}},"runtime_memory":{{"available":true,"metrics":["process.rss_bytes"]}},"runtime_outbounds":{{"available":true}},"memory_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"rules":{{"available":true,"max_rules":{max_bytes}}},"flows":{{"available":true,"recording":"on","scopes":["userspace_tcp"],"max_flows":{max_flows},"max_steps_per_flow":1,"retention_seconds":{retention},"snapshot_ttl_seconds":30,"max_page_size":1000}},"nodes":{{"available":true,"can_manage":true}},{tun},{providers},"groups":{{"available":true,"config_patch":true,"selection":true,"max_patch_operations":16}},{dns},{probes},"routing_trace":{{"available":true,"resolve_modes":["none","live"]}},"runtime_settings":{{"available":true,"fields":["record_flows","record_logs","record_dns_log","log.level","dns_log.max_records","flows.max_flows","flows.retention_seconds"]}},"geodata":{{"available":true,"assets":["geoip","geosite"],"can_update":true,"configurable_sources":true,"max_urls":4}},"dns_rules":{{"available":true,"max_rules":64}},"reload":{{"available":true}},"suspend":{{"available":true}},"resume":{{"available":true}},"events":{events},"logs":{logs}}}}}"#,
         observed = state::iso8601(SystemTime::now()),
         window = state::WINDOW_SECONDS,
         points = state::MAX_POINTS,
@@ -613,7 +704,7 @@ fn runtime() -> String {
     format!(
         concat!(
             r#"{{"observed_at":"{observed}","instance_id":"{instance}","#,
-            r#""lifecycle":{{"state":"running","started_at":"{started}","uptime_seconds":"{uptime}"}},"#,
+            r#""lifecycle":{{"state":"{lifecycle}","started_at":"{started}","uptime_seconds":"{uptime}"}},"#,
             r#""generation":{{"active_id":"{generation}","config_revision":"{revision}","state":"active","activated_at":"{started}"}},"#,
             r#""datapath":{{"kind":"userspace","state":"active","visibility":"partial","ebpf":null}},"#,
             r#""traffic":{{"scope":"visible","observed_by":"userspace","counter_since":"{started}","sampled_at":{sampled_at},"#,
@@ -625,6 +716,7 @@ fn runtime() -> String {
         ),
         observed = state::iso8601(now),
         instance = format!("lemonvpn-{}", std::process::id()),
+        lifecycle = control::runtime_state(),
         generation = config::generation(),
         revision = config::revision(),
         started = state::iso8601(started),

@@ -97,9 +97,10 @@ pub fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
             .map(|addrs| addrs.map(|addr| addr.ip()).collect());
     }
     let name = canonical(host)?;
+    let forced = config::dns_upstream_for(host);
     let mut last = None;
     for kind in ["A", "AAAA"] {
-        match lookup(&name, kind, None, true) {
+        match lookup(&name, kind, forced.as_deref(), true) {
             Ok(result) => {
                 record(
                     None,

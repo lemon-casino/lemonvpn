@@ -6,6 +6,7 @@ use std::net::TcpStream;
 
 use crate::api;
 use crate::config;
+use crate::control;
 use crate::flows;
 use crate::logs;
 use crate::proxy;
@@ -48,6 +49,12 @@ pub fn handle(mut client: TcpStream) -> io::Result<()> {
         if is_api_path(path) {
             return api::handle(client, &method, &target, &text, &cors);
         }
+    }
+
+    // A suspended datapath keeps serving the API above, but refuses new
+    // tunnels; resume stays reachable on the same listener.
+    if control::suspended() {
+        return respond(&mut client, 503, r#"{"error":"engine_suspended"}"#);
     }
 
     // Everything past the API and health branches is proxied traffic. Logging

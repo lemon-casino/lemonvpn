@@ -106,6 +106,12 @@ pub fn begin(
     domain_source: Option<&'static str>,
     decision: &Decision,
 ) -> Guard {
+    if crate::control::recording_mode("record_flows") == "off" {
+        return Guard {
+            id: String::new(),
+            finished: true,
+        };
+    }
     let flow = new_flow(src, host, port, domain, domain_source, decision);
     let id = flow.id.clone();
     push(flow);

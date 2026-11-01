@@ -6,7 +6,7 @@
 //! stay null/unknown rather than being invented.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::SystemTime;
@@ -28,6 +28,8 @@ struct Entry {
     dst: String,
     started_at: SystemTime,
     counters: Arc<Counters>,
+    /// A clone of the inbound socket; `shutdown` on it ends the tunnel.
+    socket: Option<TcpStream>,
 }
 
 /// A registered tunnel; dropping it removes the entry.
@@ -37,7 +39,7 @@ pub struct Live {
 }
 
 impl Live {
-    pub fn open(src: SocketAddr, dst: SocketAddr) -> Live {
+    pub fn open(src: SocketAddr, dst: SocketAddr, socket: Option<TcpStream>) -> Live {
         let key = NEXT.fetch_add(1, Ordering::Relaxed);
         let counters = Arc::new(Counters::default());
         let entry = Entry {
@@ -47,10 +49,28 @@ impl Live {
             dst: dst.to_string(),
             started_at: SystemTime::now(),
             counters: Arc::clone(&counters),
+            socket,
         };
         open().insert(key, entry);
         Live { key, counters }
     }
+}
+
+/// Force-closes one live tunnel by id. A second close misses the entry and
+/// reports false, which the API turns into 404.
+pub fn close(id: &str) -> bool {
+    let mut map = open();
+    let key = map
+        .iter()
+        .find(|(_, entry)| entry.id == id)
+        .map(|(key, _)| *key);
+    let Some(key) = key else { return false };
+    if let Some(entry) = map.remove(&key) {
+        if let Some(socket) = entry.socket {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
+    true
 }
 
 impl Drop for Live {
@@ -104,7 +124,7 @@ mod tests {
     #[test]
     fn registers_and_removes_a_tunnel() {
         let before = snapshot().len();
-        let live = Live::open(addr(1234), addr(443));
+        let live = Live::open(addr(1234), addr(443), None);
         live.counters.upload.fetch_add(7, Ordering::Relaxed);
         live.counters.download.fetch_add(11, Ordering::Relaxed);
 

@@ -125,7 +125,7 @@ pub fn tunnel(
 
     let _open = OpenConnection::new();
     let live = match (client.peer_addr(), upstream.peer_addr()) {
-        (Ok(src), Ok(dst)) => Some(connections::Live::open(src, dst)),
+        (Ok(src), Ok(dst)) => Some(connections::Live::open(src, dst, client.try_clone().ok())),
         _ => None,
     };
     let download_counters = live.as_ref().map(|live| Arc::clone(&live.counters));

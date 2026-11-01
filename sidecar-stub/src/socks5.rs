@@ -26,6 +26,11 @@ const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 
 pub fn handle(mut client: TcpStream) -> io::Result<()> {
+    // A suspended datapath refuses new tunnels before the greeting; the API
+    // stays reachable so resume can still arrive on the same listener.
+    if crate::control::suspended() {
+        return Ok(());
+    }
     let mut greeting = [0u8; 2];
     client.read_exact(&mut greeting)?;
     if greeting[0] != VERSION {

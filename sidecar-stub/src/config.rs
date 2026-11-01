@@ -78,21 +78,27 @@ pub struct Rule {
 
 impl Rule {
     fn matches(&self, host: &str) -> bool {
-        match &self.condition {
-            Some(Condition::DomainFull(value)) => host == value,
-            Some(Condition::DomainSuffix(value)) => {
-                host == value
-                    || host
-                        .strip_suffix(value)
-                        .is_some_and(|prefix| prefix.ends_with('.'))
-            }
-            Some(Condition::IpCidr(network, prefix)) => host
-                .parse::<IpAddr>()
-                .ok()
-                .is_some_and(|address| cidr_contains(address, *network, *prefix)),
-            Some(Condition::All) => true,
-            None => false,
+        self.condition
+            .as_ref()
+            .is_some_and(|condition| condition_matches(condition, host))
+    }
+}
+
+/// Shared by routing rules and DNS request rules.
+fn condition_matches(condition: &Condition, host: &str) -> bool {
+    match condition {
+        Condition::DomainFull(value) => host == value,
+        Condition::DomainSuffix(value) => {
+            host == value
+                || host
+                    .strip_suffix(value)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
         }
+        Condition::IpCidr(network, prefix) => host
+            .parse::<IpAddr>()
+            .ok()
+            .is_some_and(|address| cidr_contains(address, *network, *prefix)),
+        Condition::All => true,
     }
 }
 
@@ -185,9 +191,23 @@ pub struct Config {
     pub groups: Vec<Group>,
     pub upstreams: Vec<Upstream>,
     pub diagnostics: Vec<Diagnostic>,
+    /// DNS request rules in evaluation order, before the implicit fallback.
+    pub dns_rules: Vec<DnsRule>,
+    /// Extra source files the main source pulls in with `include('name.dae')`.
+    pub includes: Vec<String>,
     pub loaded_at: SystemTime,
     modified: Option<SystemTime>,
     bytes: usize,
+}
+
+/// One DNS request rule: the first condition that matches the query name
+/// sends it to the named `dns { upstream }` entry instead of the first one.
+#[derive(Clone, Debug)]
+pub struct DnsRule {
+    pub expression: String,
+    pub condition: Condition,
+    pub upstream: String,
+    pub line: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -271,6 +291,130 @@ pub fn refresh() {
     );
 }
 
+/// Read-only access to the accepted snapshot for other modules.
+pub fn with_current<T>(reader: impl FnOnce(&Config) -> T) -> T {
+    reader(&current())
+}
+
+/// The accepted main source text, for text-level rewrites.
+pub fn source_content() -> String {
+    current().content.clone()
+}
+
+/// Re-reads and rebuilds the source even when mtime says nothing changed.
+/// Returns the active generation afterwards.
+pub fn force_reload() -> String {
+    let path = config_path();
+    let modified = fs::metadata(&path).ok().and_then(|meta| meta.modified().ok());
+    let Ok(content) = fs::read_to_string(&path) else {
+        return current().generation.clone();
+    };
+    if content.len() > MAX_BYTES {
+        return current().generation.clone();
+    }
+    let built = build(content, modified);
+    let generation = built.generation.clone();
+    *current() = built;
+    logs::info(
+        "engine::config",
+        "Configuration source reloaded by request.",
+        Some(logs::fields(&[("generation", generation.as_str())])),
+    );
+    generation
+}
+
+/// The operation result body a reload/group update reports.
+pub fn reload_result_json() -> String {
+    let generation = json::escape(&generation());
+    format!(r#"{{"active_generation_id":"{generation}","datapath_generation_id":"{generation}"}}"#)
+}
+
+/// Semantic validation: parses, resolves groups and rules, and reports every
+/// error-level diagnostic. This is the `full` mode of config/validate.
+pub fn validate_full(content: &str) -> (bool, String) {
+    let parsed = parse(content);
+    let names: Vec<String> = parsed.nodes.iter().map(|node| node.name.clone()).collect();
+    let built = build_with_providers(content.to_owned(), None, &crate::providers::nodes(&names));
+    let has_error = built.diagnostics.iter().any(|d| d.level == "error");
+    (!has_error, diagnostics_json(&built.diagnostics))
+}
+
+/// Semantic validation of the accepted source set (after a file landed).
+pub fn validate_full_now() -> (bool, String) {
+    let content = source_content();
+    validate_full(&content)
+}
+
+/// The upstream a DNS request rule picks for this name, if any.
+pub fn dns_upstream_for(host: &str) -> Option<String> {
+    let config = current();
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    config
+        .dns_rules
+        .iter()
+        .find(|rule| condition_matches(&rule.condition, &host))
+        .map(|rule| rule.upstream.clone())
+}
+
+/// Rewrites one group's policy/default/final lines in the source text, keeping
+/// every other line (including its filters) where it was.
+pub fn rewrite_group(
+    content: &str,
+    group: &str,
+    policy: Option<&str>,
+    default: Option<Option<&str>>,
+    final_outbound: Option<Option<&str>>,
+) -> Result<String, String> {
+    let lines: Vec<String> = content.lines().map(str::to_owned).collect();
+    let start = lines
+        .iter()
+        .position(|line| {
+            let trimmed = line.trim();
+            trimmed == &format!("{group} {{") || trimmed == &format!("{group}{{")
+        })
+        .ok_or_else(|| format!("group `{group}` 在源文件中不存在"))?;
+    let mut end = start;
+    for (offset, line) in lines.iter().enumerate().skip(start + 1) {
+        if line.trim() == "}" {
+            end = offset;
+            break;
+        }
+    }
+    let mut body: Vec<String> = Vec::new();
+    for line in &lines[start + 1..end] {
+        let trimmed = line.trim();
+        if trimmed.starts_with("policy:")
+            || trimmed.starts_with("default:")
+            || trimmed.starts_with("final:")
+        {
+            continue;
+        }
+        body.push(line.clone());
+    }
+    if let Some(text) = policy {
+        body.push(format!("    policy: {text}"));
+    }
+    if let Some(value) = default {
+        if let Some(text) = value {
+            body.push(format!("    default: '{text}'"));
+        }
+    }
+    if let Some(value) = final_outbound {
+        if let Some(text) = value {
+            body.push(format!("    final: {text}"));
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    out.extend_from_slice(&lines[..start + 1]);
+    out.extend(body);
+    out.extend_from_slice(&lines[end..]);
+    let mut joined = out.join("\n");
+    if content.ends_with('\n') {
+        joined.push('\n');
+    }
+    Ok(joined)
+}
+
 /// Rebuilds the accepted snapshot after the provider store changed. The source
 /// file, its digest and the revision stay as they were.
 pub fn reload_providers() {
@@ -349,6 +493,12 @@ fn select_member(group: &Group, config: &Config) -> Option<String> {
     let members = &group.members;
     if members.is_empty() {
         return None;
+    }
+    // A pinned selection or manual choice from the API beats the policy.
+    if let Some(name) = crate::control::selection_override(&group.name) {
+        if members.contains(&name) {
+            return Some(name);
+        }
     }
     match group.policy {
         Policy::Selector => group
@@ -469,7 +619,27 @@ pub fn current_sha256() -> String {
 /// One source with its content, as `GET /config/sources/{source_id}` returns it.
 pub fn config_source_json(id: &str) -> Option<String> {
     if id != SOURCE_ID {
-        return None;
+        // Additional sources are addressed by file name and read from the
+        // data directory; they may exist before the main source includes them.
+        if !id.ends_with(".dae")
+            || id.chars().any(|c| c.is_control())
+            || id.contains('\\')
+            || id.split('/').any(|s| s.is_empty() || s == "." || s == "..")
+        {
+            return None;
+        }
+        let content = std::fs::read_to_string(data_dir().join(id)).ok()?;
+        let bytes = content.len();
+        let sha = crate::sha256::hex(content.as_bytes());
+        return Some(format!(
+            r#"{{"id":"{}","path":"{}","kind":"include","content_sha256":"{}","bytes":{},"content":"{}","line_count":{},"writable":true,"loaded_at":null}}"#,
+            id,
+            id,
+            sha,
+            bytes,
+            json::escape(&content),
+            content.lines().count(),
+        ));
     }
     refresh();
     let config = current();
@@ -781,6 +951,8 @@ struct Parsed {
     nodes: Vec<Node>,
     groups: Vec<RawGroup>,
     upstreams: Vec<Upstream>,
+    dns_rules: Vec<DnsRuleRaw>,
+    includes: Vec<String>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -793,6 +965,13 @@ struct RawGroup {
     line: u32,
 }
 
+struct DnsRuleRaw {
+    expression: String,
+    condition: Condition,
+    upstream: String,
+    line: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Ctx {
     Node,
@@ -800,6 +979,7 @@ enum Ctx {
     Group(String),
     DnsRoot,
     DnsUpstream,
+    DnsRequest,
     Routing,
     Ignored,
 }
@@ -819,6 +999,7 @@ fn build_with_providers(
 ) -> Config {
     let sha256 = sha256::hex(content.as_bytes());
     let mut parsed = parse(&content);
+    merge_includes(&mut parsed);
     // Provider nodes join the same table as the source's own nodes, so group
     // filters and routing see one flat roster. The source file and its digest
     // are untouched; the merged view is what every reader gets.
@@ -909,6 +1090,23 @@ fn build_with_providers(
         condition: None,
         line: fallback.line,
     };
+    let mut dns_rules = Vec::new();
+    for raw in parsed.dns_rules.drain(..) {
+        if !parsed.upstreams.iter().any(|upstream| upstream.name == raw.upstream) {
+            parsed.diagnostics.push(diagnostic(
+                raw.line,
+                "dns_upstream",
+                format!("DNS 规则引用的上游 `{}` 不存在", raw.upstream),
+            ));
+            continue;
+        }
+        dns_rules.push(DnsRule {
+            expression: raw.expression,
+            condition: raw.condition,
+            upstream: raw.upstream,
+            line: raw.line,
+        });
+    }
     Config {
         generation: format!("generation-{}", &sha256[..12]),
         revision: sha256.clone(),
@@ -920,6 +1118,8 @@ fn build_with_providers(
         nodes: parsed.nodes,
         groups,
         upstreams: parsed.upstreams,
+        dns_rules,
+        includes: parsed.includes,
         diagnostics: parsed.diagnostics,
         loaded_at: SystemTime::now(),
         modified,
@@ -1166,6 +1366,7 @@ fn parse(content: &str) -> Parsed {
                     upstream_block = true;
                     Ctx::DnsUpstream
                 }
+                (Some(Ctx::DnsRoot), "request") => Ctx::DnsRequest,
                 _ => Ctx::Ignored,
             };
             stack.push(next);
@@ -1193,6 +1394,15 @@ fn parse(content: &str) -> Parsed {
             Some(Ctx::DnsUpstream) => {
                 if upstream_block {
                     parse_upstream_line(text, line, &mut parsed);
+                }
+            }
+            Some(Ctx::DnsRequest) => parse_dns_rule_line(text, line, &mut parsed),
+            None => {
+                if let Some(inner) = text
+                    .strip_prefix("include(")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                {
+                    parsed.includes.push(unquote(inner.trim()));
                 }
             }
             _ => {}
@@ -1272,6 +1482,68 @@ fn parse_policy(value: &str) -> Option<Policy> {
             .and_then(|index| index.trim().parse().ok())
             .map(Policy::Fixed),
     }
+}
+
+/// Pulls every `include('name.dae')` file next to the source into the same
+/// parse. One level deep: an included file may not include further files.
+fn merge_includes(parsed: &mut Parsed) {
+    if parsed.includes.is_empty() {
+        return;
+    }
+    let names = parsed.includes.clone();
+    for name in names {
+        let path = data_dir().join(&name);
+        match fs::read_to_string(&path) {
+            Ok(extra) => {
+                let mut sub = parse(&extra);
+                parsed.nodes.extend(sub.nodes.drain(..));
+                parsed.groups.extend(sub.groups.drain(..));
+                parsed.rules.extend(sub.rules.drain(..));
+                parsed.upstreams.extend(sub.upstreams.drain(..));
+                parsed.dns_rules.extend(sub.dns_rules.drain(..));
+                parsed.diagnostics.extend(sub.diagnostics.drain(..));
+            }
+            Err(_) => parsed.diagnostics.push(Diagnostic {
+                level: "warning",
+                line: 0,
+                code: "include_missing",
+                message: format!("include 的源文件 `{name}` 不存在"),
+            }),
+        }
+    }
+}
+
+fn parse_dns_rule_line(text: &str, line: u32, parsed: &mut Parsed) {
+    let Some((condition_text, upstream_text)) = text.split_once("->") else {
+        parsed.diagnostics.push(diagnostic(
+            line,
+            "dns_rule",
+            "DNS 请求规则必须是 `条件 -> 上游名`".to_owned(),
+        ));
+        return;
+    };
+    let Some(condition) = parse_condition(condition_text.trim()) else {
+        parsed.diagnostics.push(diagnostic(
+            line,
+            "dns_rule",
+            "DNS 请求规则的条件必须是 domain(full: ...)、domain(suffix: ...) 或 ip(cidr: ...)"
+                .to_owned(),
+        ));
+        return;
+    };
+    let upstream = unquote(upstream_text.trim());
+    if upstream.is_empty() {
+        parsed
+            .diagnostics
+            .push(diagnostic(line, "dns_rule", "DNS 请求规则缺少上游名".to_owned()));
+        return;
+    }
+    parsed.dns_rules.push(DnsRuleRaw {
+        expression: text.to_owned(),
+        condition,
+        upstream,
+        line,
+    });
 }
 
 fn parse_upstream_line(text: &str, line: u32, parsed: &mut Parsed) {
@@ -1666,5 +1938,64 @@ mod tests {
         assert_eq!(config.fallback.index, 0);
         assert_eq!(config.diagnostics.len(), 1);
         assert_eq!(config.diagnostics[0].code, "fallback_missing");
+    }
+
+    #[test]
+    fn parses_dns_request_rules_and_reports_unknown_upstreams() {
+        let ok = config(
+            "node {\n  edge: 'socks5://10.0.0.2:1080'\n}\n\
+             dns {\n  upstream {\n    alidns: 'udp://223.5.5.5:53'\n  }\n  request {\n    domain(suffix: cn) -> alidns\n  }\n}\n\
+             routing {\n  fallback: edge\n}\n",
+        );
+        assert!(ok.diagnostics.is_empty());
+        assert_eq!(ok.dns_rules.len(), 1);
+        assert_eq!(ok.dns_rules[0].upstream, "alidns");
+        assert!(super::condition_matches(&ok.dns_rules[0].condition, "www.cn"));
+        assert!(!super::condition_matches(&ok.dns_rules[0].condition, "example.com"));
+
+        let broken = config(
+            "dns {\n  upstream {\n    alidns: 'udp://223.5.5.5:53'\n  }\n  request {\n    domain(suffix: cn) -> missing\n  }\n}\n\
+             routing {\n}\n",
+        );
+        assert!(broken.dns_rules.is_empty());
+        assert!(broken
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "dns_upstream" && diagnostic.level == "error"));
+    }
+
+    #[test]
+    fn rewrites_a_group_in_place_keeping_the_rest() {
+        let source = "node {\n  edge: 'socks5://10.0.0.2:1080'\n  backup: 'socks5://10.0.0.3:1080'\n}\n\
+             group {\n  proxy {\n    filter: name('edge')\n    filter: name('backup')\n    policy: fixed(0)\n    default: 'edge'\n  }\n  spare {\n    filter: name('backup')\n    policy: random\n  }\n}\n\
+             routing {\n  fallback: proxy\n}\n";
+        let rewritten =
+            super::rewrite_group(source, "proxy", Some("selector"), Some(Some("backup")), Some(None))
+                .unwrap();
+        assert!(rewritten.contains("policy: selector"));
+        assert!(rewritten.contains("default: 'backup'"));
+        assert!(!rewritten.contains("fixed(0)"));
+        assert!(rewritten.contains("filter: name('backup')"));
+        assert!(rewritten.contains("policy: random"));
+        let rebuilt = config(&rewritten);
+        assert!(rebuilt.diagnostics.is_empty());
+        assert_eq!(rebuilt.groups[0].policy, Policy::Selector);
+        assert_eq!(rebuilt.groups[0].default.as_deref(), Some("backup"));
+        assert_eq!(
+            super::rewrite_group(source, "nope", Some("selector"), None, None),
+            Err("group `nope` 在源文件中不存在".to_owned())
+        );
+    }
+
+    #[test]
+    fn validates_the_full_configuration_semantically() {
+        let good = "node {\n  edge: 'socks5://10.0.0.2:1080'\n}\nrouting {\n  fallback: edge\n}\n";
+        assert!(super::validate_full(good).0);
+        let bad = "node {\n  edge: 'socks5://10.0.0.2:1080'\n}\n\
+             group {\n  proxy {\n    filter: name('edge')\n    policy: score\n  }\n}\n\
+             routing {\n  fallback: proxy\n}\n";
+        let (valid, diagnostics) = super::validate_full(bad);
+        assert!(!valid);
+        assert!(diagnostics.contains("group_policy"));
     }
 }

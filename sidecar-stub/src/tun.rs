@@ -532,7 +532,7 @@ fn relay_flow(
     let meter = crate::outbounds::Meter::open(&decision);
     let bytes = meter.handle();
     let _open = OpenCount::new();
-    let live = crate::connections::Live::open(src, target);
+    let live = crate::connections::Live::open(src, target, None);
     let counters = Arc::clone(&live.counters);
     let _ = live; // keeps the connection listed until the relays end
 

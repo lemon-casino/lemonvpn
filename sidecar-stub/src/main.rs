@@ -11,6 +11,7 @@ mod api;
 mod base64;
 mod config;
 mod connections;
+mod control;
 mod crypto;
 mod dns;
 mod events;
