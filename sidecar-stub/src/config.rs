@@ -1121,9 +1121,25 @@ fn parse(content: &str) -> Parsed {
     let mut group: Option<RawGroup> = None;
     let mut upstream_block = false;
 
+    fn strip_comment(line: &str) -> &str {
+        // `#` only starts a comment outside quotes: node names, passwords and
+        // filters legitimately contain it inside quoted values.
+        let mut open: Option<char> = None;
+        for (index, character) in line.char_indices() {
+            match open {
+                Some(quote) if character == quote => open = None,
+                Some(_) => {}
+                None if character == '\'' || character == '"' => open = Some(character),
+                None if character == '#' => return &line[..index],
+                None => {}
+            }
+        }
+        line
+    }
+
     for (offset, raw) in content.lines().enumerate() {
         let line = (offset + 1) as u32;
-        let text = raw.split('#').next().unwrap_or("").trim();
+        let text = strip_comment(raw).trim();
         if text.is_empty() {
             continue;
         }
@@ -1518,6 +1534,23 @@ mod tests {
         assert_eq!(config.sha256.len(), 64);
         assert_eq!(config.upstreams.len(), 1);
         assert_eq!(config.upstreams[0].host, "223.5.5.5");
+    }
+
+    #[test]
+    fn parses_quoted_values_containing_hash_and_trailing_comments() {
+        let config = config(
+            "node {\n  lan: 'socks5://user:p#ss@10.0.0.2:1080'\n  'United-States #6': 'socks5://10.0.0.3:1081'\n}\n\
+             group {\n  proxy {\n    filter: name('lan') # local helper stays\n    filter: name('United-States #6')\n    policy: fixed(1)\n  }\n}\n\
+             routing {\n  fallback: proxy\n}\n",
+        );
+        assert!(config.diagnostics.is_empty());
+        let lan = config.nodes.iter().find(|node| node.name == "lan").unwrap();
+        assert_eq!(lan.password.as_deref(), Some("p#ss"));
+        let group = &config.groups[0];
+        assert_eq!(group.members, vec!["lan", "United-States #6"]);
+        let decision = super::decide_from(&config, "www.example.com");
+        assert_eq!(decision.outbound, "proxy");
+        assert_eq!(decision.chain, vec!["United-States #6"]);
     }
 
     #[test]
