@@ -499,14 +499,14 @@ fn tun_status_body() -> String {
 #[cfg(windows)]
 fn tun_capability() -> String {
     format!(
-        r#"{{"available":true,"enabled":{},"udp":"dns_only"}}"#,
+        r#""tun":{{"available":true,"enabled":{},"udp":"dns_only"}}"#,
         crate::tun::active()
     )
 }
 
 #[cfg(not(windows))]
 fn tun_capability() -> String {
-    r#"{"available":false}"#.to_owned()
+    r#""tun":{"available":false}"#.to_owned()
 }
 
 /// 应一次 TUN 开关请求,返回响应体或 (status, code, message)。
@@ -519,8 +519,10 @@ fn tun_set(body: &str) -> Result<String, (u16, &'static str, String)> {
     };
     let result = if enabled {
         crate::tun::enable()
-    } else {
+    } else if crate::tun::active() {
         crate::tun::disable()
+    } else {
+        Ok(())
     };
     match result {
         Ok(()) => Ok(crate::tun::status_json()),
