@@ -306,6 +306,7 @@ pub fn handle(
             Ok(body) => body,
             Err(message) => return error(&mut client, 400, "invalid_request", message, cors),
         },
+        "/api/v1/runtime/memory" => runtime_memory(),
         "/api/v1/runtime/memory/history" => match memory_history(query) {
             Ok(body) => body,
             Err(message) => return error(&mut client, 400, "invalid_request", message, cors),
@@ -779,6 +780,17 @@ fn history(query: &str) -> Result<String, &'static str> {
     ))
 }
 
+/// The latest memory sample as the contract's RuntimeMemory snapshot. This
+/// engine reads no cgroup and loads no eBPF, so those sections stay null.
+fn runtime_memory() -> String {
+    let rss = state::memory_samples().pop().and_then(|(_, rss)| rss);
+    format!(
+        r#"{{"observed_at":"{observed}","process":{{"rss_bytes":{rss}}},"cgroup":null,"kernel":null}}"#,
+        observed = state::iso8601(SystemTime::now()),
+        rss = rss.map_or_else(|| "null".to_owned(), |value| quoted(Some(value))),
+    )
+}
+
 fn memory_history(query: &str) -> Result<String, &'static str> {
     let window = match number(query, "window_seconds")? {
         Some(value) => value,
@@ -1169,5 +1181,27 @@ mod tests {
         assert_eq!(quoted(Some(0)), "\"0\"");
         assert_eq!(quoted(Some(18446744073709551615)), "\"18446744073709551615\"");
         assert_eq!(quoted(None), "null");
+    }
+
+    #[test]
+    fn serves_the_runtime_memory_snapshot() {
+        let body = super::runtime_memory();
+        assert!(body.contains("\"observed_at\":\""));
+        assert!(body.contains("\"cgroup\":null"));
+        assert!(body.contains("\"kernel\":null"));
+        let rss = body
+            .split("\"rss_bytes\":")
+            .nth(1)
+            .expect("process.rss_bytes is present")
+            .split(',')
+            .next()
+            .unwrap()
+            .trim_end_matches('}')
+            .to_owned();
+        let value = rss.trim_matches('"');
+        assert!(
+            rss == "null" || (value.parse::<u64>().is_ok() && rss.starts_with('"')),
+            "rss_bytes must be a decimal string or null, got {rss}"
+        );
     }
 }
