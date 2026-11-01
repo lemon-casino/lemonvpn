@@ -1,0 +1,17 @@
+# LemonVPN desktop shell, packaging and CI live here.
+# Upstream working clones are pinned via pins.env, not tracked here.
+/doona/
+/honk/
+
+# LCode workspace internals
+/.lcode/
+
+# Build artifacts and dependencies
+/target/
+/node_modules/
+/dist/
+
+# OS and editor noise
+Thumbs.db
+.DS_Store
+*.log
