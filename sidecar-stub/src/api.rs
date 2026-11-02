@@ -41,14 +41,17 @@ pub fn handle(
     let path = http::path_of(target);
     let query = target.split_once('?').map_or("", |(_, query)| query);
 
+    // Read the body once, before routing. A route that answers without
+    // consuming the body would otherwise close the socket with unread bytes,
+    // which Windows reports to the client as a connection reset — WebView
+    // fetch surfaces that as "Failed to fetch" (operation starts send `{}`).
+    let body = match read_body(&mut client, headers) {
+        Ok(body) => body,
+        Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
+    };
+
     match (method, path) {
         ("POST", "/api/v1/dns/query") => {
-            let body = match read_body(&mut client, headers) {
-                Ok(body) => body,
-                Err(message) => {
-                    return error(&mut client, 400, "invalid_request", &message, cors)
-                }
-            };
             return match dns::query_json(&body) {
                 Ok(body) => {
                     http::respond_with(&mut client, 200, &body, &format!("{CACHE_HEADERS}{cors}"))
@@ -57,12 +60,6 @@ pub fn handle(
             };
         }
         ("POST", "/api/v1/probes") => {
-            let body = match read_body(&mut client, headers) {
-                Ok(body) => body,
-                Err(message) => {
-                    return error(&mut client, 400, "invalid_request", &message, cors)
-                }
-            };
             return match probes::start(&body) {
                 Ok(accepted) => http::respond_with(
                     &mut client,
@@ -77,12 +74,6 @@ pub fn handle(
             };
         }
         ("POST", "/api/v1/config/validate") => {
-            let body = match read_body(&mut client, headers) {
-                Ok(body) => body,
-                Err(message) => {
-                    return error(&mut client, 400, "invalid_request", &message, cors)
-                }
-            };
             let Some(content) = json::field(&body, "content") else {
                 return error(
                     &mut client,
@@ -124,12 +115,6 @@ pub fn handle(
                     cors,
                 );
             }
-            let body = match read_body(&mut client, headers) {
-                Ok(body) => body,
-                Err(message) => {
-                    return error(&mut client, 400, "invalid_request", &message, cors)
-                }
-            };
             let Some(content) = json::field(&body, "content") else {
                 return error(
                     &mut client,
@@ -186,10 +171,6 @@ pub fn handle(
             };
         }
         ("POST", "/api/v1/providers") => {
-            let body = match read_body(&mut client, headers) {
-                Ok(body) => body,
-                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
-            };
             return match providers::create(&body) {
                 Ok((body, location)) => http::respond_with(
                     &mut client,
@@ -215,10 +196,6 @@ pub fn handle(
             };
         }
         ("POST", "/api/v1/tun/set") => {
-            let body = match read_body(&mut client, headers) {
-                Ok(body) => body,
-                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
-            };
             return match tun_set(&body) {
                 Ok(body) => {
                     http::respond_with(&mut client, 200, &body, &format!("{CACHE_HEADERS}{cors}"))
@@ -236,10 +213,6 @@ pub fn handle(
             );
         }
         ("POST", "/api/v1/nodes") => {
-            let body = match read_body(&mut client, headers) {
-                Ok(body) => body,
-                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
-            };
             return match providers::add_node(&body) {
                 Ok((body, location)) => http::respond_with(
                     &mut client,
@@ -297,31 +270,15 @@ pub fn handle(
             return control::start_resume(&mut client, cors);
         }
         ("POST", "/api/v1/routing/trace") => {
-            let body = match read_body(&mut client, headers) {
-                Ok(body) => body,
-                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
-            };
             return control::trace(&mut client, cors, &body);
         }
         ("POST", "/api/v1/config/sources") => {
-            let body = match read_body(&mut client, headers) {
-                Ok(body) => body,
-                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
-            };
             return control::create_source(&mut client, cors, &body);
         }
         ("PATCH", "/api/v1/runtime/settings") => {
-            let body = match read_body(&mut client, headers) {
-                Ok(body) => body,
-                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
-            };
             return control::patch_settings(&mut client, cors, &body);
         }
         ("PATCH", "/api/v1/geodata/settings") => {
-            let body = match read_body(&mut client, headers) {
-                Ok(body) => body,
-                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
-            };
             return control::patch_geodata(&mut client, cors, &body);
         }
         ("POST", "/api/v1/geodata/update") => {
@@ -329,19 +286,11 @@ pub fn handle(
         }
         ("PATCH", path) if path.starts_with("/api/v1/groups/") && path.ends_with("/config") => {
             let id = &path["/api/v1/groups/".len()..path.len() - "/config".len()];
-            let body = match read_body(&mut client, headers) {
-                Ok(body) => body,
-                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
-            };
             let if_match = http::header_value(headers, "If-Match");
             return control::patch_group(&mut client, cors, id, &body, if_match);
         }
         ("PUT", path) if path.starts_with("/api/v1/groups/") && path.ends_with("/selection") => {
             let id = &path["/api/v1/groups/".len()..path.len() - "/selection".len()];
-            let body = match read_body(&mut client, headers) {
-                Ok(body) => body,
-                Err(message) => return error(&mut client, 400, "invalid_request", &message, cors),
-            };
             return control::select(&mut client, cors, id, &body);
         }
         ("DELETE", path)

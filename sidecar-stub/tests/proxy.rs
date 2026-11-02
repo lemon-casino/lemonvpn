@@ -783,6 +783,17 @@ fn a_config_source_replacement_reloads_and_checks_the_revision() {
 }
 
 #[test]
+fn an_operation_start_drains_a_json_body_before_answering() {
+    // doona's starts client sends `{}`. The operation routes do not read it,
+    // and closing a socket with unread bytes makes the client see a reset
+    // instead of the 202 — the WebView reports that as "Failed to fetch".
+    let engine = Engine::start_with(Some("routing {\n  fallback: direct\n}\n"));
+    let accepted = engine.post("/api/v1/operations/reload", "{}");
+    assert!(accepted.starts_with("HTTP/1.1 202"), "响应: {accepted}");
+    assert!(accepted.contains(r#""kind":"reload""#), "响应: {accepted}");
+}
+
+#[test]
 fn routing_through_a_socks5_node_reaches_the_origin() {
     let echo = spawn_echo();
     let node = spawn_socks5(echo);
