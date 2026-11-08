@@ -175,6 +175,14 @@ async function prepareSidecar(cargo) {
     cpSync(join(dirname(sidecarBinary),'lemonvpn-service.exe'),join(binariesDir,'lemonvpn-service.exe'));
     cpSync(join(binariesDir,kernelBinaryName(triple)),join(dirname(sidecarBinary),kernelBinaryName(triple)));
   }
+  if (triple.endsWith('-apple-darwin')) {
+    // Dev runs load the kernel from the sidecar directory; the .app bundle
+    // finds it in Contents/Resources via tauri.macos.conf.json. The TUN
+    // service binary ships the same way for the LaunchDaemon install.
+    run(cargo, ['build','--release','--package','lemonvpn-engine-platform','--bin','lemonvpn-service','--target',triple,'--manifest-path',sidecarManifest]);
+    cpSync(join(dirname(sidecarBinary),'lemonvpn-service'),join(binariesDir,'lemonvpn-service'));
+    cpSync(join(binariesDir,kernelBinaryName(triple)),join(dirname(sidecarBinary),kernelBinaryName(triple)));
+  }
   console.log(`[prepare] sidecar 已复制到 ${dest}`);
   const wintun = wintunTarget(triple);
   if (wintun) {

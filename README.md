@@ -36,7 +36,7 @@ Windows 0.1.4 更新：修复 TUN 服务管道通信，服务安装/修复归入
 
 基于共享 Rust 代理引擎、[doona](https://github.com/Zakkaus/doona) 界面与 Tauri 2 构建桌面代理应用，目标覆盖 Windows / macOS / Linux、x86_64 / aarch64。Windows 0.1.3 接入固定版本 mihomo 提供协议兼容和双栈 TUN，共享 Rust 引擎保留配置、规则与监控。
 
-- 状态：Windows 0.1.3 补入 IPv4/IPv6 TCP/UDP TUN、协议兼容内核、开机自启和按需 TUN 服务；按用户要求只编译构建，不运行测试或启动新程序。具体范围与限制见 [Windows 0.1.3 说明](docs/windows-0.1.3.zh.md)。其他系统的原生 VPN 适配尚未实现。
+- 状态：Windows 0.1.3 补入 IPv4/IPv6 TCP/UDP TUN、协议兼容内核、开机自启和按需 TUN 服务；按用户要求只编译构建，不运行测试或启动新程序。具体范围与限制见 [Windows 0.1.3 说明](docs/windows-0.1.3.zh.md)。macOS 补齐系统代理、开机自启、单实例、RSS 与兼容内核分发，TUN 与进程归属尚未实现，真机验收待后续进行，见 [macOS 说明](docs/macos-0.1.31.zh.md)。
 - 当前优先级：稳定本机 Windows x64，正式发布和 ARM64 验收延后。已补单实例、按宿主归属恢复代理、子进程故障恢复和父进程退出兜底；长期运行与真实网络切换仍需验收。
 - 当前代码架构与扩展方式：[docs/engine-architecture.zh.md](docs/engine-architecture.zh.md)
 - 开发方案与架构决策:[docs/desktop-development-plan.zh.md](docs/desktop-development-plan.zh.md)
@@ -171,7 +171,7 @@ $env:LEMONVPN_PROXY='on';  cargo run --manifest-path app/src-tauri/Cargo.toml
 $env:LEMONVPN_PROXY='off'; cargo run --manifest-path app/src-tauri/Cargo.toml
 ```
 
-macOS(`networksetup`)与 Linux(`gsettings` / `kwriteconfig`)的系统代理配置器尚未实现,非 Windows 平台上开关报告为不可用。
+macOS 系统代理基于 `networksetup`,接管/恢复/归属语义与 Windows 一致(见 [macOS 说明](docs/macos-0.1.31.zh.md));Linux(`gsettings` / `kwriteconfig`)的系统代理配置器尚未实现,开关报告为不可用。
 
 ## 引擎守护(M1)
 

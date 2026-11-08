@@ -8,7 +8,7 @@
 //! background and finish their operation once the requested members answer.
 
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -447,7 +447,7 @@ fn probe_tcp(node: &config::Node, version: &'static str) -> Outcome {
         let address = SocketAddr::new(ip, node.port);
         let family = if ip.is_ipv4() { "ipv4" } else { "ipv6" };
         let started = Instant::now();
-        match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
+        match crate::platform::current().connect_tcp(address, CONNECT_TIMEOUT) {
             Ok(stream) => {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 return Outcome {

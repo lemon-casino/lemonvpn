@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "resources": {
+      "binaries/lemonvpn-kernel": "lemonvpn-kernel",
+      "binaries/lemonvpn-service": "lemonvpn-service",
+      "binaries/geoip.dat": "geoip.dat",
+      "binaries/geosite.dat": "geosite.dat",
+      "binaries/geodata.manifest.json": "geodata.manifest.json",
+      "binaries/geoip.LICENSE.txt": "geoip.LICENSE.txt",
+      "binaries/geosite.LICENSE.txt": "geosite.LICENSE.txt",
+      "binaries/mihomo.LICENSE.txt": "mihomo.LICENSE.txt",
+      "binaries/mihomo.manifest.json": "mihomo.manifest.json"
+    }
+  }
+}

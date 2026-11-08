@@ -6,8 +6,9 @@
 //! so switching the proxy off restores them instead of leaving the user with a
 //! loopback proxy that no longer has an engine behind it.
 //!
-//! macOS (`networksetup`) and Linux (`gsettings`/`kwriteconfig`) are not
-//! implemented yet; there the switch reports itself as unavailable.
+//! macOS delegates to `networksetup` with the same semantics; Linux
+//! (`gsettings`/`kwriteconfig`) is not implemented yet and reports itself as
+//! unavailable.
 
 /// What the UI needs to render the switch.
 #[derive(Clone, Debug)]
@@ -469,11 +470,438 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::ProxyStatus;
+    use serde::{Deserialize, Serialize};
+    use std::net::{SocketAddr, TcpStream};
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::Duration;
+
+    /// One protocol's settings for one network service, as `networksetup`
+    /// reports and accepts them.
+    #[derive(Clone, Default, Deserialize, Serialize)]
+    struct ProxyConfig {
+        enabled: bool,
+        host: Option<String>,
+        port: Option<u16>,
+    }
+
+    /// Everything taken over for one network service, restored on disable.
+    #[derive(Clone, Default, Deserialize, Serialize)]
+    struct ServiceSnapshot {
+        web: ProxyConfig,
+        secure: ProxyConfig,
+        socks: ProxyConfig,
+        bypass: Option<Vec<String>>,
+    }
+
+    /// The macOS counterpart of the Windows `HKCU\Software\LemonVPN` values.
+    #[derive(Deserialize, Serialize)]
+    struct ProxyState {
+        server: String,
+        owner_pid: u32,
+        services: Vec<(String, ServiceSnapshot)>,
+    }
+
+    const STATE_FILE: &str = "system-proxy.json";
+
+    fn state_path() -> PathBuf {
+        crate::default_data_dir().join(STATE_FILE)
+    }
+
+    fn load_state() -> Option<ProxyState> {
+        let bytes = std::fs::read(state_path()).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Written before any system setting changes, so a partial application is
+    /// always recoverable by [`recover_stale`] even if this process dies.
+    fn write_state(state: &ProxyState) -> Result<(), String> {
+        let path = state_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| format!("创建数据目录失败:{err}"))?;
+        }
+        let bytes = serde_json::to_vec(state).map_err(|err| err.to_string())?;
+        std::fs::write(&path, bytes).map_err(|err| format!("写入代理状态失败:{err}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    fn clear_state() -> Result<(), String> {
+        match std::fs::remove_file(state_path()) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("清理代理状态失败:{err}")),
+        }
+    }
+
+    fn networksetup(args: &[&str]) -> Result<String, String> {
+        let output = Command::new("networksetup")
+            .args(args)
+            .output()
+            .map_err(|err| format!("无法运行 networksetup:{err}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if stderr.is_empty() {
+                format!(
+                    "networksetup {} 失败(退出码 {:?})",
+                    args.join(" "),
+                    output.status.code()
+                )
+            } else {
+                format!("networksetup {} 失败:{stderr}", args.join(" "))
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn parse_services(output: &str) -> Vec<String> {
+        // The first line is the asterisk legend; a leading '*' marks a disabled
+        // service whose settings cannot be switched.
+        output
+            .lines()
+            .skip(1)
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('*'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn network_services() -> Result<Vec<String>, String> {
+        let output = networksetup(&["-listallnetworkservices"])?;
+        Ok(parse_services(&output))
+    }
+
+    fn get_flag(protocol: &str) -> &'static str {
+        match protocol {
+            "web" => "-getwebproxy",
+            "secure" => "-getsecurewebproxy",
+            _ => "-getsocksfirewallproxy",
+        }
+    }
+
+    fn set_flag(protocol: &str) -> &'static str {
+        match protocol {
+            "web" => "-setwebproxy",
+            "secure" => "-setsecurewebproxy",
+            _ => "-setsocksfirewallproxy",
+        }
+    }
+
+    fn state_flag(protocol: &str) -> &'static str {
+        match protocol {
+            "web" => "-setwebproxystate",
+            "secure" => "-setsecurewebproxystate",
+            _ => "-setsocksfirewallproxystate",
+        }
+    }
+
+    fn read_config(protocol: &str, service: &str) -> Result<ProxyConfig, String> {
+        let output = networksetup(&[get_flag(protocol), service])?;
+        Ok(parse_config(&output))
+    }
+
+    fn parse_config(output: &str) -> ProxyConfig {
+        let mut config = ProxyConfig::default();
+        for line in output.lines() {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            match name.trim() {
+                "Enabled" => config.enabled = value.eq_ignore_ascii_case("yes"),
+                "Server" if !value.is_empty() => config.host = Some(value.to_owned()),
+                "Port" => config.port = value.parse().ok(),
+                _ => {}
+            }
+        }
+        config
+    }
+
+    fn read_bypass(service: &str) -> Result<Option<Vec<String>>, String> {
+        let output = networksetup(&["-getproxybypassdomains", service])?;
+        let domains: Vec<String> = output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("There are"))
+            .map(str::to_owned)
+            .collect();
+        Ok((!domains.is_empty()).then_some(domains))
+    }
+
+    /// `networksetup` clears the list when the only extra argument is a blank.
+    fn set_bypass(service: &str, domains: &[&str]) -> Result<(), String> {
+        let mut args = vec!["-setproxybypassdomains", service];
+        if domains.is_empty() {
+            args.push(" ");
+        } else {
+            args.extend_from_slice(domains);
+        }
+        networksetup(&args).map(|_| ())
+    }
+
+    fn split_server(server: &str) -> Result<(&str, u16), String> {
+        let (host, port) = server
+            .rsplit_once(':')
+            .ok_or_else(|| format!("代理地址缺少端口:{server}"))?;
+        let port = port.parse().map_err(|_| format!("代理端口无效:{server}"))?;
+        Ok((host, port))
+    }
+
+    fn snapshot_services(services: &[String]) -> Result<Vec<(String, ServiceSnapshot)>, String> {
+        let mut snapshot = Vec::new();
+        for name in services {
+            snapshot.push((
+                name.clone(),
+                ServiceSnapshot {
+                    web: read_config("web", name)?,
+                    secure: read_config("secure", name)?,
+                    socks: read_config("socks", name)?,
+                    bypass: read_bypass(name)?,
+                },
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    fn apply_service(service: &str, host: &str, port: u16) -> Result<(), String> {
+        // `networksetup -set*proxy` enables the protocol while pointing it at
+        // the server; no separate state call is needed for the takeover.
+        for protocol in ["web", "secure", "socks"] {
+            networksetup(&[set_flag(protocol), service, host, &port.to_string()])?;
+        }
+        set_bypass(service, &["127.0.0.1", "localhost"])
+    }
+
+    /// Restores one service's recorded settings verbatim.
+    fn restore_service(service: &str, saved: &ServiceSnapshot) -> Result<(), String> {
+        for (protocol, config) in
+            [("web", &saved.web), ("secure", &saved.secure), ("socks", &saved.socks)]
+        {
+            if let (Some(host), Some(port)) = (config.host.as_deref(), config.port) {
+                networksetup(&[set_flag(protocol), service, host, &port.to_string()])?;
+            }
+            networksetup(&[
+                state_flag(protocol),
+                service,
+                if config.enabled { "on" } else { "off" },
+            ])?;
+        }
+        match &saved.bypass {
+            Some(domains) if !domains.is_empty() => {
+                let refs: Vec<&str> = domains.iter().map(String::as_str).collect();
+                set_bypass(service, &refs)
+            }
+            _ => set_bypass(service, &[]),
+        }
+    }
+
+    /// Whether any protocol on this service still points at our server.
+    fn current_is_ours(service: &str, host: &str, port: u16) -> bool {
+        for protocol in ["web", "secure", "socks"] {
+            if let Ok(config) = read_config(protocol, service) {
+                if config.enabled
+                    && config.host.as_deref() == Some(host)
+                    && config.port == Some(port)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Points the system proxy at `server`, remembering the pre-takeover
+    /// settings of every network service the first time this runs.
+    pub fn enable(server: &str) -> Result<(), String> {
+        let services = network_services()?;
+        let state = match load_state() {
+            // A snapshot only exists for the original user settings; keep it
+            // across restarts and ports, like the Windows SAVED values.
+            Some(mut state) => {
+                state.server = server.to_owned();
+                state.owner_pid = std::process::id();
+                state
+            }
+            None => ProxyState {
+                server: server.to_owned(),
+                owner_pid: std::process::id(),
+                services: snapshot_services(&services)?,
+            },
+        };
+
+        let (host, port) = split_server(server)?;
+        write_state(&state)?;
+        let mut applied = 0usize;
+        let mut first_error = None;
+        for (name, _) in &state.services {
+            match apply_service(name, host, port) {
+                Ok(()) => applied += 1,
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+        if applied == 0 {
+            // Nothing took effect; undo the recorded takeover so the state
+            // file does not claim settings that were never installed.
+            let snapshot = state.services.clone();
+            for (name, saved) in &snapshot {
+                let _ = restore_service(name, saved);
+            }
+            clear_state()?;
+            return Err(first_error.unwrap_or_else(|| "没有可用的网络服务".to_string()));
+        }
+        Ok(())
+    }
+
+    /// Restores the settings saved by [`enable`]. Leaves them alone when the
+    /// recorded server no longer matches — the user changed it themselves, and
+    /// their choice wins.
+    pub fn disable_for(server: &str) -> Result<(), String> {
+        disable_owned(server, std::process::id())
+    }
+
+    /// Used by the sidecar watchdog after its desktop parent has exited.
+    pub fn disable_owned(server: &str, owner: u32) -> Result<(), String> {
+        disable_impl(server, Some(owner)).map(|_| ())
+    }
+
+    fn disable_impl(server: &str, owner: Option<u32>) -> Result<bool, String> {
+        let Some(state) = load_state() else {
+            return Ok(false);
+        };
+        if state.server != server {
+            return Ok(false);
+        }
+        if owner.is_some_and(|pid| state.owner_pid != pid) {
+            return Ok(false);
+        }
+        let (host, port) = split_server(server)?;
+        let mut changed = false;
+        let mut first_error = None;
+        for (name, saved) in &state.services {
+            // A service the user reconfigured themselves keeps their choice;
+            // an unreadable service is treated the same way.
+            if current_is_ours(name, host, port) {
+                match restore_service(name, saved) {
+                    Ok(()) => changed = true,
+                    Err(err) => {
+                        first_error.get_or_insert(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        clear_state()?;
+        Ok(changed)
+    }
+
+    /// A dead process may still own a live pid through EPERM; both count as
+    /// alive, mirroring the Windows handle check.
+    fn is_running(pid: u32) -> bool {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        if unsafe { kill(pid as i32, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(1)
+    }
+
+    /// Recover a previous crash only when its recorded loopback server has no
+    /// listener. A live instance, unrelated proxy, or unreadable state is left
+    /// alone.
+    pub fn recover_stale() -> Result<(), String> {
+        let Some(state) = load_state() else {
+            return Ok(());
+        };
+        if is_running(state.owner_pid) {
+            return Ok(());
+        }
+        let Ok(address) = state.server.parse::<SocketAddr>() else {
+            return Ok(());
+        };
+        if !address.ip().is_loopback()
+            || TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok()
+        {
+            return Ok(());
+        }
+        disable_impl(&state.server, None).map(|_| ())
+    }
+
+    pub fn status() -> ProxyStatus {
+        let Some(state) = load_state() else {
+            return ProxyStatus {
+                enabled: false,
+                server: None,
+                error: None,
+            };
+        };
+        let Ok((host, port)) = split_server(&state.server) else {
+            return ProxyStatus {
+                enabled: false,
+                server: None,
+                error: Some(format!("代理地址无效:{}", state.server)),
+            };
+        };
+        ProxyStatus {
+            enabled: state
+                .services
+                .iter()
+                .any(|(name, _)| current_is_ours(name, host, port)),
+            server: Some(state.server),
+            error: None,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_services_and_skips_disabled() {
+            let output = "An asterisk (*) denotes that a network service is disabled.\nWi-Fi\n*Thunderbolt Bridge\nEthernet\n\n";
+            assert_eq!(parse_services(output), vec!["Wi-Fi", "Ethernet"]);
+            assert_eq!(parse_services("legend\n"), Vec::<String>::new());
+        }
+
+        #[test]
+        fn parses_proxy_config_lines() {
+            let output = "Enabled: Yes\nServer: 127.0.0.1\nPort: 18080\nAuthenticated Proxy Enabled: 0\n";
+            let config = parse_config(output);
+            assert!(config.enabled);
+            assert_eq!(config.host.as_deref(), Some("127.0.0.1"));
+            assert_eq!(config.port, Some(18080));
+
+            let disabled = parse_config("Enabled: No\nServer: \nPort: 0\n");
+            assert!(!disabled.enabled);
+            assert_eq!(disabled.host, None);
+            assert_eq!(disabled.port, Some(0));
+        }
+
+        #[test]
+        fn splits_loopback_servers() {
+            assert_eq!(split_server("127.0.0.1:18080"), Ok(("127.0.0.1", 18080)));
+            assert!(split_server("no-port").is_err());
+            assert!(split_server("127.0.0.1:oops").is_err());
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod imp {
     use super::ProxyStatus;
 
-    const UNSUPPORTED: &str = "系统代理开关目前只支持 Windows";
+    const UNSUPPORTED: &str = "系统代理开关目前支持 Windows 与 macOS";
 
     pub fn status() -> ProxyStatus {
         ProxyStatus {

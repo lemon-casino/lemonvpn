@@ -63,10 +63,12 @@ engine.shutdown()?;
 |---|---|
 | Windows | Wintun、IPv4 路由、物理接口 socket 绑定、RSS、数据目录 |
 | Linux | 标准 TCP/UDP socket、RSS、数据目录；TUN 尚未实现 |
-| macOS | 标准 TCP/UDP socket、数据目录；TUN 和 RSS 尚未实现 |
+| macOS | 标准 TCP/UDP socket、`networksetup` 系统代理、LaunchAgent 开机自启、单实例、RSS、数据目录；TUN 与进程归属尚未实现 |
 | Android / iOS | 预留宿主接口；原生 VPN 服务及绑定尚未实现 |
 
 未实现的原生 TUN 在 API 能力中报告 `available:false`，写入返回 501；能力由实际安装的后端决定，移动端无需伪装 Windows。现有 TUN 仍仅支持 IPv4 TCP 和 DNS UDP，普通 UDP 中继与 IPv6 不在此次变更范围内。
+
+macOS 系统代理沿用 Windows 的语义：接管前把每个网络服务的 HTTP/HTTPS/SOCKS 设置与旁路域名快照写入数据目录 `system-proxy.json`，禁用时只恢复仍指向本引擎端口的服务，用户自行修改过的服务保持用户选择；记录的归属进程退出且回环端口无监听时才做陈旧恢复。兼容内核以 `lemonvpn-kernel` 名义随包分发，进程组随拥有者回收；sidecar 通过 `getppid` 轮询实现等价于 Windows 父进程句柄的看门狗。壳层单实例在 POSIX 上复用同一锁文件并以 `flock` 加锁；开机自启写入 `~/Library/LaunchAgents/org.lemonvpn.desktop.plist`。
 
 Windows 后端在安装捕获路由前等待网卡地址进入 `IpDadStatePreferred`，避免系统选取其他网卡的源 IP 导致握手失败。设备、成功安装的路由和物理接口绑定由会话统一持有，部分安装失败时也清理；不额外配置系统默认网关。默认系统代理配置仍由桌面壳负责，原有备份/还原逻辑保留。
 

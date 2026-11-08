@@ -27,6 +27,9 @@
 /app/src-tauri/binaries/mihomo.manifest.json
 !/sidecar-stub/Cargo.lock
 !/app/src-tauri/Cargo.lock
+# Dev machines' global gitignore often carries a blanket `bin/` rule that
+# silently drops cargo auto-discovered binary sources; re-include ours.
+!/sidecar-stub/crates/engine-platform/src/bin/
 
 # Local diagnostic captures and generated branding drafts
 /sidecar-stub/PktMon.etl

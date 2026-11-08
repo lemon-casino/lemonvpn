@@ -15,6 +15,8 @@ use std::time::Duration;
 mod memory;
 #[cfg(windows)]
 mod windows;
+#[cfg(target_os = "macos")]
+mod darwin;
 
 /// Packet addressing agreed between the host adapter and the user-space stack.
 #[derive(Clone, Debug)]
@@ -149,20 +151,25 @@ struct NativePlatform;
 impl Platform for NativePlatform {
     fn external_tun(&self, enabled: bool) -> io::Result<()> {
         #[cfg(windows)] { windows::external_tun(enabled) }
-        #[cfg(not(windows))] { let _=enabled; Ok(()) }
+        #[cfg(target_os = "macos")] { darwin::external_tun(enabled) }
+        #[cfg(not(any(windows, target_os = "macos")))] { let _=enabled; Ok(()) }
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn connect_tcp(&self, address: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
-        windows::connect_tcp(address, timeout)
+        #[cfg(windows)] { windows::connect_tcp(address, timeout) }
+        #[cfg(target_os = "macos")] { darwin::connect_tcp(address, timeout) }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn bind_udp(&self, local: SocketAddr) -> io::Result<UdpSocket> {
-        windows::bind_udp(local)
+        #[cfg(windows)] { windows::bind_udp(local) }
+        #[cfg(target_os = "macos")] { darwin::bind_udp(local) }
     }
 
     fn tun_supported(&self) -> bool {
-        cfg!(windows)
+        // Windows captures with its own wintun adapter; macOS delegates to the
+        // privileged TUN service installed from the same app bundle.
+        cfg!(any(windows, target_os = "macos"))
     }
 
     #[cfg(windows)]
@@ -193,7 +200,7 @@ pub fn current() -> &'static dyn Platform {
     PLATFORM.get_or_init(|| Arc::new(NativePlatform)).as_ref()
 }
 
-fn default_data_dir() -> PathBuf {
+pub(crate) fn default_data_dir() -> PathBuf {
     #[cfg(windows)]
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         return PathBuf::from(local).join("LemonVPN");
@@ -216,5 +223,7 @@ pub mod tun_bridge;
 pub mod process;
 #[cfg(windows)]
 pub mod service;
+#[cfg(target_os = "macos")]
+pub mod service_macos;
 #[cfg(windows)]
 pub mod parent;

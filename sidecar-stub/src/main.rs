@@ -12,6 +12,38 @@ fn main() {
         }),
         Err(_) => DEFAULT_PORT,
     };
+    #[cfg(not(windows))]
+    {
+        // Full-system TUN traffic fans out into one socket per flow; the
+        // default 256 soft file-descriptor limit exhausts within seconds.
+        unsafe {
+            extern "C" {
+                fn getrlimit(resource: i32, limit: *mut Rlimit) -> i32;
+                fn setrlimit(resource: i32, limit: *const Rlimit) -> i32;
+            }
+            #[repr(C)]
+            struct Rlimit {
+                current: u64,
+                maximum: u64,
+            }
+            const RLIMIT_NOFILE: i32 = 8;
+            const RLIM_INFINITY: u64 = 0x7fff_ffff_ffff_ffff;
+            const OPEN_MAX: u64 = 10240;
+            let mut limit = Rlimit {
+                current: 0,
+                maximum: 0,
+            };
+            if getrlimit(RLIMIT_NOFILE, &mut limit) == 0 {
+                let ceiling = if limit.maximum == RLIM_INFINITY {
+                    OPEN_MAX
+                } else {
+                    limit.maximum
+                };
+                limit.current = limit.current.max(ceiling);
+                setrlimit(RLIMIT_NOFILE, &limit);
+            }
+        }
+    }
     #[cfg(windows)]
     let parent = env::var("LEMONVPN_PARENT_PID")
         .ok()
@@ -30,6 +62,25 @@ fn main() {
             *pid,
         );
         return;
+    }
+    #[cfg(not(windows))]
+    extern "C" {
+        fn getppid() -> i32;
+    }
+    #[cfg(not(windows))]
+    let parent_pid = env::var("LEMONVPN_PARENT_PID")
+        .ok()
+        .and_then(|pid| pid.parse::<u32>().ok());
+    #[cfg(not(windows))]
+    if let Some(pid) = parent_pid {
+        if unsafe { getppid() } != pid as i32 {
+            eprintln!("lemonvpn-engine-stub: parent {pid} is unavailable");
+            let _ = lemonvpn_engine_core::platform::system_proxy::disable_owned(
+                &format!("127.0.0.1:{port}"),
+                pid,
+            );
+            return;
+        }
     }
     let mut engine = Engine::start(EngineOptions {
         port,
@@ -69,6 +120,27 @@ fn main() {
             );
             return;
         }
+    }
+    #[cfg(not(windows))]
+    if let Some(pid) = parent_pid {
+        thread::spawn(move || {
+            let mut engine = engine;
+            // The portable stand-in for the Windows process handle: once the
+            // shell dies, the kernel re-parents this process and the engine
+            // must restore the network before exiting.
+            loop {
+                thread::sleep(std::time::Duration::from_secs(2));
+                if unsafe { getppid() } != pid as i32 {
+                    let _ = lemonvpn_engine_core::platform::system_proxy::disable_owned(
+                        &format!("127.0.0.1:{}", engine.local_addr().port()),
+                        pid,
+                    );
+                    let _ = engine.shutdown();
+                    eprintln!("lemonvpn-engine-stub: parent exited; owned state restored");
+                    process::exit(0);
+                }
+            }
+        });
     }
     loop {
         thread::park();

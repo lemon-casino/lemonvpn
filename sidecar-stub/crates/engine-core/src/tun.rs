@@ -626,7 +626,9 @@ pub(crate) fn active() -> bool {
 }
 
 pub(crate) fn supported() -> bool {
-    crate::compat::available() || platform::current().tun_supported()
+    // Kernel TUN exists only where capture can be privileged: Windows uses its
+    // own wintun adapter, macOS delegates to the installed TUN service.
+    platform::current().tun_supported()
 }
 
 pub(crate) fn enable() -> io::Result<()> {

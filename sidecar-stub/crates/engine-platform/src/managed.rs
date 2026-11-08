@@ -40,9 +40,14 @@ pub const CORE_BINARY_NAME: &str = if cfg!(windows) {
 pub fn core_path() -> Option<PathBuf> {
     let name = CORE_BINARY_NAME;
     let directory = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    [directory.join(name), directory.join("resources").join(name)]
-        .into_iter()
-        .find(|p| p.is_file())
+    // `../Resources` matches the macOS .app layout next to Contents/MacOS.
+    [
+        directory.join(name),
+        directory.join("resources").join(name),
+        directory.join("../Resources").join(name),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
 }
 
 pub fn free_port() -> io::Result<u16> {
@@ -135,7 +140,16 @@ impl CoreProcess {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x0800_0000);
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // A dedicated process group lets Drop reach helper children too.
+            command.process_group(0);
+        }
+        #[cfg(windows)]
         let mut child = command.spawn()?;
+        #[cfg(not(windows))]
+        let child = command.spawn()?;
         #[cfg(windows)]
         let job = unsafe {
             use std::os::windows::io::AsRawHandle;
@@ -212,6 +226,15 @@ impl Drop for CoreProcess {
             Some(&serde_json::json!({"tun":{"enable":false}})),
         );
         let _ = self.child.kill();
+        #[cfg(unix)]
+        unsafe {
+            extern "C" {
+                fn killpg(pgrp: i32, sig: i32) -> i32;
+            }
+            // SIGKILL the group started by `process_group(0)` so helpers the
+            // kernel spawned cannot outlive the owner either.
+            let _ = killpg(self.child.id() as i32, 9);
+        }
         let _ = self.child.wait();
         #[cfg(windows)]
         unsafe {
@@ -276,7 +299,11 @@ pub fn uplink_name() -> Option<String> {
     {
         crate::windows::uplink_name().ok()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::darwin::uplink_name()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         None
     }

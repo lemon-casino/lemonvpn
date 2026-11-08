@@ -1,13 +1,15 @@
-//! A Windows file handle owns the instance lock. Windows releases it even if
-//! the process crashes; a stale PID file alone never prevents a later start.
+//! One shell instance per data directory. Windows keeps a file handle open
+//! with exclusive sharing and POSIX hosts keep an `flock` on the same lock
+//! file; both release even if the process crashes, so a stale PID text alone
+//! never prevents a later start.
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const LOCK_FILE: &str = "desktop.lock";
-const FILE_SHARE_READ: u32 = 1;
 
 pub struct InstanceGuard {
     _file: File,
@@ -17,12 +19,31 @@ pub struct InstanceGuard {
 pub fn data_dir() -> PathBuf {
     std::env::var_os("LEMONVPN_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("LOCALAPPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir)
-                .join("LemonVPN")
-        })
+        .unwrap_or_else(default_data_dir)
+}
+
+#[cfg(windows)]
+fn default_data_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("LemonVPN")
+}
+
+#[cfg(target_os = "macos")]
+fn default_data_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Library/Application Support/LemonVPN"))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn default_data_dir() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("lemonvpn")
 }
 
 impl InstanceGuard {
@@ -30,6 +51,15 @@ impl InstanceGuard {
     /// Ordinary duplicate launches return immediately without starting an engine.
     pub fn acquire(directory: &Path, wait: Duration) -> io::Result<Option<Self>> {
         std::fs::create_dir_all(directory)?;
+        #[cfg(windows)]
+        return Self::acquire_shared(directory, wait);
+        #[cfg(unix)]
+        return Self::acquire_flock(directory, wait);
+    }
+
+    #[cfg(windows)]
+    fn acquire_shared(directory: &Path, wait: Duration) -> io::Result<Option<Self>> {
+        const FILE_SHARE_READ: u32 = 1;
         let deadline = Instant::now() + wait;
         loop {
             match OpenOptions::new()
@@ -43,7 +73,6 @@ impl InstanceGuard {
                 Ok(mut file) => {
                     let mut previous = String::new();
                     (&mut file).take(64).read_to_string(&mut previous)?;
-                    use std::io::{Seek, SeekFrom};
                     file.seek(SeekFrom::Start(0))?;
                     file.set_len(0)?;
                     write!(file, "{}", std::process::id())?;
@@ -63,8 +92,44 @@ impl InstanceGuard {
             }
         }
     }
+
+    #[cfg(unix)]
+    fn acquire_flock(directory: &Path, wait: Duration) -> io::Result<Option<Self>> {
+        use std::os::unix::io::AsRawFd;
+        const LOCK_EX: i32 = 2;
+        const LOCK_NB: i32 = 4;
+        extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        let deadline = Instant::now() + wait;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join(LOCK_FILE))?;
+        loop {
+            if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+                let mut previous = String::new();
+                (&mut file).take(64).read_to_string(&mut previous)?;
+                file.seek(SeekFrom::Start(0))?;
+                file.set_len(0)?;
+                write!(file, "{}", std::process::id())?;
+                file.flush()?;
+                return Ok(Some(Self {
+                    _file: file,
+                    previous_owner: previous.trim().parse::<u32>().is_ok(),
+                }));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
+#[cfg(windows)]
 pub fn activate_existing(directory: &Path) {
     use windows_sys::Win32::UI::WindowsAndMessaging::EnumWindows;
     let Some(pid) = std::fs::read_to_string(directory.join(LOCK_FILE))
@@ -76,6 +141,10 @@ pub fn activate_existing(directory: &Path) {
     unsafe { EnumWindows(Some(show_owned_window), pid as isize) };
 }
 
+#[cfg(not(windows))]
+pub fn activate_existing(_directory: &Path) {}
+
+#[cfg(windows)]
 unsafe extern "system" fn show_owned_window(
     window: windows_sys::Win32::Foundation::HWND,
     expected_pid: isize,

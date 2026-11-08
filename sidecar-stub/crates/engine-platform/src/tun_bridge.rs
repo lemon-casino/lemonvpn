@@ -1,6 +1,10 @@
 //! A fixed TUN-to-authenticated-loopback bridge. Privileged code never receives
 //! proxy definitions, executable paths, arbitrary core configs or API requests.
 use crate::managed::{self, CoreProcess};
+#[cfg(windows)]
+use crate::service as broker;
+#[cfg(target_os = "macos")]
+use crate::service_macos as broker;
 use serde_json::{json, Value};
 use std::{
     io,
@@ -110,7 +114,7 @@ pub fn apply_processes(config: &mut Value, names: &[String]) -> io::Result<()> {
 
 enum Owner {
     Local(CoreProcess),
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     Service,
 }
 pub struct TunBridge {
@@ -131,10 +135,10 @@ impl TunBridge {
     ) -> io::Result<Self> {
         let mut config = configuration(router_port, dns_port, password)?;
         apply_processes(&mut config, &process_names)?;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
-            if crate::service::installed() {
-                crate::service::request(
+            if broker::installed() {
+                broker::request(
                     &json!({"action":"start","router_port":router_port,"dns_port":dns_port,"password":password,"process_names":process_names}),
                 )?;
                 return Ok(Self {
@@ -146,7 +150,7 @@ impl TunBridge {
                     process_names,
                 });
             }
-            if !crate::service::is_elevated() {
+            if !broker::is_elevated() {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "TUN 需要先安装管理员服务",
@@ -176,9 +180,9 @@ impl TunBridge {
         apply_processes(&mut next, &names)?;
         match &mut self.owner {
             Owner::Local(process) => process.configure(next.clone())?,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Owner::Service => {
-                crate::service::request(&json!({"action":"process_rules","process_names":names}))?;
+                broker::request(&json!({"action":"process_rules","process_names":names}))?;
             }
         }
         self.config = next;
@@ -191,8 +195,8 @@ impl TunBridge {
             Owner::Local(process) => process
                 .request("POST", "/cache/dns/flush", None)
                 .map(|_| ()),
-            #[cfg(windows)]
-            Owner::Service => crate::service::request(&json!({"action":"flush_dns"}))
+            #[cfg(any(windows, target_os = "macos"))]
+            Owner::Service => broker::request(&json!({"action":"flush_dns"}))
                 .map(|_| ())
                 .map_err(|error| {
                     io::Error::other(format!(
@@ -210,8 +214,8 @@ impl TunBridge {
         }
         self.cached = match &mut self.owner {
             Owner::Local(process) => process.alive(),
-            #[cfg(windows)]
-            Owner::Service => crate::service::request(&json!({"action":"status"}))
+            #[cfg(any(windows, target_os = "macos"))]
+            Owner::Service => broker::request(&json!({"action":"status"}))
                 .ok()
                 .and_then(|v| v.get("enabled").and_then(Value::as_bool))
                 .unwrap_or(false),
@@ -229,9 +233,9 @@ impl TunBridge {
                     process.request("PATCH", "/configs", Some(&json!({"tun":{"enable":false}})))?;
                 }
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Owner::Service => {
-                crate::service::request(&json!({"action":"stop"}))?;
+                broker::request(&json!({"action":"stop"}))?;
             }
         }
         self.stopped = true;
@@ -241,9 +245,9 @@ impl TunBridge {
 }
 impl Drop for TunBridge {
     fn drop(&mut self) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         if !self.stopped && matches!(self.owner, Owner::Service) {
-            let _ = crate::service::request(&json!({"action":"stop"}));
+            let _ = broker::request(&json!({"action":"stop"}));
         }
     }
 }

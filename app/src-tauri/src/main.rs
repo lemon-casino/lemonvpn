@@ -2,7 +2,7 @@
 
 mod engine;
 mod integration;
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 mod instance;
 mod proxy;
 mod window;
@@ -465,7 +465,7 @@ setInterval(tick, 500);
 </html>"##;
 
 fn main() {
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     let _instance = {
         let directory = instance::data_dir();
         let handover = std::env::args().any(|arg| arg == ENABLE_TUN_ARG);
@@ -490,7 +490,7 @@ fn main() {
     };
     // A crashed host releases its instance lock before its sidecar watchdog
     // finishes cleanup. Let that owned listener disappear before replacing it.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     if _instance.previous_owner {
         wait_for_port_release(engine::configured_port(), Duration::from_secs(3));
     }
