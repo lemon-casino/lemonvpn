@@ -2,9 +2,8 @@
 //!
 //! The shell never proxies traffic itself: it starts the engine as a separate
 //! process, waits for its loopback health endpoint, and kills it on exit. The
-//! real engine is honk-core, which does not build on Windows yet (it links
-//! `nix` and `libsystemd`); `sidecar-stub` stands in so the seam can be
-//! exercised on every platform.
+//! sidecar hosts the shared engine library; its legacy filename is retained
+//! for compatibility with existing installations.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -12,7 +11,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Port the engine listens on unless `LEMONVPN_ENGINE_PORT` overrides it.
@@ -47,6 +46,9 @@ pub struct EngineStatus {
 }
 
 pub struct Engine {
+    /// Serializes spawn/health/restart against shutdown.
+    lifecycle: Mutex<()>,
+    wake: (Mutex<()>, Condvar),
     child: Mutex<Option<Child>>,
     status: Mutex<EngineStatus>,
     port: u16,
@@ -58,19 +60,31 @@ pub struct Engine {
     stopping: AtomicBool,
     restarts: Mutex<u32>,
     last_start: Mutex<Option<Instant>>,
+    path: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+    owned_datapath: AtomicBool,
 }
 
 impl Engine {
     /// Builds the supervisor and performs the first start.
     pub fn start() -> Self {
+        Self::start_at(port_from_env(), resolve_engine_path(), None)
+    }
+
+    fn start_at(port: u16, path: Option<PathBuf>, data_dir: Option<PathBuf>) -> Self {
         let engine = Engine {
+            lifecycle: Mutex::new(()),
+            wake: (Mutex::new(()), Condvar::new()),
             child: Mutex::new(None),
-            port: port_from_env(),
+            port,
             logs: Arc::new(Mutex::new(VecDeque::new())),
             started: Instant::now(),
             stopping: AtomicBool::new(false),
             restarts: Mutex::new(0),
             last_start: Mutex::new(None),
+            path,
+            data_dir,
+            owned_datapath: AtomicBool::new(false),
             status: Mutex::new(EngineStatus {
                 state: "stopped".to_string(),
                 detail: String::new(),
@@ -84,9 +98,12 @@ impl Engine {
     /// for every restart.
     fn spawn_once(&self) {
         let port = self.port;
-        let Some(path) = resolve_engine_path() else {
+        if self.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(path) = self.path.as_ref() else {
             let detail =
-                "未找到引擎二进制:设置 LEMONVPN_ENGINE,或把 honk-core / lemonvpn-engine-stub 放到应用同目录"
+                "未找到引擎二进制:设置 LEMONVPN_ENGINE,或把 lemonvpn-engine-stub 放到应用同目录"
                     .to_string();
             self.log(&detail);
             *self.status.lock().unwrap() = EngineStatus {
@@ -100,6 +117,10 @@ impl Engine {
 
         let mut command = Command::new(&path);
         command.env("LEMONVPN_ENGINE_PORT", port.to_string());
+        command.env("LEMONVPN_PARENT_PID", std::process::id().to_string());
+        if let Some(directory) = &self.data_dir {
+            command.env("LEMONVPN_DATA_DIR", directory);
+        }
         // Piped so the log window can show what the engine says; in a GUI
         // build inherited stdio goes nowhere.
         command.stderr(Stdio::piped());
@@ -118,7 +139,8 @@ impl Engine {
                     });
                 }
 
-                let status = match wait_for_health(port, &mut child, HEALTH_TIMEOUT) {
+                let status = match wait_for_health(port, &mut child, HEALTH_TIMEOUT, &self.stopping)
+                {
                     Ok(()) => EngineStatus {
                         state: "running".to_string(),
                         detail: format!("{} 已在 127.0.0.1:{port} 就绪", path.display()),
@@ -143,12 +165,22 @@ impl Engine {
                         state: "unhealthy".to_string(),
                         detail: format!("{} 已启动,但 /health 未在 10 秒内响应", path.display()),
                     },
+                    Err(HealthFailure::Cancelled) => EngineStatus {
+                        state: "stopped".to_string(),
+                        detail: "引擎启动已取消".to_string(),
+                    },
                 };
                 self.log(&status.detail);
                 if status.state == "running" {
                     *self.last_start.lock().unwrap() = Some(Instant::now());
+                    self.owned_datapath.store(true, Ordering::SeqCst);
+                    *self.child.lock().unwrap() = Some(child);
+                } else {
+                    // A failed health check must not leave a live child holding
+                    // the port while the supervisor starts another process.
+                    let _ = child.kill();
+                    let _ = child.wait();
                 }
-                *self.child.lock().unwrap() = Some(child);
                 *self.status.lock().unwrap() = status;
             }
             Err(err) => {
@@ -165,7 +197,8 @@ impl Engine {
     /// One supervision step: restarts a dead engine with exponential backoff.
     /// Returns true when the engine gave up, in which case the caller must
     /// turn the system proxy off so it does not point at a dead port.
-    pub fn tick(&self) -> bool {
+    pub fn tick(&self, on_exit: impl FnOnce()) -> bool {
+        let _lifecycle = self.lifecycle.lock().unwrap();
         if self.stopping.load(Ordering::SeqCst) {
             return false;
         }
@@ -184,12 +217,18 @@ impl Engine {
                     Some(code) => format!("引擎进程已退出(退出码 {code})"),
                     None => "引擎进程已退出".to_string(),
                 });
+                // Restore capture routes before attempting another process,
+                // rather than leaving traffic trapped throughout retry backoff.
+                on_exit();
             }
             ChildState::Absent => {}
         }
 
         let state = self.status().state;
-        if matches!(state.as_str(), "missing" | "failed" | "stopped") {
+        if matches!(
+            state.as_str(),
+            "missing" | "failed" | "stopped" | "port_in_use"
+        ) {
             return false;
         }
 
@@ -227,7 +266,14 @@ impl Engine {
             ),
         };
 
-        std::thread::sleep(backoff);
+        let _wait = self
+            .wake
+            .1
+            .wait_timeout_while(self.wake.0.lock().unwrap(), backoff, |_| {
+                !self.stopping.load(Ordering::SeqCst)
+            })
+            .unwrap();
+        drop(_wait);
         if self.stopping.load(Ordering::SeqCst) {
             return false;
         }
@@ -258,6 +304,11 @@ impl Engine {
         self.port
     }
 
+    /// A failed or foreign listener never grants permission to clean up TUN.
+    pub fn owned_datapath(&self) -> bool {
+        self.owned_datapath.load(Ordering::SeqCst)
+    }
+
     /// The recent engine output, oldest first.
     pub fn logs(&self) -> String {
         let logs = self.logs.lock().unwrap();
@@ -274,7 +325,12 @@ impl Engine {
     /// Kills the engine process and stops the supervisor from restarting it.
     /// Safe to call more than once.
     pub fn shutdown(&self) {
-        self.stopping.store(true, Ordering::SeqCst);
+        {
+            let _wake = self.wake.0.lock().unwrap();
+            self.stopping.store(true, Ordering::SeqCst);
+            self.wake.1.notify_all();
+        }
+        let _lifecycle = self.lifecycle.lock().unwrap();
         if let Some(mut child) = self.child.lock().unwrap().take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -283,6 +339,12 @@ impl Engine {
             state: "stopped".to_string(),
             detail: "引擎已停止".to_string(),
         };
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -300,6 +362,11 @@ fn push_line(logs: &Mutex<VecDeque<String>>, started: Instant, line: impl AsRef<
     ));
 }
 
+/// The port the next engine start will use, read before the engine exists.
+pub fn configured_port() -> u16 {
+    port_from_env()
+}
+
 fn port_from_env() -> u16 {
     std::env::var("LEMONVPN_ENGINE_PORT")
         .ok()
@@ -307,7 +374,7 @@ fn port_from_env() -> u16 {
         .unwrap_or(DEFAULT_PORT)
 }
 
-/// Order: `LEMONVPN_ENGINE` → `honk-core` beside the shell binary → the bundled
+/// Order: `LEMONVPN_ENGINE` → the bundled
 /// stub (`lemonvpn-engine-stub`, what `bundle.externalBin` installs) beside the
 /// shell binary → in debug builds, the stub built from this workspace.
 fn resolve_engine_path() -> Option<PathBuf> {
@@ -319,11 +386,6 @@ fn resolve_engine_path() -> Option<PathBuf> {
     }
 
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let bundled = exe_dir.join(exe_name("honk-core"));
-    if bundled.is_file() {
-        return Some(bundled);
-    }
-
     // Tauri strips the target triple from externalBin, so the sidecar lands next
     // to the shell as a plain `lemonvpn-engine-stub.exe`.
     let stub = exe_dir.join(exe_name("lemonvpn-engine-stub"));
@@ -372,6 +434,7 @@ enum HealthFailure {
     ChildExited(Option<i32>),
     /// Nothing usable answered before the deadline.
     TimedOut,
+    Cancelled,
 }
 
 /// One probe of the loopback health endpoint.
@@ -385,11 +448,19 @@ enum Probe {
     Silent,
 }
 
-fn wait_for_health(port: u16, child: &mut Child, timeout: Duration) -> Result<(), HealthFailure> {
+fn wait_for_health(
+    port: u16,
+    child: &mut Child,
+    timeout: Duration,
+    stopping: &AtomicBool,
+) -> Result<(), HealthFailure> {
     let pid = child.id();
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
+        if stopping.load(Ordering::SeqCst) {
+            return Err(HealthFailure::Cancelled);
+        }
         match child.try_wait() {
             Ok(Some(exit)) if exit.code() == Some(ENGINE_EXIT_PORT_IN_USE) => {
                 return Err(HealthFailure::PortInUse)
@@ -453,7 +524,9 @@ fn probe(port: u16, pid: u32) -> Probe {
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 #[cfg(windows)]
@@ -470,6 +543,89 @@ fn suppress_console_window(_command: &mut Command) {}
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[cfg(windows)]
+    fn sidecar() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries")
+            .join("lemonvpn-engine-stub-x86_64-pc-windows-msvc.exe")
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn supervisor_recovers_child_exit_cancels_restart_and_does_not_adopt_foreign_port() {
+        let directory =
+            std::env::temp_dir().join(format!("lemonvpn-supervisor-{}", std::process::id()));
+        let port = TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let engine = Arc::new(Engine::start_at(port, Some(sidecar()), Some(directory)));
+        assert_eq!(engine.status().state, "running");
+        let first_pid = engine.child.lock().unwrap().as_ref().unwrap().id();
+        engine
+            .child
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .kill()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let crash_notified = AtomicBool::new(false);
+        assert!(!engine.tick(|| crash_notified.store(true, Ordering::SeqCst)));
+        assert!(crash_notified.load(Ordering::SeqCst));
+        assert_eq!(engine.status().state, "running");
+        let second_pid = engine.child.lock().unwrap().as_ref().unwrap().id();
+        assert_ne!(first_pid, second_pid);
+        // Health must belong to the replacement process, not a stale listener.
+        assert_eq!(probe(port, second_pid), Probe::Ready);
+        engine
+            .child
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .kill()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let ticking = Arc::clone(&engine);
+        let tick = std::thread::spawn(move || ticking.tick(|| {}));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while engine.status().state != "restarting" {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let stopped = Instant::now();
+        engine.shutdown();
+        tick.join().unwrap();
+        assert!(
+            stopped.elapsed() < Duration::from_secs(1),
+            "shutdown must cancel restart backoff"
+        );
+        assert!(engine.child.lock().unwrap().is_none());
+        let listener = TcpListener::bind(("127.0.0.1", port)).expect("shutdown released the port");
+        drop(engine);
+        drop(listener);
+
+        let foreign = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = foreign.local_addr().unwrap().port();
+        let foreign_server = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = foreign.accept() {
+                let _ = socket.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            }
+        });
+        let engine = Engine::start_at(port, Some(sidecar()), None);
+        assert_eq!(engine.status().state, "port_in_use");
+        assert!(!engine.owned_datapath());
+        assert!(engine.child.lock().unwrap().is_none());
+        assert!(!engine.tick(|| {}));
+        assert_eq!(engine.status().state, "port_in_use");
+        foreign_server.join().unwrap();
+    }
 
     /// Serves one canned HTTP response, then closes.
     fn serve_once(response: &'static str) -> u16 {
@@ -505,9 +661,8 @@ mod tests {
 
     #[test]
     fn probe_rejects_a_bare_200() {
-        let port = serve_once(
-            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-        );
+        let port =
+            serve_once("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
         assert_eq!(probe(port, 4242), Probe::Foreign);
     }
 

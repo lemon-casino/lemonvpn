@@ -745,6 +745,21 @@ fn memory_history_reports_process_memory() {
 }
 
 #[test]
+fn desktop_status_reports_the_real_listener_and_native_memory() {
+    let engine = Engine::start();
+    let response = engine.get("/api/v1/desktop/status");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains(&format!("127.0.0.1:{}", engine.port)), "{response}");
+    assert!(response.contains(r#""protocols":["HTTP","SOCKS5"]"#), "{response}");
+    if cfg!(windows) {
+        assert!(uint_field(&response, "rss_bytes") > 0, "{response}");
+        assert!(uint_field(&response, "peak_rss_bytes") >= uint_field(&response, "rss_bytes"), "{response}");
+        assert!(uint_field(&response, "private_bytes") > 0, "{response}");
+        assert!(uint_field(&response, "total_bytes") >= uint_field(&response, "available_bytes"), "{response}");
+    }
+}
+
+#[test]
 fn a_config_source_replacement_reloads_and_checks_the_revision() {
     let engine = Engine::start_with(Some("# old\nrouting {\n  fallback: direct\n}\n"));
     let config = engine.get("/api/v1/config");

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["nsis"],
+    "windows": {
+      "nsis": {
+        "installerHooks": "windows/hooks.nsh",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico"
+      }
+    },
+    "resources": {
+      "binaries/lemonvpn-kernel.exe": "lemonvpn-kernel.exe",
+      "binaries/geoip.dat": "geoip.dat",
+      "binaries/geosite.dat": "geosite.dat",
+      "binaries/geodata.manifest.json": "geodata.manifest.json",
+      "binaries/geoip.LICENSE.txt": "geoip.LICENSE.txt",
+      "binaries/geosite.LICENSE.txt": "geosite.LICENSE.txt",
+      "binaries/lemonvpn-service.exe": "lemonvpn-service.exe",
+      "binaries/mihomo.LICENSE.txt": "mihomo.LICENSE.txt",
+      "binaries/mihomo.manifest.json": "mihomo.manifest.json",
+      "binaries/wintun.dll": "wintun.dll",
+      "binaries/wintun.LICENSE.txt": "wintun.LICENSE.txt"
+    }
+  }
+}

@@ -1,0 +1,199 @@
+diff --git a/index.html b/index.html
+index 7bfa28f..5d546b9 100644
+--- a/index.html
++++ b/index.html
+@@ -4,9 +4,9 @@
+ <meta charset="utf-8">
+ <meta name="viewport" content="width=device-width, initial-scale=1">
+ <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http: https: ws: wss:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; font-src 'self'">
+-<title>doona</title>
+-<meta name="description" content="Static web UI for the daeuniverse native API.">
+-<link rel="icon" href="/logo.svg">
++<title>LemonVPN</title>
++<meta name="description" content="LemonVPN desktop proxy client.">
++<link rel="icon" type="image/png" sizes="32x32" href="./icons/icon-32.png">
+ <link rel="manifest" href="./manifest.webmanifest">
+ <!-- Default Rose Pine Dawn (light) and Moon (dark) colours: src/ui/styles/palettes/rose-pine.css. -->
+ <meta name="theme-color" content="#faf4ed" media="(prefers-color-scheme: light)">
+@@ -14,7 +14,7 @@
+ <link rel="apple-touch-icon" sizes="180x180" href="./icons/apple-touch-icon.png">
+ <meta name="mobile-web-app-capable" content="yes">
+ <meta name="apple-mobile-web-app-capable" content="yes">
+-<meta name="apple-mobile-web-app-title" content="doona">
++<meta name="apple-mobile-web-app-title" content="LemonVPN">
+ </head>
+ <body><div id="root"></div><div class="rp-popover-band" aria-hidden="true"></div><script type="module" src="/src/main.tsx"></script></body>
+ </html>
+diff --git a/src/shell/TopBar.tsx b/src/shell/TopBar.tsx
+index cd190da..8190f71 100644
+--- a/src/shell/TopBar.tsx
++++ b/src/shell/TopBar.tsx
+@@ -12,7 +12,7 @@ import DataRefresh from '../ui/icons/DataRefresh';
+ import Refresh from '../ui/icons/Refresh';
+ import Search from '../ui/icons/Search';
+ import Translate from '../ui/icons/Translate';
+-import logo from '../logo.svg';
++import logo from '../logo.png';
+ import {useT, type Lang} from '../i18n';
+ import {Button, ChoiceMenu, Divider, Link} from '../ui/ui';
+ import {issuesUrl} from '../api/problemReport';
+@@ -80,6 +80,7 @@ export const TopBar = memo(function TopBar({
+     <header className="rp-top" {...titlebarDrag}>
+       {hasDesktop ? (
+         <div className="rp-brand rp-desktop-brand" aria-label={appName}>
++          <img src={logo} alt="" />
+           <span>{appName}</span>
+         </div>
+       ) : (
+diff --git a/src/shell/Shell.tsx b/src/shell/Shell.tsx
+index 878446a..209c88c 100644
+--- a/src/shell/Shell.tsx
++++ b/src/shell/Shell.tsx
+@@ -19,8 +19,8 @@ import {useShellController, useShellFrame, useStartupToasts} from './useShellCon
+ import {LoadBoundary} from '../ui/LoadBoundary';
+ import {preloadable} from '../ui/preloadable';
+ import {expectsAccess} from '../api';
+-import logo from '../logo.svg';
+-import {appName, hasDesktop} from '../desktop';
++import logo from '../logo.png';
++import {appName} from '../desktop';
+ import {WindowControls, titlebarDrag} from './WindowControls';
+ import type {Frame, FrameProps} from './Frame';
+ const FlagPicker = lazy(() => import('../ui/FlagPicker').then(module => ({default: module.FlagPicker})));
+@@ -130,7 +130,7 @@ export function StartupFrame({children}: {children: ReactNode}) {
+     <div className="rp-shell">
+       <header className="rp-top" {...titlebarDrag}>
+         <div className="rp-brand">
+-          {!hasDesktop && <img src={logo} alt="" />}
++          <img src={logo} alt="" />
+           <span>{appName}</span>
+         </div>
+         <WindowControls />
+diff --git a/src/shell/Login.tsx b/src/shell/Login.tsx
+index f6b3d7e..616264a 100644
+--- a/src/shell/Login.tsx
++++ b/src/shell/Login.tsx
+@@ -2,7 +2,7 @@ import {useT, type Lang} from '../i18n';
+ import {useLogin} from './useLogin';
+ import {Button, Card, ErrorMessage, Form, InlineAlert, Link, Loading, TextField} from '../ui/ui';
+ import LinkOut from '../ui/icons/LinkOut';
+-import logo from '../logo.svg';
++import logo from '../logo.png';
+ import {href} from './route';
+ import {LanguageMenu, PaletteMenu, SchemeToggle, type PaletteMenuProps} from './AppearanceControls';
+ import {WindowControls, titlebarDrag} from './WindowControls';
+diff --git a/src/shell/About.tsx b/src/shell/About.tsx
+index 377a753..8231d5a 100644
+--- a/src/shell/About.tsx
++++ b/src/shell/About.tsx
+@@ -1,7 +1,6 @@
+ import type {ReactElement} from 'react';
+ import {Button, Kv, Link, ModalDialog, cx, phoneQuery, useMediaQuery} from '../ui/ui';
+-import logo from '../logo.svg';
+-import night from '../duck-night.webp';
++import logo from '../logo.png';
+ import GitHub from '../ui/icons/GitHub';
+ import FileText from '../ui/icons/FileText';
+ import {useAbout} from './useShell';
+@@ -34,8 +33,8 @@ export function About({
+       <div className={cx('rp-about', view.honked && 'honked')}>
+         <Button appearance="plain" className={cx('rp-about-duck', view.painted && 'painted')} onPress={view.tap} label={view.duck}>
+           <img key={view.taps} src={logo} alt="" className={cx(view.hop && 'hop')} />
+-          {/* Fetched on the first tap, well before the painting fades in, rather than with every open of the dialog. */}
+-          <img src={view.taps > 0 ? night : undefined} alt="" className="night" />
++          {/* Keep the selected brand visible through the existing interaction. */}
++          <img src={view.taps > 0 ? logo : undefined} alt="" className="night" />
+           {view.honked && <span className="rp-about-bubble">{view.quack}</span>}
+         </Button>
+         <div className="rp-about-name">
+diff --git a/src/ui/styles/shell-search.css b/src/ui/styles/shell-search.css
+index 30af3f0..27aad33 100644
+--- a/src/ui/styles/shell-search.css
++++ b/src/ui/styles/shell-search.css
+@@ -184,8 +184,10 @@
+   }
+ }
+ .rp-brand img {
+-  width: 28px;
+-  height: 28px;
++  width: 52px;
++  height: 52px;
++  object-fit: contain;
++  flex: none;
+ }
+ .rp-desktop-brand {
+   font-size: 22px;
+diff --git a/src/ui/styles/cards-dashboard.css b/src/ui/styles/cards-dashboard.css
+index bb17d73..b8ab755 100644
+--- a/src/ui/styles/cards-dashboard.css
++++ b/src/ui/styles/cards-dashboard.css
+@@ -261,8 +261,10 @@
+   font-weight: 700;
+ }
+ .rp-login-brand img {
+-  width: 40px;
+-  height: 40px;
++  width: 72px;
++  height: 72px;
++  object-fit: contain;
++  flex: none;
+ }
+ .rp-login-note {
+   margin: var(--rp-space-2) 0 0;
+diff --git a/src/ui/styles/palettes/halloween.css b/src/ui/styles/palettes/halloween.css
+index d4a5a40..b6cfbf2 100644
+--- a/src/ui/styles/palettes/halloween.css
++++ b/src/ui/styles/palettes/halloween.css
+@@ -84,8 +84,3 @@
+ :root[data-family='halloween'] :is(.rp-card:nth-child(4n), .rp-dashboard-cell:nth-child(4n) > .rp-card) {
+   --hw-art: url('./halloween/web.svg');
+ }
+-/* The duck wears a witch's hat wherever the app shows its logo. */
+-:root[data-family='halloween'] :is(.rp-brand, .rp-login-brand) > img,
+-:root[data-family='halloween'] .rp-about-duck > img:first-child {
+-  content: url('./halloween/logo.svg');
+-}
+diff --git a/public/manifest.webmanifest b/public/manifest.webmanifest
+index fedddd0..4965f7c 100644
+--- a/public/manifest.webmanifest
++++ b/public/manifest.webmanifest
+@@ -1,16 +1,31 @@
+ {
+   "id": "./",
+-  "name": "doona",
+-  "short_name": "doona",
+-  "description": "Static web UI for the daeuniverse native API.",
++  "name": "LemonVPN",
++  "short_name": "LemonVPN",
++  "description": "LemonVPN desktop proxy client.",
+   "start_url": "./",
+   "scope": "./",
+   "display": "standalone",
+-  "background_color": "#faf4ed",
+-  "theme_color": "#faf4ed",
++  "background_color": "#20262e",
++  "theme_color": "#20262e",
+   "icons": [
+-    {"src": "./icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+-    {"src": "./icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+-    {"src": "./icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
++    {
++      "src": "./icons/icon-192.png",
++      "sizes": "192x192",
++      "type": "image/png",
++      "purpose": "any"
++    },
++    {
++      "src": "./icons/icon-512.png",
++      "sizes": "512x512",
++      "type": "image/png",
++      "purpose": "any"
++    },
++    {
++      "src": "./icons/maskable-512.png",
++      "sizes": "512x512",
++      "type": "image/png",
++      "purpose": "maskable"
++    }
+   ]
+ }

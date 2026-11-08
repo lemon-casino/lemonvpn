@@ -1,0 +1,43 @@
+name: Shared engine
+
+on:
+  push:
+    paths: ['sidecar-stub/**', 'app/scripts/**', '.github/workflows/engine.yml']
+  pull_request:
+    paths: ['sidecar-stub/**', 'app/scripts/**', '.github/workflows/engine.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  native-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    env:
+      LEMONVPN_DATA_DIR: ${{ runner.temp }}/lemonvpn-engine-ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sidecar-stub -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: cargo test --manifest-path sidecar-stub/Cargo.toml --workspace --locked
+      - run: node --test app/scripts/engine-artifacts.test.mjs
+
+  windows-arm64-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_arm64
+      - run: cargo check --manifest-path sidecar-stub/Cargo.toml --workspace --all-targets --target aarch64-pc-windows-msvc --locked

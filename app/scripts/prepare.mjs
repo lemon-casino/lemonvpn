@@ -12,9 +12,14 @@
 // Only Node's standard library is used, so the build installs nothing extra.
 
 import {spawnSync} from 'node:child_process';
+import {createHash} from 'node:crypto';
 import {cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
 import {dirname, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {kernelBinaryName, sidecarLayout, verifyPeMachine, wintunTarget} from './engine-artifacts.mjs';
+import {prepareCompat} from './prepare-compat.mjs';
+import {prepareGeodata} from './prepare-geodata.mjs';
+import {prepareBranding} from './prepare-branding.mjs';
 
 /** Sidecar binary name, without the target triple Tauri appends. */
 const SIDECAR = 'lemonvpn-engine-stub';
@@ -28,7 +33,6 @@ const doonaDir = join(repoRoot, 'doona');
 const doonaDist = join(doonaDir, 'dist');
 const appDist = join(appDir, 'dist');
 const sidecarManifest = join(repoRoot, 'sidecar-stub', 'Cargo.toml');
-const sidecarBinary = join(repoRoot, 'sidecar-stub', 'target', 'release', exeName(SIDECAR));
 const binariesDir = join(appDir, 'src-tauri', 'binaries');
 
 /**
@@ -103,7 +107,7 @@ function normalizeEol(file) {
 
 /** Target triple of the build, as Tauri 2 suffixes external binaries with it. */
 function targetTriple(cargo) {
-  const fromTauri = process.env.TAURI_ENV_TARGET_TRIPLE;
+  const fromTauri = process.env.TAURI_ENV_TARGET_TRIPLE ?? process.env.CARGO_BUILD_TARGET;
   if (fromTauri) return fromTauri;
 
   const rustc = join(dirname(cargo), exeName('rustc'));
@@ -117,6 +121,10 @@ function targetTriple(cargo) {
 }
 
 function prepareFrontend(pnpm) {
+  if (!existsSync(join(doonaDir, 'src', 'desktop.ts'))) {
+    throw new Error('doona 尚未应用桌面适配:按 README 使用 DOONA_DESKTOP_REVISION 和 doona-lemonvpn-desktop.patch');
+  }
+  prepareBranding(doonaDir);
   if (!existsSync(join(doonaDir, 'node_modules'))) {
     throw new Error(`${doonaDir} 尚未安装依赖:先运行 pnpm --dir doona install`);
   }
@@ -135,24 +143,62 @@ function prepareFrontend(pnpm) {
   console.log(`[prepare] 前端已复制到 ${appDist}(${files} 项)`);
 }
 
-function prepareSidecar(cargo) {
-  run(cargo, ['build', '--release', '--manifest-path', sidecarManifest]);
+async function prepareSidecar(cargo) {
+  const triple = targetTriple(cargo);
+  // Validate before invoking tools. The artifact must come from this exact
+  // target directory; naming a host binary with a target suffix is unsafe.
+  sidecarLayout('', triple);
+  await prepareCompat(repoRoot, binariesDir, triple);
+  await prepareGeodata(repoRoot, binariesDir);
+  run(cargo, ['build', '--release', '--bin', SIDECAR, '--target', triple, '--manifest-path', sidecarManifest]);
+  const result = spawnSync(cargo, ['metadata', '--format-version', '1', '--filter-platform', triple, '--manifest-path', sidecarManifest], {
+    encoding: 'utf8', maxBuffer: 16 * 1024 * 1024
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(`无法读取引擎依赖元数据:${result.error?.message ?? result.stderr}`);
+  }
+  const metadata = JSON.parse(result.stdout);
+  const layout = sidecarLayout(metadata.target_directory, triple);
+  const sidecarBinary = layout.artifact;
 
   if (!existsSync(sidecarBinary)) {
     throw new Error(`sidecar 构建产物不存在:${sidecarBinary}`);
   }
-  const triple = targetTriple(cargo);
-  const dest = join(binariesDir, `${SIDECAR}-${triple}${process.platform === 'win32' ? '.exe' : ''}`);
+  const dest = join(binariesDir, layout.bundledName);
   mkdirSync(binariesDir, {recursive: true});
   cpSync(sidecarBinary, dest);
+  for (const asset of ['geoip.dat', 'geosite.dat', 'geodata.manifest.json']) {
+    cpSync(join(binariesDir, asset), join(dirname(sidecarBinary), asset));
+  }
+  if (triple === 'x86_64-pc-windows-msvc') {
+    run(cargo, ['build','--release','--package','lemonvpn-engine-platform','--bin','lemonvpn-service','--target',triple,'--manifest-path',sidecarManifest]);
+    cpSync(join(dirname(sidecarBinary),'lemonvpn-service.exe'),join(binariesDir,'lemonvpn-service.exe'));
+    cpSync(join(binariesDir,kernelBinaryName(triple)),join(dirname(sidecarBinary),kernelBinaryName(triple)));
+  }
   console.log(`[prepare] sidecar 已复制到 ${dest}`);
+  const wintun = wintunTarget(triple);
+  if (wintun) {
+    const dependency = metadata.packages.find(pkg => pkg.name === 'wintun');
+    if (!dependency) throw new Error('引擎依赖中缺少 wintun');
+    const driverRoot = join(dirname(dependency.manifest_path), 'wintun');
+    const dll = join(driverRoot, 'bin', wintun.directory, 'wintun.dll');
+    verifyPeMachine(readFileSync(dll), wintun.machine);
+    if (triple === 'x86_64-pc-windows-msvc') {
+      const expected=readFileSync(join(repoRoot,'sidecar-stub/crates/engine-platform/assets/wintun.sha256'),'utf8').trim();
+      const actual=createHash('sha256').update(readFileSync(dll)).digest('hex');
+      if(actual!==expected)throw new Error('Wintun DLL 与提权服务的固定摘要不一致');
+    }
+    cpSync(dll, join(binariesDir, 'wintun.dll'));
+    cpSync(join(driverRoot, 'LICENSE.txt'), join(binariesDir, 'wintun.LICENSE.txt'));
+    console.log(`[prepare] Wintun 驱动和许可证已准备(${wintun.directory})`);
+  }
 }
 
 try {
   const pnpm = tool('pnpm');
   const cargo = tool('cargo');
-  prepareFrontend(pnpm);
-  prepareSidecar(cargo);
+  if (!process.argv.includes('--engine-only')) prepareFrontend(pnpm);
+  await prepareSidecar(cargo);
   console.log('[prepare] 完成');
 } catch (err) {
   console.error(`[prepare] 失败:${err.message}`);

@@ -13,6 +13,24 @@
 /app/node_modules/
 /app/src-tauri/target/
 /sidecar-stub/target/
+/app/src-tauri/binaries/wintun.dll
+/app/src-tauri/binaries/wintun.LICENSE.txt
+/app/src-tauri/binaries/lemonvpn-mihomo.exe
+/app/src-tauri/binaries/lemonvpn-kernel.exe
+/app/src-tauri/binaries/geoip.dat
+/app/src-tauri/binaries/geosite.dat
+/app/src-tauri/binaries/geoip.LICENSE.txt
+/app/src-tauri/binaries/geosite.LICENSE.txt
+/app/src-tauri/binaries/geodata.manifest.json
+/app/src-tauri/binaries/lemonvpn-service.exe
+/app/src-tauri/binaries/mihomo.LICENSE.txt
+/app/src-tauri/binaries/mihomo.manifest.json
+!/sidecar-stub/Cargo.lock
+!/app/src-tauri/Cargo.lock
+
+# Local diagnostic captures and generated branding drafts
+/sidecar-stub/PktMon.etl
+/output/
 
 # OS and editor noise
 Thumbs.db

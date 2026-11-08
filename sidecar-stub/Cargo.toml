@@ -4,31 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[workspace]
+members = ["crates/engine-core", "crates/engine-platform"]
+default-members = [".", "crates/engine-core", "crates/engine-platform"]
+resolver = "2"
+
 [dependencies]
-# Subscriptions are fetched over HTTPS and the TLS-based outbounds (VLESS/Trojan/
-# Shadowsocks) need the same client. Everything else stays std-only.
-rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
-webpki-roots = "0.26"
-# AEAD (GCM/ChaCha20-Poly1305), HKDF, SHA-256, HMAC and random bytes.
-ring = "0.17"
-# VMess needs one raw AES-128 block encrypt (the auth id), MD5 (its cmd key and
-# the Shadowsocks key derivation) and SHAKE128 (its chunk length masking).
-aes = "0.8"
-md-5 = "0.10"
-sha3 = "0.10"
-# Hysteria2 rides on QUIC: quinn drives the protocol on a dedicated
-# single-thread tokio runtime inside the module; the outbound API stays
-# blocking std IO through a loopback socket pair.
-tokio = { version = "1", default-features = false, features = ["rt", "sync", "net", "io-util", "time"] }
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-# TUN mode: user-space TCP termination (smoltcp) over a wintun adapter, and
-# outbound sockets bound to the physical interface to avoid routing loops.
-smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
-socket2 = "0.6"
-
-[target.'cfg(windows)'.dependencies]
-wintun = "0.5"
-
-[dev-dependencies]
-# Self-signed certificates for the local TLS test servers.
-rcgen = "0.13"
+lemonvpn-engine-core = { path = "crates/engine-core" }

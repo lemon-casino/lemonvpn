@@ -3,7 +3,10 @@
   "private": true,
   "scripts": {
     "dev": "tauri dev",
-    "build": "tauri build"
+    "build": "tauri build",
+    "prepare:branding": "node scripts/prepare-branding.mjs",
+    "test:native-ui": "node scripts/native-ui-smoke.mjs",
+    "test:local-workload": "node scripts/engine-stability-smoke.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

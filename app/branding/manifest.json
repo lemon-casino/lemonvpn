@@ -1,0 +1,13 @@
+{
+  "name": "LemonVPN graphite/white origami cat-plane laptop",
+  "source": "logo.png",
+  "sourceSize": [2048, 2048],
+  "sourceNote": "User-approved original artwork with a black keyboard/base and a white cat-plane. Transparent 2048px canvas tightly fits the original proportions with 32px horizontal margins.",
+  "horizontalMargin": 32,
+  "webLogo": "web/logo.png",
+  "desktopIcons": "../src-tauri/icons",
+  "desktopGenerator": "Tauri CLI icon",
+  "webThemeColor": "#20262e",
+  "accentColor": "#ffffff",
+  "keyboardColor": "#000000"
+}
