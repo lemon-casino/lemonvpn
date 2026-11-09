@@ -134,10 +134,11 @@ jobs:
       - name: Build unsigned Windows installer (no tests or app launch)
         if: matrix.platform == 'windows'
         shell: pwsh
+        working-directory: app
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          & pnpm --dir app build --verbose --target $env:BUILD_TARGET --bundles $env:BUILD_BUNDLES --no-sign --ci -- --locked 2>&1 |
+          & node node_modules/@tauri-apps/cli/tauri.js build --verbose --target $env:BUILD_TARGET --bundles $env:BUILD_BUNDLES --no-sign --ci '--' '--locked' 2>&1 |
             Tee-Object -FilePath "$env:RUNNER_TEMP\lemonvpn-build.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify architecture and collect packages with checksums
