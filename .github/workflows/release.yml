@@ -120,6 +120,8 @@ jobs:
             app/src-tauri/target/geodata-cache
           cache-on-failure: true
       - name: Build unsigned installers (no tests or app launch)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           pnpm --dir app build --target "$BUILD_TARGET" --bundles "$BUILD_BUNDLES" --no-sign --ci -- --locked \
             2>&1 | tee "$RUNNER_TEMP/lemonvpn-build.log"

@@ -39,7 +39,8 @@ if (-not $installation) {
 $developerCommand = Join-Path $installation 'Common7\Tools\VsDevCmd.bat'
 if (-not (Test-Path -LiteralPath $developerCommand)) { throw 'VsDevCmd.bat is missing.' }
 # Only fixed compiler setup arguments are passed to cmd; no file operations.
-$compilerEnvironment = & "$env:SystemRoot\System32\cmd.exe" /d /s /c "`"`"$developerCommand`" -no_logo -arch=$targetArch -host_arch=$hostArch >nul && set`""
+$environmentCommand = "call `"$developerCommand`" -no_logo -arch=$targetArch -host_arch=$hostArch >nul && set"
+$compilerEnvironment = & "$env:SystemRoot\System32\cmd.exe" /d /c $environmentCommand
 if ($LASTEXITCODE -ne 0) { throw "Cannot initialize the $hostArch -> $targetArch MSVC environment." }
 $allow = @('INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VCToolsInstallDir', 'VCToolsVersion', 'WindowsSdkDir', 'WindowsSDKVersion', 'UniversalCRTSdkDir', 'UCRTVersion')
 foreach ($line in $compilerEnvironment) {
