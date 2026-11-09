@@ -62,16 +62,24 @@ pub struct Engine {
     last_start: Mutex<Option<Instant>>,
     path: Option<PathBuf>,
     data_dir: Option<PathBuf>,
+    resources: Option<PathBuf>,
     owned_datapath: AtomicBool,
 }
 
 impl Engine {
     /// Builds the supervisor and performs the first start.
-    pub fn start() -> Self {
-        Self::start_at(port_from_env(), resolve_engine_path(), None)
+    pub fn start(resources: PathBuf) -> Self {
+        Self::start_configured(
+            port_from_env(), resolve_engine_path(), Some(crate::instance::data_dir()), Some(resources),
+        )
     }
 
+    #[cfg(test)]
     fn start_at(port: u16, path: Option<PathBuf>, data_dir: Option<PathBuf>) -> Self {
+        Self::start_configured(port, path, data_dir, None)
+    }
+
+    fn start_configured(port: u16, path: Option<PathBuf>, data_dir: Option<PathBuf>, resources: Option<PathBuf>) -> Self {
         let engine = Engine {
             lifecycle: Mutex::new(()),
             wake: (Mutex::new(()), Condvar::new()),
@@ -84,6 +92,7 @@ impl Engine {
             last_start: Mutex::new(None),
             path,
             data_dir,
+            resources,
             owned_datapath: AtomicBool::new(false),
             status: Mutex::new(EngineStatus {
                 state: "stopped".to_string(),
@@ -120,6 +129,9 @@ impl Engine {
         command.env("LEMONVPN_PARENT_PID", std::process::id().to_string());
         if let Some(directory) = &self.data_dir {
             command.env("LEMONVPN_DATA_DIR", directory);
+        }
+        if let Some(directory) = &self.resources {
+            command.env("LEMONVPN_RESOURCE_DIR", directory);
         }
         // Piped so the log window can show what the engine says; in a GUI
         // build inherited stdio goes nowhere.

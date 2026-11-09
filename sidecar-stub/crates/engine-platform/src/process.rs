@@ -39,12 +39,18 @@ pub fn owner(source: SocketAddr, network: &str) -> Option<ProcessInfo> {
     {
         native::owner(source, network)
     }
-    #[cfg(not(windows))]
+    #[cfg(any(target_os="linux",target_os="macos"))]
+    { posix::owner(source,network) }
+    #[cfg(not(any(windows,target_os="linux",target_os="macos")))]
     {
         let _ = (source, network);
         None
     }
 }
+
+#[cfg(any(target_os="linux",target_os="macos"))]
+#[path="process_posix.rs"]
+mod posix;
 
 #[cfg(windows)]
 mod native {

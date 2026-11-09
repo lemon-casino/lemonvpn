@@ -1,5 +1,11 @@
 # LemonVPN
 
+推送版本 tag 后自动构建并发布：Windows、macOS、Linux 各 x64/ARM64，共六种原生构建；安装包不签名，全部成功后自动公开 GitHub Release，并附带 SHA256 校验。使用方式与架构补齐见 [Tag 自动发布](docs/tag-release.zh.md)。
+
+Windows 0.1.31：已重新构建未签名的 x64 NSIS 安装包，包含 TUN 托盘入口、状态同步及最新桌面适配。构建未运行测试或安装程序，当前运行进程与已安装文件保持不变。产物与 SHA256 见 [构建记录](docs/windows-0.1.31.zh.md)。
+
+2026-11-09 桌面平台补齐：托盘增加 TUN 模式并同步真实开关状态；补齐 macOS/Linux 进程信息、重复启动唤起与无托盘兜底、IPv6-only 默认 DNS，以及 Linux 多服务管理器、授权和会话代理。详见 [实现与检查范围](docs/desktop-platform-completion.zh.md)。仅源码与离线编译/前端构建，未运行测试、生成原生安装包或影响当前 Windows 软件；签名与正式发布延后。
+
 Windows 0.1.20：按实际引擎能力提供 DNS 动作，移除不支持的 asis 选项并明确诊断；补齐拖放排序提交回调，保存后回读实际顺序确认，提示全局模式覆盖普通路由的生效范围。详见 [说明](docs/windows-0.1.20.zh.md)。只读检查现有日志，静态检查与编译构建，未运行测试、修改当前配置或替换当前软件。
 
 Windows 0.1.19：活动页“应用”紧邻模式选择，全局出站及其占位移到控件组后侧，避免按钮被空白隔远，保留三种模式的稳定布局。详见 [说明](docs/windows-0.1.19.zh.md)。仅静态检查与编译构建，未运行测试或替换当前软件。
@@ -36,7 +42,7 @@ Windows 0.1.4 更新：修复 TUN 服务管道通信，服务安装/修复归入
 
 基于共享 Rust 代理引擎、[doona](https://github.com/Zakkaus/doona) 界面与 Tauri 2 构建桌面代理应用，目标覆盖 Windows / macOS / Linux、x86_64 / aarch64。Windows 0.1.3 接入固定版本 mihomo 提供协议兼容和双栈 TUN，共享 Rust 引擎保留配置、规则与监控。
 
-- 状态：Windows 0.1.3 补入 IPv4/IPv6 TCP/UDP TUN、协议兼容内核、开机自启和按需 TUN 服务；按用户要求只编译构建，不运行测试或启动新程序。具体范围与限制见 [Windows 0.1.3 说明](docs/windows-0.1.3.zh.md)。macOS 补齐系统代理、开机自启、单实例、RSS 与兼容内核分发，TUN 与进程归属尚未实现，真机验收待后续进行，见 [macOS 说明](docs/macos-0.1.31.zh.md)。
+- 状态：Windows 0.1.3 补入 IPv4/IPv6 TCP/UDP TUN、协议兼容内核、开机自启和按需 TUN 服务；按用户要求只编译构建，不运行测试或启动新程序。具体范围与限制见 [Windows 0.1.3 说明](docs/windows-0.1.3.zh.md)。macOS 已补双栈出口、网络切换与睡眠恢复；Linux 已接入按 socket 绑定出口的 TUN、GNOME/KDE 系统代理和 XDG 自启。当前只通过编译与静态检查，原生行为验收未进行，范围见 [平台集成说明](docs/posix-network-integration.zh.md)。
 - 当前优先级：稳定本机 Windows x64，正式发布和 ARM64 验收延后。已补单实例、按宿主归属恢复代理、子进程故障恢复和父进程退出兜底；长期运行与真实网络切换仍需验收。
 - 当前代码架构与扩展方式：[docs/engine-architecture.zh.md](docs/engine-architecture.zh.md)
 - 开发方案与架构决策:[docs/desktop-development-plan.zh.md](docs/desktop-development-plan.zh.md)
@@ -54,7 +60,7 @@ Windows 0.1.4 更新：修复 TUN 服务管道通信，服务安装/修复归入
 | `sidecar-stub/src/main.rs` | 桌面进程入口，保留原 sidecar 文件名兼容现有安装 |
 | `app/` | Tauri 桌面壳、前端准备和按目标架构打包脚本 |
 | `pins.env` | 锁定 honk 修订与 doona 版本(沿用 honk `pins.env` 机制) |
-| `doona/`、`honk/` | 仅存在于本地开发机的上游工作副本(已被 .gitignore 排除),CI 按 pins 拉取对应发布产物 |
+| `doona/`、`honk/` | 本地上游工作副本（已被 .gitignore 排除）；桌面 CI 按 pins 获取固定前端源码和官方内核资源 |
 
 本地开发需要上游副本时:
 
@@ -73,7 +79,7 @@ git clone https://github.com/Zakkaus/doona.git doona
 
 本地运行由 `app/`（桌面壳）、`sidecar-stub/`（共享引擎的桌面宿主）与 `doona/`（界面，本地克隆）组成。`stub` 仅为保留的兼容名称。
 
-前置:Node 22+/24+、pnpm、Rust 1.77+(MSVC 工具链),`cargo` 需在 `PATH` 中。
+前置：Node 24、pnpm 11（版本见前端 packageManager）和 Rust stable，`cargo` 需在 PATH 中。Windows 需要对应目标的 MSVC 工具链，ARM64 另需 LLVM/Clang；自动构建在 runner 内准备这些环境。
 
 ```powershell
 # 1. doona 界面(终端 1)
@@ -135,7 +141,7 @@ curl.exe --socks5 127.0.0.1:18080 https://example.com -I
 
 入站没有认证,因此只绑定回环地址——把 `BIND_ADDR` 改成可路由地址会让这台机器变成开放代理。UDP ASSOCIATE 与 SOCKS5 认证尚未实现。
 
-当前数据面不依赖 honk-core。共享代码与平台层独立；非 Windows 的普通 TCP/UDP socket 有标准库实现，系统 TUN 则明确报告不可用。后续平台可实现相同的 `Platform` 接口。
+当前数据面不依赖 honk-core。共享引擎与平台层独立，Windows/macOS/Linux 分别提供 socket 出口保护；macOS/Linux 的双栈 TUN 由平台管理员服务桥接。内置 smoltcp 栈与兼容内核桥接的实现范围不同，详见 [架构说明](docs/engine-architecture.zh.md)。
 
 ## Native API(M1)
 
@@ -171,7 +177,7 @@ $env:LEMONVPN_PROXY='on';  cargo run --manifest-path app/src-tauri/Cargo.toml
 $env:LEMONVPN_PROXY='off'; cargo run --manifest-path app/src-tauri/Cargo.toml
 ```
 
-macOS 系统代理基于 `networksetup`,接管/恢复/归属语义与 Windows 一致(见 [macOS 说明](docs/macos-0.1.31.zh.md));Linux(`gsettings` / `kwriteconfig`)的系统代理配置器尚未实现,开关报告为不可用。
+macOS 系统代理基于 `networksetup`，Linux 支持 GSettings、KConfig 和其他桌面的会话代理。接管前保存原值，关闭时按归属恢复。适用范围见 [当前平台说明](docs/desktop-platform-completion.zh.md)。
 
 ## 引擎守护(M1)
 
@@ -181,9 +187,9 @@ macOS 系统代理基于 `networksetup`,接管/恢复/归属语义与 Windows �
 
 ## 托盘与引擎日志(M1,Windows)
 
-壳常驻托盘:左键单击托盘图标显示主窗口,右键菜单为「显示窗口 / 系统代理 / 引擎日志 / 退出」。主窗口不再显示原生菜单栏，页面与标题栏直接衔接。
+壳常驻托盘:左键单击托盘图标显示主窗口,右键菜单为「显示窗口 / 系统代理 / TUN 模式 / 引擎日志 / 退出」。主窗口不再显示原生菜单栏，页面与标题栏直接衔接。
 
-关闭主窗口只隐藏到托盘,引擎与系统代理继续工作。要真正退出请用托盘菜单里的「退出」,退出时会停止引擎并还原系统代理。
+关闭主窗口隐藏到托盘；无可用托盘时保留窗口并最小化，引擎与系统代理继续工作。通过托盘「退出」或设置内「退出应用」结束，退出时会停止引擎并还原系统代理。
 
 「引擎日志」打开独立窗口,显示引擎 stderr 与壳的托管记录(每行带相对启动时间,保留最近 500 行,每 0.5 秒刷新,可一键复制)。页面由壳通过自定义协议 `lemonvpn://localhost/logs` 提供,不依赖 doona 新增路由(桌面设置页桥接仍待 D6)。日志页通过 `engine_logs` 命令取数,主窗口与日志页互不影响。
 

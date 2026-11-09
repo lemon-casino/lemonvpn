@@ -1,5 +1,11 @@
 # macOS 0.1.31：系统代理、开机自启、单实例与内核分发
 
+> 当前实现见 [桌面平台补齐](desktop-platform-completion.zh.md) 与 [网络集成](posix-network-integration.zh.md)；下文保留早期实现和历史验证记录，不代表本轮已进行原生验收。
+
+> 后续源码已补齐双栈网络/睡眠恢复、Linux TUN 与桌面集成，见 [当前实现说明](posix-network-integration.zh.md)。下文保留补齐前的审查或历史验证记录；本次没有运行测试或生成安装包。
+
+> 2026-11-09 更正：文中的“TUN 服务尚未实现”属于早期记录；当前已有 LaunchDaemon TUN 实现及此前虚拟机验证记录，但不等于 macOS 完整验收。此次仅做静态检查和平台层编译检查，修复路由归属/回滚与代理恢复；网络切换、IPv6 独立出口、原生壳层及安装包仍需后续验收。详见 [平台审查](platform-audit-2026-11-09.zh.md)。
+
 macOS 桌面版补齐 Windows 版已有的应用级能力：系统代理、开机自启、单实例、RSS 统计、mihomo 兼容内核分发与 TUN 服务（实现见文末）。按端口找拥有进程的归属识别与 TUN 服务仍未实现：进程条件规则在 macOS 上不参与匹配，RSS/内存页只显示进程与系统总量。内核派发场景下引擎曾因 `compat::available()` 把内核的 TUN 能力上报为可用（macOS 的 utun 创建需要 root，应用以普通权限运行，实际不可用），`tun::supported()` 已改为按平台原生 TUN 支持判定（windows 与 macos 为真），侧栏 TUN 快捷开关按 capabilities 显隐。
 
 系统代理沿用 Windows 的语义。接管前把每个网络服务（`networksetup -listallnetworkservices`，跳过停用服务）的 HTTP/HTTPS/SOCKS 与旁路域名快照写入数据目录 `system-proxy.json`，先落盘再改系统设置，任何部分生效都可被陈旧恢复找回；禁用时只恢复仍指向本引擎端口的服务，用户自行修改过的服务保持用户选择；记录的归属进程退出且回环端口无监听时才做陈旧恢复。重启换端口时保留最初快照，不重复备份。

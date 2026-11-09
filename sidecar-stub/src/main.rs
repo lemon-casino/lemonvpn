@@ -12,7 +12,7 @@ fn main() {
         }),
         Err(_) => DEFAULT_PORT,
     };
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         // Full-system TUN traffic fans out into one socket per flow; the
         // default 256 soft file-descriptor limit exhausts within seconds.
@@ -26,19 +26,17 @@ fn main() {
                 current: u64,
                 maximum: u64,
             }
+            #[cfg(target_os = "macos")]
             const RLIMIT_NOFILE: i32 = 8;
-            const RLIM_INFINITY: u64 = 0x7fff_ffff_ffff_ffff;
+            #[cfg(target_os = "linux")]
+            const RLIMIT_NOFILE: i32 = 7;
             const OPEN_MAX: u64 = 10240;
             let mut limit = Rlimit {
                 current: 0,
                 maximum: 0,
             };
             if getrlimit(RLIMIT_NOFILE, &mut limit) == 0 {
-                let ceiling = if limit.maximum == RLIM_INFINITY {
-                    OPEN_MAX
-                } else {
-                    limit.maximum
-                };
+                let ceiling = limit.maximum.min(OPEN_MAX);
                 limit.current = limit.current.max(ceiling);
                 setrlimit(RLIMIT_NOFILE, &limit);
             }

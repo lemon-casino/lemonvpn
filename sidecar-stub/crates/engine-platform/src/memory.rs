@@ -47,12 +47,13 @@ pub(crate) fn snapshot() -> crate::MemorySnapshot {
     }
     #[repr(C)]
     struct MachTaskBasicInfo {
-        suspend_count: c_uint,
         virtual_size: u64,
         resident_size: u64,
+        resident_size_max: u64,
         user_time: TimeValue,
         system_time: TimeValue,
         policy: c_uint,
+        suspend_count: c_int,
     }
     extern "C" {
         // mach_task_self_ is exported as a data symbol (mach_port_t); calling
@@ -82,6 +83,7 @@ pub(crate) fn snapshot() -> crate::MemorySnapshot {
     };
     if result == 0 {
         snapshot.resident_bytes = Some(info.resident_size);
+        snapshot.peak_resident_bytes = Some(info.resident_size_max);
     }
     let name = b"hw.memsize\0";
     let mut total: u64 = 0;

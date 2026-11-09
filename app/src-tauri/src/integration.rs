@@ -29,7 +29,15 @@ pub fn status() -> Status {
             service_update_required: lemonvpn_engine_platform::service_macos::update_required(),
         }
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        Status {
+            autostart: lemonvpn_engine_platform::autostart_linux::enabled(),
+            service_installed: lemonvpn_engine_platform::service_linux::installed(),
+            service_update_required: lemonvpn_engine_platform::service_linux::update_required(),
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         Status {
             autostart: false,
@@ -152,7 +160,12 @@ pub fn set_autostart(enabled: bool) -> Result<Status, String> {
         }
         Ok(status())
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        lemonvpn_engine_platform::autostart_linux::set(enabled).map_err(|e|e.to_string())?;
+        Ok(status())
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = enabled;
         Err("当前平台尚未提供开机自启".into())
@@ -334,15 +347,24 @@ pub fn service_action(resources: &Path, install: bool) -> Result<Status, String>
         }
         Ok(status())
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        let executable=resources.join("lemonvpn-service");
+        if !executable.is_file(){return Err("安装包缺少 TUN 服务程序".into())}
+        let args=if install {
+            vec!["--install".to_owned(),"--owner-uid".to_owned(),lemonvpn_engine_platform::service_linux::current_uid().map_err(|e|e.to_string())?.to_string()]
+        }else{vec!["--uninstall".to_owned()]};
+        lemonvpn_engine_platform::privilege_linux::authorize(&executable,&args).map_err(|e|e.to_string())?;
+        Ok(status())
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = (resources, install);
         Err("当前平台不使用 Windows 服务".into())
     }
 }
 
-/// Single shell word: an argv value passed through `do shell script`, which
-/// the helper runs with `/bin/sh`.
+/// Single shell word passed through macOS `do shell script`.
 #[cfg(target_os = "macos")]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))

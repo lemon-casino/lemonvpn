@@ -133,7 +133,7 @@ pub fn connect(decision: &config::Decision, host: &str, port: u16) -> io::Result
 /// dials resolve through the configured DNS upstreams; the system resolver is
 /// only the fallback when no upstream is configured.
 pub fn dial(host: &str, port: u16) -> io::Result<TcpStream> {
-    if crate::compat::tun_active() && !host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+    if crate::platform::managed::egress_families().is_none() && crate::compat::tun_active() && !host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
         return crate::compat::connect(None, None, host, port);
     }
     let addrs: Vec<SocketAddr> = if let Ok(address) = host.parse::<IpAddr>() {

@@ -260,6 +260,19 @@ fn empty_reply(query: &[u8], rcode: u8) -> io::Result<Vec<u8>> {
     Ok(reply)
 }
 fn exchange_wire(upstream: &config::Upstream, query: &[u8]) -> io::Result<Vec<u8>> {
+    if crate::platform::managed::egress_families()==Some([false,true])
+        && upstream.name=="default" && upstream.protocol=="udp" && upstream.port==53
+        && matches!(upstream.host.as_str(),"223.5.5.5"|"223.6.6.6") {
+        let mut last=invalid("默认 IPv6 DNS 暂不可用");
+        for host in ["2400:3200::1","2400:3200:baba::1"] {
+            let mut selected=upstream.clone();selected.host=host.to_owned();
+            match exchange_wire_native(&selected,query){Ok(reply)=>return Ok(reply),Err(e)=>last=e}
+        }
+        return Err(last);
+    }
+    exchange_wire_native(upstream,query)
+}
+fn exchange_wire_native(upstream: &config::Upstream, query: &[u8]) -> io::Result<Vec<u8>> {
     let reply = if upstream.protocol == "tcp" {
         tcp_exchange(upstream, query)?
     } else {
@@ -295,7 +308,10 @@ pub fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
     }
     let name = canonical(host)?;
     let mut last = None;
+    let families = crate::platform::managed::egress_families();
+    let mut collected = Vec::new();
     for kind in ["A", "AAAA"] {
+        if families.is_some_and(|f|!f[usize::from(kind=="AAAA")]) { continue; }
         match lookup(&name, kind, None, true) {
             Ok(result) => {
                 record(
@@ -315,7 +331,8 @@ pub fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
                     .filter_map(|answer| answer.data.parse().ok())
                     .collect();
                 if !addresses.is_empty() {
-                    return Ok(addresses);
+                    if families.is_none() { return Ok(addresses); }
+                    collected.extend(addresses);
                 }
             }
             Err(error) => {
@@ -334,6 +351,7 @@ pub fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
             }
         }
     }
+    if !collected.is_empty() { return Ok(collected); }
     Err(last
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{host} 没有解析结果"))))
 }

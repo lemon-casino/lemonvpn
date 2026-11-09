@@ -38,13 +38,27 @@ pub const CORE_BINARY_NAME: &str = if cfg!(windows) {
 };
 
 pub fn core_path() -> Option<PathBuf> {
-    let name = CORE_BINARY_NAME;
+    resource_path(CORE_BINARY_NAME)
+}
+
+/// The shell supplies Tauri's resolved resource directory. In particular Linux
+/// uses the bundle's package name, whose spelling/case must not be guessed.
+pub fn resource_path(name: &str) -> Option<PathBuf> {
+    if let Some(directory) = std::env::var_os("LEMONVPN_RESOURCE_DIR") {
+        let path = PathBuf::from(directory).join(name);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
     let directory = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    // `../Resources` matches the macOS .app layout next to Contents/MacOS.
+    // `../Resources` matches the macOS .app layout next to Contents/MacOS,
+    // `../lib/LemonVPN` the Linux deb/appimage layout beside /usr/bin.
     [
         directory.join(name),
         directory.join("resources").join(name),
         directory.join("../Resources").join(name),
+        directory.join("../lib/lemonvpn").join(name),
+        directory.join("../lib/LemonVPN").join(name),
     ]
     .into_iter()
     .find(|p| p.is_file())
@@ -303,8 +317,37 @@ pub fn uplink_name() -> Option<String> {
     {
         crate::darwin::uplink_name()
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        if !crate::linux::supported() { return None; }
+        crate::network::interface(false).or_else(|_|crate::network::interface(true)).ok()
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         None
     }
+}
+
+/// Auxiliary protocol cores select a family before assigning their interface;
+/// a global IPv4 interface must never be reused for a distinct IPv6 uplink.
+pub fn uplink_for(ipv6: bool) -> io::Result<Option<String>> {
+    #[cfg(any(target_os="macos",target_os="linux"))]
+    { crate::network::interface(ipv6).map(Some) }
+    #[cfg(not(any(target_os="macos",target_os="linux")))]
+    { let _=ipv6; Ok(uplink_name()) }
+}
+
+pub fn egress_families() -> Option<[bool; 2]> {
+    #[cfg(target_os="linux")]
+    if !crate::linux::supported() { return None; }
+    #[cfg(any(target_os="macos",target_os="linux"))]
+    { Some(crate::network::snapshot(false).map(|s|[s.routes.ipv4.is_some(),s.routes.ipv6.is_some()]).unwrap_or([false,false])) }
+    #[cfg(not(any(target_os="macos",target_os="linux")))]
+    { None }
+}
+pub fn network_revision() -> Option<u64> {
+    #[cfg(any(target_os="macos",target_os="linux"))]
+    { crate::network::snapshot(false).ok().map(|s|s.revision) }
+    #[cfg(not(any(target_os="macos",target_os="linux")))]
+    { None }
 }

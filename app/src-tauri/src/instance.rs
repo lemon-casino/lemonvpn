@@ -14,6 +14,8 @@ const LOCK_FILE: &str = "desktop.lock";
 pub struct InstanceGuard {
     _file: File,
     pub previous_owner: bool,
+    #[cfg(unix)]
+    activation: lemonvpn_engine_platform::desktop_activation::Activation,
 }
 
 pub fn data_dir() -> PathBuf {
@@ -39,11 +41,8 @@ fn default_data_dir() -> PathBuf {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn default_data_dir() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("lemonvpn")
+    // Lock the same directory the engine uses, including XDG_CONFIG_HOME.
+    lemonvpn_engine_platform::current().default_data_dir()
 }
 
 impl InstanceGuard {
@@ -119,6 +118,7 @@ impl InstanceGuard {
                 return Ok(Some(Self {
                     _file: file,
                     previous_owner: previous.trim().parse::<u32>().is_ok(),
+                    activation: lemonvpn_engine_platform::desktop_activation::Activation::bind(directory)?,
                 }));
             }
             if Instant::now() >= deadline {
@@ -141,8 +141,34 @@ pub fn activate_existing(directory: &Path) {
     unsafe { EnumWindows(Some(show_owned_window), pid as isize) };
 }
 
-#[cfg(not(windows))]
-pub fn activate_existing(_directory: &Path) {}
+#[cfg(unix)]
+pub fn activate_existing(directory:&Path){lemonvpn_engine_platform::desktop_activation::notify(directory);}
+
+#[cfg(unix)]
+impl InstanceGuard {
+    pub fn activation_listener(&self)->io::Result<std::os::unix::net::UnixDatagram>{self.activation.listener()}
+}
+#[cfg(unix)]
+impl Drop for InstanceGuard {fn drop(&mut self){self.activation.close_path();}}
+
+#[cfg(unix)]
+pub fn start_activation(socket:std::os::unix::net::UnixDatagram,app:tauri::AppHandle) {
+    use tauri::Manager;
+    std::thread::spawn(move|| {
+        let mut bytes=[0;16];
+        loop {
+            if app.try_state::<crate::tray::TrayUi>().is_some_and(|state|state.stopped()){break}
+            match socket.recv(&mut bytes) {
+                Ok(4) if &bytes[..4]==b"show"=>{
+                    let target=app.clone();
+                    let _=app.run_on_main_thread(move||crate::show_main(&target));
+                },
+                Err(e) if matches!(e.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::TimedOut|io::ErrorKind::Interrupted)=>{},
+                Err(_)=>break,_=>{},
+            }
+        }
+    });
+}
 
 #[cfg(windows)]
 unsafe extern "system" fn show_owned_window(

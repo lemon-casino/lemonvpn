@@ -17,6 +17,12 @@ mod memory;
 mod windows;
 #[cfg(target_os = "macos")]
 mod darwin;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod network;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod egress;
 
 /// Packet addressing agreed between the host adapter and the user-space stack.
 #[derive(Clone, Debug)]
@@ -152,24 +158,28 @@ impl Platform for NativePlatform {
     fn external_tun(&self, enabled: bool) -> io::Result<()> {
         #[cfg(windows)] { windows::external_tun(enabled) }
         #[cfg(target_os = "macos")] { darwin::external_tun(enabled) }
-        #[cfg(not(any(windows, target_os = "macos")))] { let _=enabled; Ok(()) }
+        #[cfg(target_os = "linux")] { linux::external_tun(enabled) }
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))] { let _=enabled; Ok(()) }
     }
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn connect_tcp(&self, address: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
         #[cfg(windows)] { windows::connect_tcp(address, timeout) }
         #[cfg(target_os = "macos")] { darwin::connect_tcp(address, timeout) }
+        #[cfg(target_os = "linux")] { linux::connect_tcp(address, timeout) }
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn bind_udp(&self, local: SocketAddr) -> io::Result<UdpSocket> {
         #[cfg(windows)] { windows::bind_udp(local) }
         #[cfg(target_os = "macos")] { darwin::bind_udp(local) }
+        #[cfg(target_os = "linux")] { linux::bind_udp(local) }
     }
 
     fn tun_supported(&self) -> bool {
-        // Windows captures with its own wintun adapter; macOS delegates to the
-        // privileged TUN service installed from the same app bundle.
-        cfg!(any(windows, target_os = "macos"))
+        #[cfg(target_os = "linux")]
+        { return linux::supported(); }
+        #[cfg(not(target_os = "linux"))]
+        { cfg!(any(windows, target_os = "macos")) }
     }
 
     #[cfg(windows)]
@@ -221,9 +231,21 @@ pub mod system_proxy;
 pub mod managed;
 pub mod tun_bridge;
 pub mod process;
+#[cfg(unix)]
+pub mod desktop_activation;
 #[cfg(windows)]
 pub mod service;
 #[cfg(target_os = "macos")]
 pub mod service_macos;
+#[cfg(target_os = "linux")]
+pub mod service_linux;
+#[cfg(target_os="linux")]
+mod linux_service_manager;
+#[cfg(target_os="linux")]
+pub mod privilege_linux;
+#[cfg(target_os="linux")]
+mod session_proxy_linux;
+#[cfg(target_os = "linux")]
+pub mod autostart_linux;
 #[cfg(windows)]
 pub mod parent;

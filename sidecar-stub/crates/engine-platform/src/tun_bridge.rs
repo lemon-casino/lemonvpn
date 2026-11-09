@@ -5,6 +5,8 @@ use crate::managed::{self, CoreProcess};
 use crate::service as broker;
 #[cfg(target_os = "macos")]
 use crate::service_macos as broker;
+#[cfg(target_os = "linux")]
+use crate::service_linux as broker;
 use serde_json::{json, Value};
 use std::{
     io,
@@ -33,6 +35,13 @@ pub fn configuration(router_port: u16, dns_port: u16, password: &str) -> io::Res
         "dns":{"enable":true,"ipv6":true,"enhanced-mode":"fake-ip","fake-ip-range":"198.18.0.1/16","fake-ip-range6":"fc00::/18","default-nameserver":["223.5.5.5","1.1.1.1"],"nameserver":[format!("udp://127.0.0.1:{dns_port}")],"respect-rules":false},
         "profile":{"store-selected":false,"store-fake-ip":false},
     });
+    #[cfg(target_os = "linux")]
+    {
+        // The egress broker owns priorities 8750..8799; capture follows them.
+        config["tun"]["iproute2-rule-index"] = json!(9000);
+        config["tun"]["iproute2-table-index"] = json!(2022);
+        config["tun"]["auto-redirect"] = json!(false);
+    }
     apply_processes(&mut config, &[])?;
     Ok(config)
 }
@@ -114,7 +123,7 @@ pub fn apply_processes(config: &mut Value, names: &[String]) -> io::Result<()> {
 
 enum Owner {
     Local(CoreProcess),
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     Service,
 }
 pub struct TunBridge {
@@ -124,6 +133,10 @@ pub struct TunBridge {
     stopped: bool,
     config: Value,
     process_names: Vec<String>,
+    #[cfg(any(target_os="macos",target_os="linux"))]
+    start_request: Value,
+    #[cfg(any(target_os="macos",target_os="linux"))]
+    recovery: Option<String>,
 }
 impl TunBridge {
     pub fn start(
@@ -133,9 +146,15 @@ impl TunBridge {
         directory: PathBuf,
         process_names: Vec<String>,
     ) -> io::Result<Self> {
+        if !crate::current().tun_supported() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "当前平台尚未提供可用的 TUN 适配器",
+            ));
+        }
         let mut config = configuration(router_port, dns_port, password)?;
         apply_processes(&mut config, &process_names)?;
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         {
             if broker::installed() {
                 broker::request(
@@ -148,9 +167,13 @@ impl TunBridge {
                     stopped: false,
                     config,
                     process_names,
+                    #[cfg(any(target_os="macos",target_os="linux"))]
+                    start_request: json!({"action":"start","router_port":router_port,"dns_port":dns_port,"password":password}),
+                    #[cfg(any(target_os="macos",target_os="linux"))]
+                    recovery: None,
                 });
             }
-            if !broker::is_elevated() {
+            if cfg!(any(target_os = "macos", target_os = "linux")) || !broker::is_elevated() {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "TUN 需要先安装管理员服务",
@@ -170,6 +193,10 @@ impl TunBridge {
             stopped: false,
             config,
             process_names,
+            #[cfg(any(target_os="macos",target_os="linux"))]
+            start_request: json!({"action":"start","router_port":router_port,"dns_port":dns_port,"password":password}),
+            #[cfg(any(target_os="macos",target_os="linux"))]
+            recovery: None,
         })
     }
     pub fn update_processes(&mut self, names: Vec<String>) -> io::Result<()> {
@@ -180,7 +207,7 @@ impl TunBridge {
         apply_processes(&mut next, &names)?;
         match &mut self.owner {
             Owner::Local(process) => process.configure(next.clone())?,
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Owner::Service => {
                 broker::request(&json!({"action":"process_rules","process_names":names}))?;
             }
@@ -195,7 +222,7 @@ impl TunBridge {
             Owner::Local(process) => process
                 .request("POST", "/cache/dns/flush", None)
                 .map(|_| ()),
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Owner::Service => broker::request(&json!({"action":"flush_dns"}))
                 .map(|_| ())
                 .map_err(|error| {
@@ -214,14 +241,37 @@ impl TunBridge {
         }
         self.cached = match &mut self.owner {
             Owner::Local(process) => process.alive(),
-            #[cfg(any(windows, target_os = "macos"))]
-            Owner::Service => broker::request(&json!({"action":"status"}))
-                .ok()
-                .and_then(|v| v.get("enabled").and_then(Value::as_bool))
-                .unwrap_or(false),
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            Owner::Service => {
+                let response=broker::request(&json!({"action":"status"}));
+                #[cfg(any(target_os="macos",target_os="linux"))]
+                {self.recovery=match &response {
+                    Ok(value)=>value.get("recovering").and_then(Value::as_str).map(str::to_owned),
+                    Err(error)=>Some(error.to_string()),
+                };}
+                let enabled=response.ok().and_then(|v|v.get("enabled").and_then(Value::as_bool)).unwrap_or(false);
+                #[cfg(any(target_os="macos",target_os="linux"))]
+                if !enabled && broker::installed() {
+                    let mut request=self.start_request.clone();
+                    request["process_names"]=json!(self.process_names);
+                    return {
+                        self.recovery=broker::request(&request).err().map(|e|e.to_string());
+                        self.cached=self.recovery.is_none();
+                        self.checked=Instant::now();
+                        self.cached
+                    };
+                }
+                enabled
+            },
         };
         self.checked = Instant::now();
         self.cached
+    }
+    pub fn recovery(&self)->Option<&str> {
+        #[cfg(any(target_os="macos",target_os="linux"))]
+        {self.recovery.as_deref()}
+        #[cfg(not(any(target_os="macos",target_os="linux")))]
+        {None}
     }
     pub fn shutdown(&mut self) -> io::Result<()> {
         if self.stopped {
@@ -233,7 +283,7 @@ impl TunBridge {
                     process.request("PATCH", "/configs", Some(&json!({"tun":{"enable":false}})))?;
                 }
             }
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             Owner::Service => {
                 broker::request(&json!({"action":"stop"}))?;
             }
@@ -245,7 +295,7 @@ impl TunBridge {
 }
 impl Drop for TunBridge {
     fn drop(&mut self) {
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         if !self.stopped && matches!(self.owner, Owner::Service) {
             let _ = broker::request(&json!({"action":"stop"}));
         }

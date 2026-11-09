@@ -22,6 +22,11 @@ use std::{
 static ROUTER: AtomicU16 = AtomicU16::new(0);
 static DNS_PORT: AtomicU16 = AtomicU16::new(0);
 static BACKEND: Mutex<Option<Backend>> = Mutex::new(None);
+static BACKEND_V6: Mutex<Option<Backend>> = Mutex::new(None);
+fn backend_slot(ipv6: bool) -> &'static Mutex<Option<Backend>> {
+    if ipv6 && managed::egress_families().is_some() { &BACKEND_V6 } else { &BACKEND }
+}
+
 static TUN: Mutex<Option<TunBridge>> = Mutex::new(None);
 static ROUTER_PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static HOT_PENDING: AtomicBool = AtomicBool::new(false);
@@ -43,6 +48,7 @@ struct Backend {
     entries: BTreeMap<String, (Value, u16)>,
     direct_port: u16,
     uplink: Option<String>,
+    ipv6: bool,
     checked: Instant,
 }
 
@@ -69,16 +75,24 @@ pub(crate) fn available() -> bool {
 pub(crate) fn tun_active() -> bool {
     TUN.lock().unwrap().as_mut().is_some_and(TunBridge::alive)
 }
+pub(crate) fn tun_recovery() -> Option<String> {
+    TUN.lock().unwrap().as_ref().and_then(|bridge|bridge.recovery().map(str::to_owned))
+}
 
 fn base_config(
     entries: &BTreeMap<String, (Value, u16)>,
     direct_port: u16,
     uplink: &Option<String>,
+    ipv6: bool,
 ) -> Value {
     let mut listeners = vec![
         json!({"name":"lemonvpn-direct","type":"socks","listen":"127.0.0.1","port":direct_port,"udp":true,"proxy":"DIRECT"}),
     ];
     let mut proxies = Vec::new();
+    if managed::egress_families().is_some() {
+        proxies.push(json!({"name":"LemonVPN-Direct","type":"direct","ip-version":if ipv6 {"ipv6"}else{"ipv4"}}));
+        listeners[0]["proxy"] = "LemonVPN-Direct".into();
+    }
     for (key, (node, port)) in entries {
         let name = format!("node-{key}");
         if let Some(hops) = node.as_array() {
@@ -120,7 +134,11 @@ fn listener(node: Option<&config::Node>, address: Option<&str>) -> io::Result<u1
         return Err(io::Error::new(io::ErrorKind::Interrupted, "引擎正在停止"));
     }
     // Render outside the backend lock; parsing config/providers must never invert locks.
-    let rendered = node.map(|node| render_node(node, address)).transpose()?;
+    let selected = match node {
+        Some(node) if managed::egress_families().is_some() => Some(endpoint_addresses(address.unwrap_or(&node.host))?.into_iter().next().ok_or_else(||io::Error::other("节点没有可用地址"))?),
+        _ => address.map(str::to_owned),
+    };
+    let rendered = node.map(|node| render_node(node, selected.as_deref())).transpose()?;
     listener_rendered(rendered)
 }
 
@@ -131,22 +149,29 @@ fn listener_rendered(rendered: Option<Value>) -> io::Result<u16> {
     let key = rendered
         .as_ref()
         .map(|n| crate::sha256::hex(n.to_string().as_bytes()));
-    let mut guard = BACKEND.lock().unwrap();
+    let ipv6 = if managed::egress_families().is_some() {
+        let first = rendered.as_ref().and_then(|v|v.as_array().and_then(|a|a.first()).or(Some(v)));
+        first.and_then(|v|v.get("server")).and_then(Value::as_str)
+            .and_then(|v|v.parse::<std::net::IpAddr>().ok()).map(|ip|ip.is_ipv6())
+            .unwrap_or_else(||managed::egress_families()==Some([false,true]))
+    } else { false };
+    let uplink = if managed::egress_families().is_some() { managed::uplink_for(ipv6)? } else { managed::uplink_name() };
+    let mut guard = backend_slot(ipv6).lock().unwrap();
+    if guard.as_mut().is_some_and(|b|b.uplink!=uplink) { guard.take(); }
     if guard.as_mut().is_some_and(|b| !b.process.alive()) {
         *guard = None;
     }
     if guard.is_none() {
         let direct_port = managed::free_port()?;
         let entries = BTreeMap::new();
-        let uplink = managed::uplink_name();
         let directory = config::data_dir()
             .join("compat")
-            .join(format!("protocols-{}", std::process::id()));
+            .join(format!("protocols-{}-{}", std::process::id(), if ipv6 {6}else{4}));
         let process = CoreProcess::start(
             &managed::core_path()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "缺少协议兼容内核"))?,
             directory,
-            base_config(&entries, direct_port, &uplink),
+            base_config(&entries, direct_port, &uplink, ipv6),
             random_secret()?,
         )?;
         *guard = Some(Backend {
@@ -154,11 +179,12 @@ fn listener_rendered(rendered: Option<Value>) -> io::Result<u16> {
             entries,
             direct_port,
             uplink,
+            ipv6,
             checked: Instant::now(),
         });
     }
     let backend = guard.as_mut().unwrap();
-    if backend.checked.elapsed() >= Duration::from_secs(1) {
+    if managed::egress_families().is_none() && backend.checked.elapsed() >= Duration::from_secs(1) {
         if let Some(name) = managed::uplink_name() {
             if backend.uplink.as_ref() != Some(&name) {
                 backend.process.request(
@@ -186,7 +212,7 @@ fn listener_rendered(rendered: Option<Value>) -> io::Result<u16> {
     backend
         .entries
         .insert(key.clone(), (rendered.unwrap(), port));
-    let payload = base_config(&backend.entries, backend.direct_port, &backend.uplink);
+    let payload = base_config(&backend.entries, backend.direct_port, &backend.uplink, backend.ipv6);
     if let Err(error) = backend.process.configure(payload) {
         backend.entries.remove(&key);
         return Err(error);
@@ -229,21 +255,48 @@ fn control(
     Ok((stream, address))
 }
 
+fn endpoint_addresses(host: &str) -> io::Result<Vec<String>> {
+    let addresses = crate::dns::resolve(host)?;
+    let families = managed::egress_families();
+    let result: Vec<_> = addresses.into_iter().filter(|ip|ip.is_loopback() || families.map_or(true,|f|f[usize::from(ip.is_ipv6())]))
+        .map(|ip|ip.to_string()).collect();
+    if result.is_empty() { return Err(io::Error::new(io::ErrorKind::NotConnected,"没有对应地址族的可用出口")); }
+    Ok(result)
+}
+
 pub(crate) fn connect(
     node: Option<&config::Node>,
     address: Option<&str>,
     host: &str,
     port: u16,
 ) -> io::Result<TcpStream> {
+    if managed::egress_families().is_some() {
+        if let Some(node) = node {
+            let mut last = io::Error::other("节点没有可用地址");
+            for endpoint in endpoint_addresses(address.unwrap_or(&node.host))? {
+                let result = listener(Some(node),Some(&endpoint)).and_then(|p|control(p,1,host,port));
+                match result { Ok((stream,_))=>return Ok(stream),Err(e)=>last=e }
+            }
+            return Err(last);
+        }
+        // Native direct sockets select their family and avoid a global core bind.
+        return crate::proxy::dial(host,port);
+    }
     control(listener(node, address)?, 1, host, port).map(|(stream, _)| stream)
 }
 
 fn chain_listener(nodes: &[config::Node], network: &str) -> io::Result<u16> {
+    chain_listener_at(nodes,network,None)
+}
+fn chain_listener_at(nodes: &[config::Node], network: &str, endpoint:Option<&str>) -> io::Result<u16> {
     if let Some(error) = chain_error(nodes, network) {
         return Err(io::Error::new(io::ErrorKind::Unsupported, error));
     }
-    let proxies: Result<Vec<_>, _> = nodes.iter().map(|node| render_node(node, None)).collect();
-    listener_rendered(Some(Value::Array(proxies?)))
+    let mut proxies: Vec<_> = nodes.iter().map(|node|render_node(node,None)).collect::<io::Result<_>>()?;
+    if managed::egress_families().is_some() {
+        proxies[0]["server"] = endpoint.map(str::to_owned).map(Ok).unwrap_or_else(||endpoint_addresses(&nodes[0].host).map(|a|a[0].clone()))?.into();
+    }
+    listener_rendered(Some(Value::Array(proxies)))
 }
 
 pub(crate) fn connect_chain(
@@ -251,6 +304,15 @@ pub(crate) fn connect_chain(
     host: &str,
     port: u16,
 ) -> io::Result<TcpStream> {
+    if managed::egress_families().is_some() && !nodes.is_empty() {
+        let mut last=io::Error::other("前置节点没有可用地址");
+        for endpoint in endpoint_addresses(&nodes[0].host)? {
+            match chain_listener_at(nodes,"tcp",Some(&endpoint)).and_then(|p|control(p,1,host,port)) {
+                Ok((stream,_))=>return Ok(stream),Err(e)=>last=e,
+            }
+        }
+        return Err(last);
+    }
     control(chain_listener(nodes, "tcp")?, 1, host, port).map(|(stream, _)| stream)
 }
 
@@ -346,6 +408,11 @@ impl Datagram {
         host: &str,
         port: u16,
     ) -> io::Result<Self> {
+        if node.is_none() && managed::egress_families().is_some() {
+            let endpoint=endpoint_addresses(host)?[0].clone();
+            let proxy=json!({"type":"direct","server":endpoint,"udp":true});
+            return Self::open_port(listener_rendered(Some(proxy))?,node,&endpoint,port);
+        }
         Self::open_port(listener(node, address)?, node, host, port)
     }
 
@@ -518,8 +585,10 @@ pub(crate) fn refresh_tun_processes() {
         return;
     }
     let result = (|| {
-        if let Some(backend) = BACKEND.lock().unwrap().as_ref() {
-            backend.process.request("POST", "/cache/dns/flush", None)?;
+        for slot in [&BACKEND,&BACKEND_V6] {
+            if let Some(backend) = slot.lock().unwrap().as_ref() {
+                backend.process.request("POST", "/cache/dns/flush", None)?;
+            }
         }
         if let Some(bridge) = TUN.lock().unwrap().as_mut() {
             bridge.update_processes(names)?;
@@ -544,7 +613,29 @@ pub(crate) fn refresh_tun_processes() {
     }
 }
 
+pub(crate) fn refresh_network() {
+    use std::sync::atomic::AtomicU64;
+    static REVISION: AtomicU64 = AtomicU64::new(0);
+    let Some(revision)=managed::network_revision() else {return};
+    if let Some(bridge)=TUN.lock().unwrap().as_mut() { bridge.alive(); }
+    let previous=REVISION.swap(revision,Ordering::AcqRel);
+    if previous==0 || previous==revision {return}
+    // Only POSIX hosts report revisions. Do not alter Windows recovery paths.
+    crate::connections::close_all();
+    crate::dns::flush();
+    BACKEND.lock().unwrap().take();
+    BACKEND_V6.lock().unwrap().take();
+    HOT_PENDING.store(true,Ordering::Release);
+    crate::logs::info("engine::network","Network changed or resumed; stale connections and resolver state released.",None);
+}
+
 pub(crate) fn enable_tun() -> io::Result<()> {
+    if !crate::platform::current().tun_supported() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "当前平台尚未提供可用的 TUN 适配器",
+        ));
+    }
     let mut tun = TUN.lock().unwrap();
     if tun.as_mut().is_some_and(TunBridge::alive) {
         return Err(io::Error::other("TUN 模式已开启"));
@@ -587,6 +678,7 @@ pub(crate) fn disable_tun() -> io::Result<()> {
 pub(crate) fn shutdown() {
     let _ = disable_tun();
     BACKEND.lock().unwrap().take();
+    BACKEND_V6.lock().unwrap().take();
 }
 
 fn render_node(node: &config::Node, address: Option<&str>) -> io::Result<Value> {

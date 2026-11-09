@@ -93,6 +93,7 @@ impl Engine {
                 move || {
                     while !shutdown.wait(Duration::from_secs(2)) {
                         config::refresh();
+                        crate::compat::refresh_network();
                         crate::compat::refresh_tun_processes();
                     }
                 }

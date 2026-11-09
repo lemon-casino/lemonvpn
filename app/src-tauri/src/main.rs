@@ -6,14 +6,12 @@ mod integration;
 mod instance;
 mod proxy;
 mod window;
+mod tray;
 
 use engine::{Engine, EngineStatus};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
-use tauri::image::Image;
-use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItem, PredefinedMenuItem};
-use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 #[cfg(windows)]
@@ -62,9 +60,17 @@ fn engine_logs(engine: tauri::State<'_, Engine>) -> String {
     engine.logs()
 }
 
+#[cfg(not(any(target_os="linux",target_os="macos")))]
 #[tauri::command]
 fn proxy_status(engine: tauri::State<'_, Engine>) -> proxy::ProxyStatus {
     proxy_for_port(engine.port())
+}
+
+#[cfg(any(target_os="linux",target_os="macos"))]
+#[tauri::command]
+async fn proxy_status(engine: tauri::State<'_, Engine>) -> Result<proxy::ProxyStatus,String> {
+    let port=engine.port();
+    tauri::async_runtime::spawn_blocking(move||proxy_for_port(port)).await.map_err(|e|e.to_string())
 }
 
 fn proxy_for_port(port: u16) -> proxy::ProxyStatus {
@@ -82,13 +88,27 @@ fn log_page_ready() {
 
 /// Turns the system proxy on (pointing at this engine) or restores whatever
 /// was configured before it.
+#[cfg(not(any(target_os="linux",target_os="macos")))]
 #[tauri::command]
 fn proxy_set(
     enabled: bool,
     engine: tauri::State<'_, Engine>,
+    app:tauri::AppHandle,
 ) -> Result<proxy::ProxyStatus, String> {
     set_system_proxy(&engine, enabled)?;
+    tray::refresh(&app);
     Ok(proxy_for_port(engine.port()))
+}
+
+#[cfg(any(target_os="linux",target_os="macos"))]
+#[tauri::command]
+async fn proxy_set(enabled:bool,app:tauri::AppHandle)->Result<proxy::ProxyStatus,String> {
+    tauri::async_runtime::spawn_blocking(move|| {
+        let engine=app.state::<Engine>();
+        set_system_proxy(&engine,enabled)?;
+        tray::refresh(&app);
+        Ok(proxy_for_port(engine.port()))
+    }).await.map_err(|e|e.to_string())?
 }
 
 fn set_system_proxy(engine: &Engine, enabled: bool) -> Result<(), String> {
@@ -113,7 +133,7 @@ fn set_tun(port: u16, enabled: bool) -> Result<(), String> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(3))
         .map_err(|err| format!("连接引擎失败：{err}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     stream
         .write_all(request.as_bytes())
         .map_err(|err| format!("发送 TUN 请求失败：{err}"))?;
@@ -247,7 +267,7 @@ fn tun_relaunch_as_admin(app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let _ = app;
-        Err("TUN 模式仅支持 Windows".to_string())
+        Err("请在 TUN 模式中安装或修复平台服务，无需以管理员身份重启应用".to_string())
     }
 }
 
@@ -256,65 +276,18 @@ fn show_main(app: &tauri::AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
-    }
-}
-
-/// Rebuilds the tray menu from the live proxy state.
-fn build_menus(app: &tauri::AppHandle) -> tauri::Result<()> {
-    let enabled = proxy_for_port(app.state::<Engine>().port()).enabled;
-
-    let tray_show = MenuItem::with_id(app, SHOW_WINDOW_ID, "显示窗口", true, None::<&str>)?;
-    let tray_proxy = CheckMenuItemBuilder::with_id(TRAY_SYSTEM_PROXY_ID, "系统代理")
-        .checked(enabled)
-        .build(app)?;
-    let tray_logs = MenuItem::with_id(app, OPEN_LOGS_ID, "引擎日志", true, None::<&str>)?;
-    let tray_quit = MenuItem::with_id(app, QUIT_ID, "退出", true, None::<&str>)?;
-    let separator = PredefinedMenuItem::separator(app)?;
-    let tray_menu = MenuBuilder::new(app)
-        .item(&tray_show)
-        .item(&tray_proxy)
-        .item(&tray_logs)
-        .item(&separator)
-        .item(&tray_quit)
-        .build()?;
-
-    match app.tray_by_id(TRAY_ID) {
-        Some(tray) => tray.set_menu(Some(tray_menu))?,
-        None => {
-            TrayIconBuilder::with_id(TRAY_ID)
-                .icon(Image::from_bytes(include_bytes!("../icons/32x32.png"))?)
-                .tooltip("LemonVPN")
-                .menu(&tray_menu)
-                .show_menu_on_left_click(false)
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        ..
-                    } = event
-                    {
-                        show_main(tray.app_handle());
-                    }
-                })
-                .build(app)?;
+        if !window.is_focused().unwrap_or(false) {
+            let _=window.request_user_attention(Some(tauri::UserAttentionType::Informational));
         }
     }
-
-    Ok(())
 }
 
-fn toggle_system_proxy(app: &tauri::AppHandle) {
-    let Some(engine) = app.try_state::<Engine>() else {
-        return;
-    };
-    let wanted = !proxy_for_port(engine.port()).enabled;
-    if let Err(err) = set_system_proxy(&engine, wanted) {
-        eprintln!("lemonvpn: 系统代理切换失败: {err}");
-    }
-    // Show the state that actually took effect.
-    if let Err(err) = build_menus(app) {
-        eprintln!("lemonvpn: 刷新菜单失败: {err}");
-    }
-}
+fn build_menus(app: &tauri::AppHandle) -> tauri::Result<()> { tray::install(app) }
+
+fn toggle_system_proxy(app: &tauri::AppHandle) { tray::toggle(app,false); }
+
+#[tauri::command]
+fn tray_refresh(app:tauri::AppHandle) {tray::refresh(&app);}
 
 /// Restarts the engine when it dies, and turns the proxy off once it cannot be
 /// recovered so the system is never left pointing at a dead port.
@@ -357,6 +330,7 @@ fn isolated_ui_smoke() -> bool {
 fn install_events(handle: &tauri::AppHandle) {
     handle.on_menu_event(|app, event| match event.id().as_ref() {
         TRAY_SYSTEM_PROXY_ID => toggle_system_proxy(app),
+        tray::TUN_ID => tray::toggle(app,true),
         SHOW_WINDOW_ID => show_main(app),
         OPEN_LOGS_ID => open_logs(app),
         QUIT_ID => app.exit(0),
@@ -488,6 +462,8 @@ fn main() {
             }
         }
     };
+    #[cfg(unix)]
+    let activation_listener=_instance.activation_listener().ok();
     // A crashed host releases its instance lock before its sidecar watchdog
     // finishes cleanup. Let that owned listener disappear before replacing it.
     #[cfg(any(windows, unix))]
@@ -529,7 +505,7 @@ fn main() {
             if wants_tun {
                 wait_for_port_release(engine::configured_port(), Duration::from_secs(10));
             }
-            let engine = Engine::start();
+            let engine = Engine::start(app.path().resource_dir()?);
             let tun_error = if wants_tun {
                 if engine.status().state == "running" {
                     set_tun(engine.port(), true).err()
@@ -590,7 +566,7 @@ fn main() {
                     },
                 )
                 .inner_size(1100.0, 720.0)
-                .visible(!std::env::args().any(|arg|arg=="--autostart"))
+                .visible(!std::env::args().any(|arg|arg=="--autostart") || !tray::can_hide(app.handle()))
                 .initialization_script(seed_profile_script(port))
                 .on_web_resource_request(|_, response| {
                     response.headers_mut().insert(
@@ -617,6 +593,8 @@ fn main() {
             #[cfg(windows)]
             let window = window.decorations(false);
             window.build()?;
+            #[cfg(unix)]
+            if let Some(socket)=activation_listener {instance::start_activation(socket,app.handle().clone());}
 
             if let Some(err) = tun_error {
                 eprintln!("lemonvpn: TUN 开启失败: {err}");
@@ -650,11 +628,13 @@ fn main() {
                 // Closing the window keeps the engine and the system proxy up;
                 // the tray's 退出 item is the way out.
                 api.prevent_close();
-                let _ = window.hide();
+                if tray::can_hide(window.app_handle()) {let _=window.hide();}
+                else {let _=window.show();let _=window.minimize();}
             }
         })
         .invoke_handler(tauri::generate_handler![
             window::window_action,
+            tray_refresh,
             engine_status,
             engine_logs,
             log_page_ready,
@@ -666,7 +646,12 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("failed to build the LemonVPN shell")
         .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                show_main(app);
+            }
             if let tauri::RunEvent::Exit = event {
+                tray::stop(app);
                 let mut owned_datapath = false;
                 let mut port = None;
                 if let Some(engine) = app.try_state::<Engine>() {

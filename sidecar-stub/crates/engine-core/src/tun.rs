@@ -628,10 +628,19 @@ pub(crate) fn active() -> bool {
 pub(crate) fn supported() -> bool {
     // Kernel TUN exists only where capture can be privileged: Windows uses its
     // own wintun adapter, macOS delegates to the installed TUN service.
+    if cfg!(any(target_os = "macos", target_os = "linux")) && !crate::compat::available() {
+        return false;
+    }
     platform::current().tun_supported()
 }
 
 pub(crate) fn enable() -> io::Result<()> {
+    if !supported() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "当前平台尚未提供可用的 TUN 适配器",
+        ));
+    }
     if crate::compat::available() {
         return crate::compat::enable_tun();
     }
@@ -682,11 +691,13 @@ pub(crate) fn disable() -> io::Result<()> {
 }
 
 pub(crate) fn status_json() -> String {
+    if !supported() {
+        return r#"{"enabled":false,"supported":false}"#.to_owned();
+    }
     if crate::compat::available() {
-        return format!(
-            r#"{{"enabled":{},"supported":true,"adapter":"LemonVPN","address":"198.18.0.1 / fdfe:dcba:9876::1","udp":"full","ipv6":true,"backend":"mihomo"}}"#,
-            crate::compat::tun_active()
-        );
+        return serde_json::json!({"enabled":crate::compat::tun_active(),"supported":true,"adapter":"LemonVPN",
+            "address":"198.18.0.1 / fdfe:dcba:9876::1","udp":"full","ipv6":true,"backend":"mihomo",
+            "recovering":crate::compat::tun_recovery()}).to_string();
     }
     if !supported() {
         return r#"{"enabled":false,"supported":false}"#.to_owned();
@@ -698,7 +709,7 @@ pub(crate) fn status_json() -> String {
         .map(|state| &state.config)
         .unwrap_or(&defaults);
     format!(
-        r#"{{"enabled":{},"adapter":"{}","address":"{}","host_address":"{}","udp":"dns_only"}}"#,
+        r#"{{"enabled":{},"supported":true,"adapter":"{}","address":"{}","host_address":"{}","udp":"dns_only"}}"#,
         guard.is_some(),
         crate::json::escape(&config.name),
         config.stack_address,

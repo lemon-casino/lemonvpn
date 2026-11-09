@@ -1,10 +1,10 @@
 # 共享引擎与平台适配层
 
-更新：2026-11-06。
+更新：2026-11-09。最新桌面适配、TUN 托盘与检查边界见 [补齐记录](desktop-platform-completion.zh.md)。
 
 0.1.3 更新：Windows 标准安装包新增固定版本 mihomo 协议后端与 IPv4/IPv6 TCP/UDP TUN 桥接，以及按需提权服务、开机自启。共享库的自定义 `TunConfig` 路径仍保留原生 IPv4 栈；下文涉及该路径的限制不能等同于标准 Windows 安装包。实现边界、进程模型和未运行测试的说明见 [Windows 0.1.3](windows-0.1.3.zh.md)。
 
-当前优先级为本机 Windows x64 稳定性；正式发布及 Windows ARM64 真机验收延后。桌面单实例锁防止重复启动，代理备份按端口和宿主 PID 归属；系统代理实现收敛到平台库，桌面壳只负责序列化。引擎宿主持有桌面父进程句柄，父进程异常退出后停止引擎、释放 TUN，并恢复仍属于该宿主的系统代理。重启等待可取消，启动未通过健康检查的子进程会被回收。TUN 新连接定期重新探测物理网卡，离线时不使用未绑定的 socket 绕回捕获路由。
+本机使用仍优先保证 Windows x64 稳定性。现已按用户要求接通 [tag 自动构建与发布](tag-release.zh.md)，包含 Windows/macOS/Linux 的 x64 与 ARM64；签名、公证和 ARM64 真机验收尚未完成。桌面单实例锁防止重复启动，代理备份按端口和宿主 PID 归属；系统代理实现收敛到平台库，桌面壳只负责序列化。引擎宿主持有桌面父进程句柄，父进程异常退出后停止引擎、释放 TUN，并恢复仍属于该宿主的系统代理。重启等待可取消，启动未通过健康检查的子进程会被回收。TUN 新连接定期重新探测物理网卡，离线时不使用未绑定的 socket 绕回捕获路由。
 
 入站协议探测、HTTP 请求头、SOCKS5 握手和 API 请求体使用可取消的读取轮询：保留原握手超时和已经收到的部分数据，停止时不再等候长超时。事件和日志订阅也独立检查停止信号，保留原 15 秒心跳，不以心跳等待时间阻塞停止。父进程退出兜底先恢复属于该宿主的代理，再等待引擎收尾，避免远端拨号拖延代理还原。
 
@@ -25,7 +25,7 @@
           TCP/UDP socket / TUN 数据包通道
            网卡与路由 / 内存统计 / 默认目录
                          ↓
-           Windows 原生实现 | 后续宿主实现
+           Windows | macOS | Linux 适配
 ```
 
 依赖单向：桌面宿主依赖 core，core 依赖 platform；platform 不依赖引擎配置、日志或桌面界面。core 中没有 Windows 条件编译、Wintun 或 Win32 调用。现有 HTTP/SOCKS 入站和全部协议出站均保留。
@@ -62,11 +62,11 @@ engine.shutdown()?;
 | 平台 | 当前实现 |
 |---|---|
 | Windows | Wintun、IPv4 路由、物理接口 socket 绑定、RSS、数据目录 |
-| Linux | 标准 TCP/UDP socket、RSS、数据目录；TUN 尚未实现 |
-| macOS | 标准 TCP/UDP socket、`networksetup` 系统代理、LaunchAgent 开机自启、单实例、RSS、数据目录；TUN 与进程归属尚未实现 |
+| Linux | 双栈网络/睡眠恢复、进程归属、单实例唤起、RSS、兼容内核分发、多管理器 TUN 服务、GSettings/KConfig/会话代理与 XDG 自启；平台库编译检查已过，原生行为未验收 |
+| macOS | 双栈网络/睡眠恢复、进程归属、`networksetup` 代理、LaunchAgent 自启、单实例唤起、RSS、LaunchDaemon TUN；平台库编译检查已过，原生行为未验收 |
 | Android / iOS | 预留宿主接口；原生 VPN 服务及绑定尚未实现 |
 
-未实现的原生 TUN 在 API 能力中报告 `available:false`，写入返回 501；能力由实际安装的后端决定，移动端无需伪装 Windows。现有 TUN 仍仅支持 IPv4 TCP 和 DNS UDP，普通 UDP 中继与 IPv6 不在此次变更范围内。
+未实现的原生 TUN 在 API 能力中报告 `available:false`，写入返回 501；能力由实际安装的后端决定，移动端无需伪装 Windows。内置 smoltcp 栈仅支持 IPv4 TCP 和 DNS UDP；Windows/macOS/Linux 的双栈 TCP/UDP TUN 另由兼容内核服务桥接，不能把两条实现混为一谈。当前平台实现与边界见 [平台集成说明](posix-network-integration.zh.md)。
 
 macOS 系统代理沿用 Windows 的语义：接管前把每个网络服务的 HTTP/HTTPS/SOCKS 设置与旁路域名快照写入数据目录 `system-proxy.json`，禁用时只恢复仍指向本引擎端口的服务，用户自行修改过的服务保持用户选择；记录的归属进程退出且回环端口无监听时才做陈旧恢复。兼容内核以 `lemonvpn-kernel` 名义随包分发，进程组随拥有者回收；sidecar 通过 `getppid` 轮询实现等价于 Windows 父进程句柄的看门狗。壳层单实例在 POSIX 上复用同一锁文件并以 `flock` 加锁；开机自启写入 `~/Library/LaunchAgents/org.lemonvpn.desktop.plist`。
 
@@ -84,6 +84,8 @@ pnpm --dir app build
 准备脚本按 `TAURI_ENV_TARGET_TRIPLE`（或 `CARGO_BUILD_TARGET`，未指定则为宿主架构）显式传 `cargo build --target`，从 Cargo metadata 提供的目标目录读取产物，避免把宿主程序改名为其他架构。Windows DLL 从依赖中选择相应 CPU 的 Wintun，校验 PE 架构，并携带原许可证。Windows 的 NSIS 和 DLL 资源配置位于 `tauri.windows.conf.json`。
 
 CI 为 Windows/Linux/macOS 增加 workspace 测试，为 Windows ARM64 增加编译检查；加入 CI 不代表所有平台已通过真机验收。macOS 通用二进制合并暂未实现，脚本会明确拒绝 `universal-apple-darwin`。
+
+版本 tag 使用独立的六目标发布工作流，不触发上述分支测试：按固定源码和摘要准备资源，使用原生 runner 构建未签名安装包，全部成功后自动发布 GitHub Release。Windows ARM64 内核和 Wintun 摘要已独立；各组件在打包后复核实际 PE/Mach-O/ELF 架构。
 
 管理员 PowerShell 中可运行原生 Wintun 冒烟：
 

@@ -7454,10 +7454,10 @@ index fedddd04..4965f7c9 100644
    ]
  }
 diff --git a/src/api/api.ts b/src/api/api.ts
-index 107878d9..0fd61e0f 100644
+index 107878d9..c0d805a0 100644
 --- a/src/api/api.ts
 +++ b/src/api/api.ts
-@@ -60,6 +60,34 @@ import type {RoutingTraceRequest, RoutingTraceResponse} from './model';
+@@ -60,6 +60,42 @@ import type {RoutingTraceRequest, RoutingTraceResponse} from './model';
  import type {components} from './types';
  import type {EngineConfig} from './engines';
  
@@ -7478,7 +7478,15 @@ index 107878d9..0fd61e0f 100644
 +export type NodeGroupsBatchResult = {generation_id: string; changed: boolean; changed_nodes: number; total_nodes: number};
 +export type NodeGroupsResult = {generation_id: string; node_id: string; group_ids?: string[]; changed: boolean};
 +export type ProviderSettings = {name: string; url: string; update_interval: number; user_agent: string; cache: boolean};
-+export type TunStatus = {enabled: boolean; supported?: boolean; adapter?: string; address?: string; host_address?: string; udp?: string};
++export type TunStatus = {
++  enabled: boolean;
++  supported?: boolean;
++  adapter?: string;
++  address?: string;
++  host_address?: string;
++  udp?: string;
++  recovering?: string | null;
++};
 +export type DesktopStatus = {
 +  observed_at: string;
 +  mixed: {address: string | null; protocols: string[]};
@@ -7492,7 +7500,7 @@ index 107878d9..0fd61e0f 100644
  export interface Api {
    // The engine's configuration extension, through the routes `config` names.
    exportConfig(config: EngineConfig, signal?: AbortSignal): Promise<ConfigExport>;
-@@ -75,6 +103,9 @@ export interface Api {
+@@ -75,6 +111,9 @@ export interface Api {
    memoryHistory(query?: MemoryHistoryQuery, signal?: AbortSignal): Promise<MemoryHistory>;
    datapath(detail?: DatapathDetail, signal?: AbortSignal): Promise<Datapath>;
    runtimeMemory(signal?: AbortSignal): Promise<RuntimeMemory>;
@@ -7502,7 +7510,7 @@ index 107878d9..0fd61e0f 100644
    nodes(query?: NodeQuery, signal?: AbortSignal): Promise<NodeList>;
    groups(signal?: AbortSignal): Promise<GroupSummary[]>;
    group(id: string, signal?: AbortSignal): Promise<Group>;
-@@ -101,8 +132,15 @@ export interface Api {
+@@ -101,8 +140,15 @@ export interface Api {
    runtimeSettings(signal?: AbortSignal): Promise<RuntimeSettings>;
    providers(query?: ProviderQuery, signal?: AbortSignal): Promise<ProviderList>;
    refreshProvider(providerId: string, signal?: AbortSignal): Promise<OperationAccepted>;
@@ -10568,16 +10576,17 @@ index 00000000..3850fa9a
 +});
 diff --git a/src/features/overview/desktopView.ts b/src/features/overview/desktopView.ts
 new file mode 100644
-index 00000000..5ac1a072
+index 00000000..f16e928f
 --- /dev/null
 +++ b/src/features/overview/desktopView.ts
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,57 @@
 +import type {DesktopStatus} from '../../api/api';
 +import type {Translator} from '../../i18n';
 +import {formatBytes} from '../../i18n/format';
 +import type {KvItem} from '../../ui/ui';
 +
-+export type DesktopProxyStatus = {enabled: boolean; server: string | null; error: string | null};
++import type {DesktopProxyStatus} from '../../store/desktop';
++export type {DesktopProxyStatus} from '../../store/desktop';
 +
 +export function desktopMemoryFields(status: DesktopStatus, t: Translator, locale: string): KvItem[] {
 +  const {process, system} = status.memory;
@@ -10630,32 +10639,11 @@ index 00000000..5ac1a072
 +}
 diff --git a/src/features/overview/useDesktopStatus.ts b/src/features/overview/useDesktopStatus.ts
 new file mode 100644
-index 00000000..d43dcd77
+index 00000000..96951d65
 --- /dev/null
 +++ b/src/features/overview/useDesktopStatus.ts
-@@ -0,0 +1,22 @@
-+import {getApi} from '../../api';
-+import type {Capabilities} from '../../api/model';
-+import type {DesktopStatus} from '../../api/api';
-+import {hasDesktop, invokeDesktop} from '../../desktop';
-+import {useResource} from '../../store/resource';
-+import type {DesktopProxyStatus} from './desktopView';
-+
-+export function useDesktopStatus(resources: Capabilities['resources'] | undefined) {
-+  const api = getApi();
-+  const supported = (resources as Record<string, unknown> | undefined)?.desktop as {available?: boolean} | undefined;
-+  const enabled = hasDesktop && supported?.available === true && !!api.desktopStatus;
-+  const status = useResource<DesktopStatus>({key: ['desktopStatus'], fetch: signal => api.desktopStatus!(signal)}, {enabled});
-+  const proxy = useResource<DesktopProxyStatus>(
-+    {
-+      key: ['desktopProxy'],
-+      followEvents: false,
-+      fetch: () => invokeDesktop<DesktopProxyStatus>('proxy_status')
-+    },
-+    {enabled}
-+  );
-+  return {status, proxy, enabled};
-+}
+@@ -0,0 +1 @@
++export {useDesktopStatus} from '../../store/desktop';
 diff --git a/src/features/policies/Policies.tsx b/src/features/policies/Policies.tsx
 index b7eadcbf..704d8fb9 100644
 --- a/src/features/policies/Policies.tsx
@@ -12833,14 +12821,14 @@ index 86500f70..c8714965 100644
      rows: evaluation.rules.map(rule => ({
 diff --git a/src/features/settings/DesktopSettings.tsx b/src/features/settings/DesktopSettings.tsx
 new file mode 100644
-index 00000000..3685015e
+index 00000000..9d7d8586
 --- /dev/null
 +++ b/src/features/settings/DesktopSettings.tsx
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,65 @@
 +import {useEffect, useState} from 'react';
 +import {useT} from '../../i18n';
 +import {desktop, invokeDesktop} from '../../desktop';
-+import {Card, ErrorMessage, Switch} from '../../ui/ui';
++import {Button, Card, ErrorMessage, Switch} from '../../ui/ui';
 +type Status = {autostart: boolean; service_installed: boolean};
 +
 +export function DesktopSettingsCard() {
@@ -12861,22 +12849,44 @@ index 00000000..3685015e
 +  };
 +  useEffect(() => {
 +    const platform = desktop?.platform;
-+    if (platform === 'windows' || platform === 'macos') void run('windows_integration_status');
++    if (platform !== 'windows' && platform !== 'macos' && platform !== 'linux') return;
++    let current = true;
++    void invokeDesktop<Status>('windows_integration_status').then(
++      status => {
++        if (current) setStatus(status);
++      },
++      error => {
++        if (current) setError(error instanceof Error ? error : new Error(String(error)));
++      }
++    );
++    return () => {
++      current = false;
++    };
 +  }, []);
 +  const macos = desktop?.platform === 'macos';
-+  const supported = desktop?.platform === 'windows' || macos;
++  const linux = desktop?.platform === 'linux';
++  const supported = desktop?.platform === 'windows' || macos || linux;
 +  if (!supported) return null;
 +  return (
-+    <Card level={2} title={t(macos ? 'desktop.integrationMacos' : 'desktop.integration')} titleId="settings-desktop">
++    <Card level={2} title={t(macos ? 'desktop.integrationMacos' : linux ? 'desktop.integrationLinux' : 'desktop.integration')} titleId="settings-desktop">
 +      <ErrorMessage error={error} />
 +      <Switch
 +        isSelected={status?.autostart ?? false}
 +        isDisabled={busy || !status}
 +        onChange={enabled => void run('autostart_set', {enabled})}
-+        description={t(macos ? 'desktop.autostartHelpMacos' : 'desktop.autostartHelp')}
++        description={t(macos ? 'desktop.autostartHelpMacos' : linux ? 'desktop.autostartHelpLinux' : 'desktop.autostartHelp')}
 +      >
 +        {t('desktop.autostart')}
 +      </Switch>
++      <div className="rp-actions">
++        <Button
++          onPress={() =>
++            void invokeDesktop('window_action', {action: 'quit'}).catch(error => setError(error instanceof Error ? error : new Error(String(error))))
++          }
++        >
++          {t('desktop.quit')}
++        </Button>
++      </div>
 +    </Card>
 +  );
 +}
@@ -12959,10 +12969,10 @@ index 6c6f51d2..40e83a78 100644
          onChange={changeTab}
 diff --git a/src/features/settings/TunSettings.tsx b/src/features/settings/TunSettings.tsx
 new file mode 100644
-index 00000000..a6e4b91f
+index 00000000..6c582428
 --- /dev/null
 +++ b/src/features/settings/TunSettings.tsx
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,125 @@
 +import {useEffect, useState} from 'react';
 +import {useT} from '../../i18n';
 +import {ApiError} from '../../api/error';
@@ -12973,15 +12983,15 @@ index 00000000..a6e4b91f
 +import {settingsCard} from './nav';
 +import {tunAvailable} from './tun';
 +
-+  const card = settingsCard('tun');
-+  type ServiceStatus = {service_installed: boolean; service_update_required: boolean};
-+  // The service install/repair flow drives the privileged TUN broker both
-+  // desktop platforms ship: a Windows SCM service and a macOS LaunchDaemon.
-+  const desktopService =
-+    hasDesktop && (desktop?.platform === 'windows' || desktop?.platform === 'macos');
++const card = settingsCard('tun');
++type ServiceStatus = {service_installed: boolean; service_update_required: boolean};
++// The service install/repair flow drives the privileged TUN broker all
++// desktop platforms ship: a Windows SCM service, a macOS LaunchDaemon and
++// a Linux systemd unit.
++const desktopService = hasDesktop && (desktop?.platform === 'windows' || desktop?.platform === 'macos' || desktop?.platform === 'linux');
 +
 +// The TUN switch is a desktop-only extension: the card disappears when the engine reports no TUN capability. Turning
-+// it on uses the restricted Windows TUN service, installed on demand without restarting the shell.
++// it on uses the privileged desktop TUN service, installed on demand without restarting the shell.
 +export function TunSettingsCard() {
 +  const t = useT();
 +  const caps = useCapabilities();
@@ -13038,6 +13048,7 @@ index 00000000..a6e4b91f
 +      <span className="rp-label">{t('settings.tunHelp')}</span>
 +      <ErrorMessage error={tun.error} onRetry={tun.refetch} />
 +      <ErrorMessage error={actionError} />
++      {status?.recovering && <InlineAlert>{status.recovering}</InlineAlert>}
 +      <Toolbar>
 +        <div className="rp-contents">
 +          <Switch
@@ -13141,23 +13152,11 @@ index 726221b5..86e369b0 100644
  // search and links land on a card whichever tab was open; otherwise `?tab=` picks one.
 diff --git a/src/features/settings/tun.ts b/src/features/settings/tun.ts
 new file mode 100644
-index 00000000..17b0246f
+index 00000000..ef62a370
 --- /dev/null
 +++ b/src/features/settings/tun.ts
-@@ -0,0 +1,13 @@
-+import type {Capabilities} from '../../api/model';
-+
-+// TUN is reported under `resources` as a LemonVPN extension; the native API contract has no key for it, so the
-+// capability is read through a narrow shape instead of widening the contract.
-+export type TunCapability = {available?: boolean; enabled?: boolean; udp?: string};
-+
-+export function tunCapability(resources: Capabilities['resources'] | undefined): TunCapability | undefined {
-+  return (resources as Record<string, unknown> | undefined)?.tun as TunCapability | undefined;
-+}
-+
-+export function tunAvailable(resources: Capabilities['resources'] | undefined): boolean {
-+  return tunCapability(resources)?.available === true;
-+}
+@@ -0,0 +1 @@
++export {tunAvailable, tunCapability, type TunCapability} from '../../store/desktop';
 diff --git a/src/features/shared/ChainEndpointControl.tsx b/src/features/shared/ChainEndpointControl.tsx
 new file mode 100644
 index 00000000..21575846
@@ -14265,7 +14264,7 @@ index 0becab1b..e47e7609 100644
        // A DNS list with no place has no single dns routing section to add it to; the section is written in the
        // configuration, which opens beside the dialog so the rule stays here.
 diff --git a/src/i18n/locales/en.json b/src/i18n/locales/en.json
-index 1c5ca031..ace6af6a 100644
+index 1c5ca031..99adaf8f 100644
 --- a/src/i18n/locales/en.json
 +++ b/src/i18n/locales/en.json
 @@ -487,7 +487,7 @@
@@ -14277,7 +14276,7 @@ index 1c5ca031..ace6af6a 100644
    "dashboard.preset": "{width}, {height}",
    "dashboard.providerBudget": "Subscription quota",
    "dashboard.remaining": "{space} remaining",
-@@ -497,6 +497,33 @@
+@@ -497,6 +497,35 @@
    "dashboard.sourceHealth": "Source health",
    "dashboard.wide": "Full width",
    "dashboard.width": "Width",
@@ -14305,13 +14304,15 @@ index 1c5ca031..ace6af6a 100644
 +  "desktop.privateMemory": "Backend process private memory",
 +  "desktop.protocols": "Supported traffic",
 +  "desktop.systemMemory": "System physical memory",
++  "desktop.quit": "Quit application",
++  "desktop.proxySessionHelp": "Applies to new shells and apps using session proxy settings. Use TUN for other apps.",
 +  "desktop.systemProxy": "System proxy",
 +  "desktop.tun": "TUN mode",
 +  "desktop.tunAddress": "Adapter address",
    "dns.addRequestRuleFor": "Add DNS request rule for {domain}",
    "dns.addRoutingRuleFor": "Add routing rule for {domain}",
    "dns.addRuleFor": "Add a rule for {value}",
-@@ -805,7 +832,7 @@
+@@ -805,7 +834,7 @@
    },
    "group.addAlternative": "Add OR match",
    "group.allNodes": "All nodes",
@@ -14320,7 +14321,7 @@ index 1c5ca031..ace6af6a 100644
    "group.byRule": "Selected by rules",
    "group.create": "Create",
    "group.customExpression": "Custom expression",
-@@ -821,7 +848,7 @@
+@@ -821,7 +850,7 @@
    "group.filterValuesHelp": "Separate values with commas; quote values containing commas.",
    "group.filterValuesInvalid": "Enter valid values; quote commas and escape backslashes inside quotes.",
    "group.groupName": "Group name",
@@ -14329,7 +14330,7 @@ index 1c5ca031..ace6af6a 100644
    "group.matchingNodes": "Matching nodes",
    "group.memberCount": {
      "one": "{n} node",
-@@ -858,7 +885,7 @@
+@@ -858,7 +887,7 @@
    "hint.logs": "Live engine log",
    "hint.nodes": "Node sources, usage and updates",
    "hint.overview": "Service state and backend features",
@@ -14338,7 +14339,7 @@ index 1c5ca031..ace6af6a 100644
    "hint.rules": "Routing rules, DNS rules and trace simulation",
    "hub.routing": "Routing",
    "hub.traffic": "Monitor",
-@@ -974,7 +1001,7 @@
+@@ -974,7 +1003,7 @@
    "nav.logs": "Logs",
    "nav.nodes": "Nodes",
    "nav.overview": "System status",
@@ -14347,7 +14348,7 @@ index 1c5ca031..ace6af6a 100644
    "nav.rules": "Rules",
    "nav.settings": "Settings",
    "nodes.actions": "Node actions",
-@@ -1104,7 +1131,7 @@
+@@ -1104,7 +1133,7 @@
    "nodes.refreshedDegraded": "{name}: nodes applied, but the datapath did not recover, so new connections proxied through userspace are refused. See System status for details.",
    "nodes.remove": "Remove {name}",
    "nodes.removeInclude": "Declared outside the main configuration file. Remove it from that file.",
@@ -14356,7 +14357,7 @@ index 1c5ca031..ace6af6a 100644
    "nodes.removeNodeTitle": "Remove node {name}",
    "nodes.removeProviderHelp": "Deletes this node source and its nodes from the main configuration and reloads.",
    "nodes.removeProviderTitle": "Remove node source {name}",
-@@ -1452,6 +1479,9 @@
+@@ -1452,6 +1481,9 @@
      "other": "{n} members, {down} unavailable"
    },
    "policy.network": "Select network for {name}",
@@ -14366,7 +14367,7 @@ index 1c5ca031..ace6af6a 100644
    "policy.noProbe": "Test all is not available for this group",
    "policy.noneSelected": "no member selected yet",
    "policy.note": "Manual groups switch members directly, and TCP and UDP can be selected separately.",
-@@ -1606,10 +1636,14 @@
+@@ -1606,10 +1638,14 @@
    "rule.ipOnly": "With only a destination IP, the simulation evaluates the IP and port. When dial_mode uses a domain-family mode, the engine extracts the domain from actual TLS or HTTP traffic and evaluates the rules again. Include the domain to simulate that result.",
    "rule.keepsRoute": "Existing connections keep their current route until they reconnect.",
    "rule.kind": "Match by",
@@ -14383,7 +14384,7 @@ index 1c5ca031..ace6af6a 100644
    "rule.kind.geoip": "geoip region",
    "rule.kind.geosite": "geosite category",
    "rule.kind.l4proto": "Transport protocol",
-@@ -2009,6 +2043,16 @@
+@@ -2009,6 +2045,16 @@
    "settings.toastTop": "Top center",
    "settings.toastTopEnd": "Top corner",
    "settings.tokenRejected": "The backend rejected the token. Enter a valid token and retry.",
@@ -14400,7 +14401,7 @@ index 1c5ca031..ace6af6a 100644
    "settings.unauthorized": "Token required. Enter a valid token and retry.",
    "settings.useDemo": "Use demo data",
    "settings.wallpaper": "Wallpaper",
-@@ -2160,7 +2204,7 @@
+@@ -2160,7 +2206,7 @@
    "ui.backend.unsupportedValue": "Unsupported value",
    "ui.backendMessage": "Backend message: {message}",
    "ui.backendUrl": "Backend URL",
@@ -14409,7 +14410,7 @@ index 1c5ca031..ace6af6a 100644
    "ui.cache": "Cache",
    "ui.cancel": "Cancel",
    "ui.changeApplying": "Another change is being applied",
-@@ -2173,7 +2217,7 @@
+@@ -2173,7 +2219,7 @@
    "ui.decrease": "Decrease",
    "ui.destinationIp": "Destination IP",
    "ui.device": "Device",
@@ -14418,7 +14419,7 @@ index 1c5ca031..ace6af6a 100644
    "ui.domain": "Domain",
    "ui.done": "Done",
    "ui.download": "Download",
-@@ -2324,7 +2368,7 @@
+@@ -2324,7 +2370,7 @@
    "widgets.expand": "Expand widgets",
    "widgets.form": "Display",
    "widgets.gallery": "Widget gallery",
@@ -14427,7 +14428,7 @@ index 1c5ca031..ace6af6a 100644
    "widgets.hide": "Hide widgets",
    "widgets.inspector": "Widget settings",
    "widgets.large": "Large",
-@@ -2378,5 +2422,208 @@
+@@ -2378,5 +2424,210 @@
    "widgets.unpin": "Unpin panel",
    "widgets.up": "Move up",
    "wordmark.gradient": "Gradient",
@@ -14436,6 +14437,8 @@ index 1c5ca031..ace6af6a 100644
 +  "desktop.integration": "Windows integration",
 +  "desktop.autostart": "Start with Windows",
 +  "desktop.autostartHelp": "Open in the system tray after signing in.",
++  "desktop.integrationLinux": "Linux integration",
++  "desktop.autostartHelpLinux": "Start at desktop login. Keep AppImage files in a permanent location.",
 +  "desktop.integrationMacos": "macOS integration",
 +  "desktop.autostartHelpMacos": "Start LemonVPN automatically after you sign in.",
 +  "desktop.serviceInstalled": "TUN service installed",
@@ -14638,7 +14641,7 @@ index 1c5ca031..ace6af6a 100644
 +  "group.reference.group-final": "Group fallback"
  }
 diff --git a/src/i18n/locales/zh-CN.json b/src/i18n/locales/zh-CN.json
-index 7681175f..6fdee072 100644
+index 7681175f..6dbb701f 100644
 --- a/src/i18n/locales/zh-CN.json
 +++ b/src/i18n/locales/zh-CN.json
 @@ -430,7 +430,7 @@
@@ -14650,7 +14653,7 @@ index 7681175f..6fdee072 100644
    "dashboard.preset": "{width}，{height}",
    "dashboard.providerBudget": "订阅额度",
    "dashboard.remaining": "此行尚余 {space}",
-@@ -440,6 +440,33 @@
+@@ -440,6 +440,35 @@
    "dashboard.sourceHealth": "来源状态",
    "dashboard.wide": "全宽",
    "dashboard.width": "宽度",
@@ -14678,13 +14681,15 @@ index 7681175f..6fdee072 100644
 +  "desktop.privateMemory": "后端进程私有内存",
 +  "desktop.protocols": "支持的流量",
 +  "desktop.systemMemory": "系统物理内存",
++  "desktop.quit": "退出应用",
++  "desktop.proxySessionHelp": "仅对新终端和支持会话代理的应用生效；其他应用请用 TUN。",
 +  "desktop.systemProxy": "系统代理",
 +  "desktop.tun": "TUN 模式",
 +  "desktop.tunAddress": "虚拟网卡地址",
    "dns.addRequestRuleFor": "为 {domain} 新增 DNS 请求规则",
    "dns.addRoutingRuleFor": "为 {domain} 新增路由规则",
    "dns.addRuleFor": "为 {value} 新建规则",
-@@ -697,7 +724,7 @@
+@@ -697,7 +726,7 @@
    "flow.viewPinned": "查看此路径的 {n} 条流程",
    "group.addAlternative": "添加 OR 匹配",
    "group.allNodes": "所有节点",
@@ -14693,7 +14698,7 @@ index 7681175f..6fdee072 100644
    "group.byRule": "由规则选入",
    "group.create": "创建",
    "group.customExpression": "自定义表达式",
-@@ -713,7 +740,7 @@
+@@ -713,7 +742,7 @@
    "group.filterValuesHelp": "以逗号分隔多个值；值含逗号时请加双引号。",
    "group.filterValuesInvalid": "请输入有效值；引号内的反斜线须转义。",
    "group.groupName": "组名称",
@@ -14702,7 +14707,7 @@ index 7681175f..6fdee072 100644
    "group.matchingNodes": "匹配的节点",
    "group.memberCount": "{n} 个节点",
    "group.nestedGroups": "子组",
-@@ -741,7 +768,7 @@
+@@ -741,7 +770,7 @@
    "hint.logs": "引擎实时日志",
    "hint.nodes": "节点来源、用量与更新",
    "hint.overview": "服务状态与后端能力",
@@ -14711,7 +14716,7 @@ index 7681175f..6fdee072 100644
    "hint.rules": "路由规则、DNS 规则与追踪模拟",
    "hub.routing": "路由",
    "hub.traffic": "观测",
-@@ -838,8 +865,8 @@
+@@ -838,8 +867,8 @@
    "nav.flows": "分流",
    "nav.logs": "日志",
    "nav.nodes": "节点",
@@ -14722,7 +14727,7 @@ index 7681175f..6fdee072 100644
    "nav.rules": "规则",
    "nav.settings": "设置",
    "nodes.actions": "节点操作",
-@@ -951,7 +978,7 @@
+@@ -951,7 +980,7 @@
    "nodes.refreshedDegraded": "{name}：节点已应用，但数据路径未恢复，经用户空间代理的新连接会被拒绝。详见系统状态页。",
    "nodes.remove": "移除 {name}",
    "nodes.removeInclude": "声明于主配置文件以外的文件，请在该文件中移除。",
@@ -14731,7 +14736,7 @@ index 7681175f..6fdee072 100644
    "nodes.removeNodeTitle": "移除节点 {name}",
    "nodes.removeProviderHelp": "从主配置删除此节点来源及其节点，并重载。",
    "nodes.removeProviderTitle": "移除节点来源 {name}",
-@@ -1278,6 +1305,9 @@
+@@ -1278,6 +1307,9 @@
    "policy.members": "{n} 个成员",
    "policy.membersDown": "{n} 个成员，{down} 个不可用",
    "policy.network": "为 {name} 选择网络",
@@ -14741,7 +14746,7 @@ index 7681175f..6fdee072 100644
    "policy.noProbe": "此组无法使用“测试全部”",
    "policy.noneSelected": "尚未选出成员",
    "policy.note": "手动选择的组可直接切换成员，TCP 与 UDP 可分别选择。",
-@@ -1414,10 +1444,14 @@
+@@ -1414,10 +1446,14 @@
    "rule.ipOnly": "仅提供目标 IP 时，模拟按 IP 与端口判定。dial_mode 使用 domain 系列模式时，引擎会从实际 TLS 或 HTTP 流量嗅探域名，并重新评估规则。若要模拟此结果，请一并提供域名。",
    "rule.keepsRoute": "现有连接保持当前路由，重新连接后才应用更改。",
    "rule.kind": "依据",
@@ -14758,7 +14763,7 @@ index 7681175f..6fdee072 100644
    "rule.kind.geoip": "geoip 地区",
    "rule.kind.geosite": "geosite 分类",
    "rule.kind.l4proto": "传输协议",
-@@ -1799,6 +1833,16 @@
+@@ -1799,6 +1835,16 @@
    "settings.toastTop": "顶部居中",
    "settings.toastTopEnd": "顶部角落",
    "settings.tokenRejected": "后端拒绝了此 Token：请填写有效的 Token 后重试。",
@@ -14775,7 +14780,7 @@ index 7681175f..6fdee072 100644
    "settings.unauthorized": "后端要求提供 Token。请填写有效的 Token 后重试。",
    "settings.useDemo": "使用演示数据",
    "settings.wallpaper": "背景图片",
-@@ -1947,7 +1991,7 @@
+@@ -1947,7 +1993,7 @@
    "ui.backend.unsupportedValue": "不支持此设置值",
    "ui.backendMessage": "后端消息：{message}",
    "ui.backendUrl": "后端网址",
@@ -14784,7 +14789,7 @@ index 7681175f..6fdee072 100644
    "ui.cache": "缓存",
    "ui.cancel": "取消",
    "ui.changeApplying": "另一项修改正在应用",
-@@ -1960,7 +2004,7 @@
+@@ -1960,7 +2006,7 @@
    "ui.decrease": "减少",
    "ui.destinationIp": "目标 IP",
    "ui.device": "设备",
@@ -14793,7 +14798,7 @@ index 7681175f..6fdee072 100644
    "ui.domain": "域名",
    "ui.done": "完成",
    "ui.download": "下载",
-@@ -2108,7 +2152,7 @@
+@@ -2108,7 +2154,7 @@
    "widgets.expand": "展开小工具",
    "widgets.form": "显示形式",
    "widgets.gallery": "小工具库",
@@ -14802,7 +14807,7 @@ index 7681175f..6fdee072 100644
    "widgets.hide": "隐藏小工具",
    "widgets.inspector": "小工具设置",
    "widgets.large": "大",
-@@ -2159,5 +2203,208 @@
+@@ -2159,5 +2205,210 @@
    "widgets.unpin": "取消固定面板",
    "widgets.up": "上移",
    "wordmark.gradient": "渐变",
@@ -14811,6 +14816,8 @@ index 7681175f..6fdee072 100644
 +  "desktop.integration": "Windows 集成",
 +  "desktop.autostart": "开机自启",
 +  "desktop.autostartHelp": "登录 Windows 后在系统托盘中启动。",
++  "desktop.integrationLinux": "Linux 集成",
++  "desktop.autostartHelpLinux": "登录桌面后自动启动，AppImage 请放在固定位置。",
 +  "desktop.integrationMacos": "macOS 集成",
 +  "desktop.autostartHelpMacos": "登录 macOS 后自动启动。",
 +  "desktop.serviceInstalled": "TUN 服务已安装",
@@ -15013,7 +15020,7 @@ index 7681175f..6fdee072 100644
 +  "group.reference.group-final": "组回退"
  }
 diff --git a/src/i18n/locales/zh-TW.json b/src/i18n/locales/zh-TW.json
-index 70960ec5..7551491e 100644
+index 70960ec5..56c2f241 100644
 --- a/src/i18n/locales/zh-TW.json
 +++ b/src/i18n/locales/zh-TW.json
 @@ -430,7 +430,7 @@
@@ -15025,7 +15032,7 @@ index 70960ec5..7551491e 100644
    "dashboard.preset": "{width}，{height}",
    "dashboard.providerBudget": "訂閱額度",
    "dashboard.remaining": "此列尚餘 {space}",
-@@ -440,6 +440,27 @@
+@@ -440,6 +440,29 @@
    "dashboard.sourceHealth": "來源狀態",
    "dashboard.wide": "全寬",
    "dashboard.width": "寬度",
@@ -15047,13 +15054,15 @@ index 70960ec5..7551491e 100644
 +  "desktop.privateMemory": "私有提交記憶體",
 +  "desktop.protocols": "支援的流量",
 +  "desktop.systemMemory": "系統實體記憶體",
++  "desktop.quit": "結束應用程式",
++  "desktop.proxySessionHelp": "僅對新終端和支援工作階段代理的應用程式生效；其他應用程式請用 TUN。",
 +  "desktop.systemProxy": "系統代理",
 +  "desktop.tun": "TUN 模式",
 +  "desktop.tunAddress": "虛擬網卡位址",
    "dns.addRequestRuleFor": "為 {domain} 新增 DNS 請求規則",
    "dns.addRoutingRuleFor": "為 {domain} 新增路由規則",
    "dns.addRuleFor": "為 {value} 新增規則",
-@@ -741,7 +762,7 @@
+@@ -741,7 +764,7 @@
    "hint.logs": "引擎即時日誌",
    "hint.nodes": "節點來源、用量與更新",
    "hint.overview": "服務狀態與後端能力",
@@ -15062,7 +15071,7 @@ index 70960ec5..7551491e 100644
    "hint.rules": "路由規則、DNS 規則與追蹤模擬",
    "hub.routing": "路由",
    "hub.traffic": "觀測",
-@@ -839,7 +860,7 @@
+@@ -839,7 +862,7 @@
    "nav.logs": "日誌",
    "nav.nodes": "節點",
    "nav.overview": "系統狀態",
@@ -15071,7 +15080,7 @@ index 70960ec5..7551491e 100644
    "nav.rules": "規則",
    "nav.settings": "設定",
    "nodes.actions": "節點操作",
-@@ -951,7 +972,7 @@
+@@ -951,7 +974,7 @@
    "nodes.refreshedDegraded": "{name}：節點已套用，但資料路徑未恢復，經使用者空間代理的新連線會被拒絕。詳見系統狀態頁。",
    "nodes.remove": "移除 {name}",
    "nodes.removeInclude": "宣告於主設定檔以外的檔案，請在該檔案中移除。",
@@ -15080,7 +15089,7 @@ index 70960ec5..7551491e 100644
    "nodes.removeNodeTitle": "移除節點 {name}",
    "nodes.removeProviderHelp": "從主組態刪除此節點來源及其節點，並重載。",
    "nodes.removeProviderTitle": "移除節點來源 {name}",
-@@ -1414,9 +1435,9 @@
+@@ -1414,9 +1437,9 @@
    "rule.ipOnly": "僅提供目的 IP 時，模擬依 IP 與連接埠判定。dial_mode 使用 domain 系列模式時，引擎會從實際 TLS 或 HTTP 流量嗅探網域，並重新評估規則。若要模擬此結果，請一併提供網域。",
    "rule.keepsRoute": "現有連線維持目前的路由，重新連線後才套用變更。",
    "rule.kind": "依據",
@@ -15092,7 +15101,7 @@ index 70960ec5..7551491e 100644
    "rule.kind.dport": "目的連接埠",
    "rule.kind.geoip": "geoip 地區",
    "rule.kind.geosite": "geosite 分類",
-@@ -1799,6 +1820,16 @@
+@@ -1799,6 +1822,16 @@
    "settings.toastTop": "上方置中",
    "settings.toastTopEnd": "上方角落",
    "settings.tokenRejected": "後端拒絕了此 Token：請填寫有效的 Token 後重試。",
@@ -15109,7 +15118,7 @@ index 70960ec5..7551491e 100644
    "settings.unauthorized": "後端要求 Token。請填寫有效的 Token 後重試。",
    "settings.useDemo": "使用示範資料",
    "settings.wallpaper": "背景圖片",
-@@ -1947,7 +1978,7 @@
+@@ -1947,7 +1980,7 @@
    "ui.backend.unsupportedValue": "不支援此設定值",
    "ui.backendMessage": "後端訊息：{message}",
    "ui.backendUrl": "後端網址",
@@ -15118,7 +15127,7 @@ index 70960ec5..7551491e 100644
    "ui.cache": "快取",
    "ui.cancel": "取消",
    "ui.changeApplying": "另一項修改正在套用",
-@@ -1960,7 +1991,7 @@
+@@ -1960,7 +1993,7 @@
    "ui.decrease": "減少",
    "ui.destinationIp": "目的 IP",
    "ui.device": "裝置",
@@ -15127,7 +15136,7 @@ index 70960ec5..7551491e 100644
    "ui.domain": "網域",
    "ui.done": "完成",
    "ui.download": "下載",
-@@ -2108,7 +2139,7 @@
+@@ -2108,7 +2141,7 @@
    "widgets.expand": "展開小工具",
    "widgets.form": "顯示形式",
    "widgets.gallery": "小工具庫",
@@ -15136,7 +15145,7 @@ index 70960ec5..7551491e 100644
    "widgets.hide": "隱藏小工具",
    "widgets.inspector": "小工具設定",
    "widgets.large": "大",
-@@ -2159,5 +2190,208 @@
+@@ -2159,5 +2192,210 @@
    "widgets.unpin": "取消固定面板",
    "widgets.up": "上移",
    "wordmark.gradient": "漸層",
@@ -15145,6 +15154,8 @@ index 70960ec5..7551491e 100644
 +  "desktop.integration": "Windows 整合",
 +  "desktop.autostart": "開機自動啟動",
 +  "desktop.autostartHelp": "登入 Windows 後在系統匣啟動。",
++  "desktop.integrationLinux": "Linux 整合",
++  "desktop.autostartHelpLinux": "登入桌面後自動啟動，AppImage 請放在固定位置。",
 +  "desktop.integrationMacos": "macOS 整合",
 +  "desktop.autostartHelpMacos": "登入 macOS 後自動啟動。",
 +  "desktop.serviceInstalled": "TUN 服務已安裝",
@@ -17623,17 +17634,16 @@ index 0f5d978d..f2110de1 100644
  // Below the side navigation's breakpoint a row of the overflow menu opens the same popover. It sits beside the menu's
 diff --git a/src/shell/DesktopControls.tsx b/src/shell/DesktopControls.tsx
 new file mode 100644
-index 00000000..1398c029
+index 00000000..01a6cf9c
 --- /dev/null
 +++ b/src/shell/DesktopControls.tsx
-@@ -0,0 +1,84 @@
-+import {useState} from 'react';
+@@ -0,0 +1,95 @@
++import {useEffect, useState} from 'react';
 +import {useT} from '../i18n';
 +import {Button, Link} from '../ui/ui';
 +import {useCapabilities, useTun} from '../store';
-+import {tunAvailable} from '../features/settings/tun';
-+import {invokeDesktop} from '../desktop';
-+import {useDesktopStatus} from '../features/overview/useDesktopStatus';
++import {tunAvailable, useDesktopStatus} from '../store/desktop';
++import {desktop, invokeDesktop} from '../desktop';
 +import {href} from './route';
 +
 +export function DesktopControls() {
@@ -17641,9 +17651,17 @@ index 00000000..1398c029
 +  const caps = useCapabilities();
 +  const {proxy, enabled} = useDesktopStatus(caps.data?.resources);
 +  const tunUsable = tunAvailable(caps.data?.resources);
++  const proxyUsable = desktop?.platform === 'windows' || desktop?.platform === 'macos' || (desktop?.platform === 'linux' && proxy.data?.supported === true);
 +  const tun = useTun(enabled && tunUsable);
 +  const [proxyBusy, setProxyBusy] = useState(false);
 +  const [error, setError] = useState<Error | null>(null);
++  useEffect(() => {
++    const receive = (event: Event) => {
++      if (event instanceof CustomEvent && typeof event.detail?.message === 'string') setError(new Error(event.detail.message));
++    };
++    window.addEventListener('lemonvpn:desktop-error', receive);
++    return () => window.removeEventListener('lemonvpn:desktop-error', receive);
++  }, []);
 +  const changeProxy = async () => {
 +    setProxyBusy(true);
 +    setError(null);
@@ -17664,25 +17682,28 @@ index 00000000..1398c029
 +      setError(error instanceof Error ? error : new Error(String(error)));
 +    }
 +  };
++  if (!proxyUsable && !tunUsable) return null;
 +  return (
 +    <div className="rp-desktop-controls">
 +      <div className="rp-desktop-control-grid">
-+        <Button
-+          appearance="plain"
-+          className="rp-desktop-toggle"
-+          isSelected={proxy.data?.enabled === true}
-+          isDisabled={!proxy.data || proxyBusy}
-+          onPress={() => void changeProxy()}
-+        >
-+          <span className="rp-desktop-toggle-top">
-+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
-+              <circle cx="12" cy="12" r="9" />
-+              <path d="M3 12h18M12 3c5 5 5 13 0 18-5-5-5-13 0-18Z" />
-+            </svg>
-+            <span className="rp-desktop-toggle-track" aria-hidden="true" />
-+          </span>
-+          <span>{t('desktop.systemProxy')}</span>
-+        </Button>
++        {proxyUsable && (
++          <Button
++            appearance="plain"
++            className="rp-desktop-toggle"
++            isSelected={proxy.data?.enabled === true}
++            isDisabled={!proxy.data || proxyBusy}
++            onPress={() => void changeProxy()}
++          >
++            <span className="rp-desktop-toggle-top">
++              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
++                <circle cx="12" cy="12" r="9" />
++                <path d="M3 12h18M12 3c5 5 5 13 0 18-5-5-5-13 0-18Z" />
++              </svg>
++              <span className="rp-desktop-toggle-track" aria-hidden="true" />
++            </span>
++            <span>{t('desktop.systemProxy')}</span>
++          </Button>
++        )}
 +        {tunUsable && (
 +          <Button
 +            appearance="plain"
@@ -17702,6 +17723,7 @@ index 00000000..1398c029
 +          </Button>
 +        )}
 +      </div>
++      {proxy.data?.scope === 'session' && <p className="rp-note">{t('desktop.proxySessionHelp')}</p>}
 +      {error && (
 +        <div className="rp-desktop-control-error" role="alert">
 +          <span>{error.message}</span>
@@ -19275,10 +19297,19 @@ index 06e3ef6c..526df41f 100644
    const versions = capabilities!.resources.probes.ip_versions!;
    const auto = versions.includes('ipv4') ? (versions.includes('ipv6') ? 'any' : 'ipv4') : 'ipv6';
 diff --git a/src/store/runtime.ts b/src/store/runtime.ts
-index 99f6032e..e58a02fb 100644
+index 99f6032e..918dcbf6 100644
 --- a/src/store/runtime.ts
 +++ b/src/store/runtime.ts
-@@ -79,6 +79,23 @@ export function useRuntimeMemory(enabled = true) {
+@@ -1,6 +1,8 @@
+ import {useCallback, useState} from 'react';
+ import {poll} from './cadence';
+ import {getApi} from '../api/index';
++import {desktop, hasDesktop, invokeDesktop} from '../desktop';
++import {ApiError} from '../api/error';
+ import type {Api} from '../api/api';
+ import type {Capabilities, Operation, Runtime, RuntimeSettings, RuntimeSettingsPatch} from '../api/model';
+ import {useResource} from './resource';
+@@ -79,6 +81,30 @@ export function useRuntimeMemory(enabled = true) {
    const api = getApi();
    return useResource({key: ['runtimeMemory'], fetch: signal => api.runtimeMemory(signal)}, {enabled});
  }
@@ -19291,8 +19322,15 @@ index 99f6032e..e58a02fb 100644
 +  const set = useCallback(
 +    (next: boolean) =>
 +      run('set', async signal => {
-+        const status = await api.setTun(next, signal);
++        const status = await api.setTun(next, signal).catch(async error => {
++          if (!next || (desktop?.platform !== 'macos' && desktop?.platform !== 'linux') || !(error instanceof ApiError) || error.code !== 'admin_required')
++            throw error;
++          await invokeDesktop('windows_service_install');
++          signal.throwIfAborted();
++          return api.setTun(next, signal);
++        });
 +        refetch();
++        if (hasDesktop) void invokeDesktop('tray_refresh').catch(() => undefined);
 +        return status;
 +      }),
 +    [api, run, refetch]
@@ -20586,3 +20624,43 @@ index 0c1e0862..9b76060d 100644
    define: {
      'import.meta.env.VITE_DOONA_VERSION': JSON.stringify(version),
      // The links the about box and the sidebar open: doona's own repository, and the organisation whose engine
+diff --git a/src/store/desktop.ts b/src/store/desktop.ts
+new file mode 100644
+index 00000000..aae10309
+--- /dev/null
++++ b/src/store/desktop.ts
+@@ -0,0 +1,34 @@
++import {getApi} from '../api';
++import type {Capabilities} from '../api/model';
++import type {DesktopStatus} from '../api/api';
++import {hasDesktop, invokeDesktop} from '../desktop';
++import {useResource} from './resource';
++export type DesktopProxyStatus = {enabled: boolean; server: string | null; error: string | null; supported?: boolean; scope?: string};
++
++export function useDesktopStatus(resources: Capabilities['resources'] | undefined) {
++  const api = getApi();
++  const supported = (resources as Record<string, unknown> | undefined)?.desktop as {available?: boolean} | undefined;
++  const enabled = hasDesktop && supported?.available === true && !!api.desktopStatus;
++  const status = useResource<DesktopStatus>({key: ['desktopStatus'], fetch: signal => api.desktopStatus!(signal)}, {enabled});
++  const proxy = useResource<DesktopProxyStatus>(
++    {
++      key: ['desktopProxy'],
++      followEvents: false,
++      fetch: () => invokeDesktop<DesktopProxyStatus>('proxy_status')
++    },
++    {enabled}
++  );
++  return {status, proxy, enabled};
++}
++
++// TUN is reported under `resources` as a LemonVPN extension; the native API contract has no key for it, so the
++// capability is read through a narrow shape instead of widening the contract.
++export type TunCapability = {available?: boolean; enabled?: boolean; udp?: string};
++
++export function tunCapability(resources: Capabilities['resources'] | undefined): TunCapability | undefined {
++  return (resources as Record<string, unknown> | undefined)?.tun as TunCapability | undefined;
++}
++
++export function tunAvailable(resources: Capabilities['resources'] | undefined): boolean {
++  return tunCapability(resources)?.available === true;
++}

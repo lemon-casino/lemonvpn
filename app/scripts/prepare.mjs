@@ -150,8 +150,8 @@ async function prepareSidecar(cargo) {
   sidecarLayout('', triple);
   await prepareCompat(repoRoot, binariesDir, triple);
   await prepareGeodata(repoRoot, binariesDir);
-  run(cargo, ['build', '--release', '--bin', SIDECAR, '--target', triple, '--manifest-path', sidecarManifest]);
-  const result = spawnSync(cargo, ['metadata', '--format-version', '1', '--filter-platform', triple, '--manifest-path', sidecarManifest], {
+  run(cargo, ['build', '--locked', '--release', '--bin', SIDECAR, '--target', triple, '--manifest-path', sidecarManifest]);
+  const result = spawnSync(cargo, ['metadata', '--locked', '--format-version', '1', '--filter-platform', triple, '--manifest-path', sidecarManifest], {
     encoding: 'utf8', maxBuffer: 16 * 1024 * 1024
   });
   if (result.error || result.status !== 0) {
@@ -170,8 +170,8 @@ async function prepareSidecar(cargo) {
   for (const asset of ['geoip.dat', 'geosite.dat', 'geodata.manifest.json']) {
     cpSync(join(binariesDir, asset), join(dirname(sidecarBinary), asset));
   }
-  if (triple === 'x86_64-pc-windows-msvc') {
-    run(cargo, ['build','--release','--package','lemonvpn-engine-platform','--bin','lemonvpn-service','--target',triple,'--manifest-path',sidecarManifest]);
+  if (triple.endsWith('-windows-msvc')) {
+    run(cargo, ['build','--locked','--release','--package','lemonvpn-engine-platform','--bin','lemonvpn-service','--target',triple,'--manifest-path',sidecarManifest]);
     cpSync(join(dirname(sidecarBinary),'lemonvpn-service.exe'),join(binariesDir,'lemonvpn-service.exe'));
     cpSync(join(binariesDir,kernelBinaryName(triple)),join(dirname(sidecarBinary),kernelBinaryName(triple)));
   }
@@ -179,7 +179,15 @@ async function prepareSidecar(cargo) {
     // Dev runs load the kernel from the sidecar directory; the .app bundle
     // finds it in Contents/Resources via tauri.macos.conf.json. The TUN
     // service binary ships the same way for the LaunchDaemon install.
-    run(cargo, ['build','--release','--package','lemonvpn-engine-platform','--bin','lemonvpn-service','--target',triple,'--manifest-path',sidecarManifest]);
+    run(cargo, ['build','--locked','--release','--package','lemonvpn-engine-platform','--bin','lemonvpn-service','--target',triple,'--manifest-path',sidecarManifest]);
+    cpSync(join(dirname(sidecarBinary),'lemonvpn-service'),join(binariesDir,'lemonvpn-service'));
+    cpSync(join(binariesDir,kernelBinaryName(triple)),join(dirname(sidecarBinary),kernelBinaryName(triple)));
+  }
+  if (triple.includes('-linux-')) {
+    // Dev runs load the kernel from the sidecar directory; deb/appimage
+    // bundles find it in /usr/lib/LemonVPN via tauri.linux.conf.json. The TUN
+    // service binary ships the same way for the systemd install.
+    run(cargo, ['build','--locked','--release','--package','lemonvpn-engine-platform','--bin','lemonvpn-service','--target',triple,'--manifest-path',sidecarManifest]);
     cpSync(join(dirname(sidecarBinary),'lemonvpn-service'),join(binariesDir,'lemonvpn-service'));
     cpSync(join(binariesDir,kernelBinaryName(triple)),join(dirname(sidecarBinary),kernelBinaryName(triple)));
   }
@@ -191,8 +199,9 @@ async function prepareSidecar(cargo) {
     const driverRoot = join(dirname(dependency.manifest_path), 'wintun');
     const dll = join(driverRoot, 'bin', wintun.directory, 'wintun.dll');
     verifyPeMachine(readFileSync(dll), wintun.machine);
-    if (triple === 'x86_64-pc-windows-msvc') {
-      const expected=readFileSync(join(repoRoot,'sidecar-stub/crates/engine-platform/assets/wintun.sha256'),'utf8').trim();
+    if (triple === 'x86_64-pc-windows-msvc' || triple === 'aarch64-pc-windows-msvc') {
+      const checksum=triple.startsWith('aarch64-')?'wintun-arm64.sha256':'wintun.sha256';
+      const expected=readFileSync(join(repoRoot,'sidecar-stub/crates/engine-platform/assets',checksum),'utf8').trim();
       const actual=createHash('sha256').update(readFileSync(dll)).digest('hex');
       if(actual!==expected)throw new Error('Wintun DLL 与提权服务的固定摘要不一致');
     }

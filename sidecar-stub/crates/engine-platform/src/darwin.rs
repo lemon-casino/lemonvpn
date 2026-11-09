@@ -7,12 +7,8 @@ use std::{
     io,
     net::{SocketAddr, TcpStream, UdpSocket},
     os::fd::AsRawFd,
-    process::Command,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Mutex,
-    },
-    time::{Duration, Instant},
+    sync::atomic::Ordering,
+    time::Duration,
 };
 
 const IPPROTO_IP: i32 = 0;
@@ -31,75 +27,36 @@ extern "C" {
     fn if_nametoindex(name: *const core::ffi::c_char) -> u32;
 }
 
-/// The interface the engine's own traffic must use while TUN mode is on:
-/// resolved before the TUN routes exist, cleared again on disable.
-static PHYSICAL: AtomicU32 = AtomicU32::new(0);
-static LAST_PHYSICAL_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
+static CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn external_tun(enabled: bool) -> io::Result<()> {
-    let index = if enabled { probe_physical_index()? } else { 0 };
-    PHYSICAL.store(index, Ordering::Relaxed);
-    *LAST_PHYSICAL_CHECK.lock().unwrap() = None;
+    if enabled && !crate::network::snapshot(true)?.routes.any() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "没有可用物理出口",
+        ));
+    }
+    CAPTURE.store(enabled, Ordering::Release);
     Ok(())
 }
-
-/// Re-evaluate the uplink for new connections after network changes. If the
-/// network disappears, fail explicitly instead of dialing unbound into our own
-/// capture routes. Existing sockets reconnect through their protocol.
-fn physical_index() -> io::Result<u32> {
-    let mut last = LAST_PHYSICAL_CHECK.lock().unwrap();
-    let current = PHYSICAL.load(Ordering::Relaxed);
-    if current == 0 {
+fn physical_index(ipv6: bool) -> io::Result<u32> {
+    if !CAPTURE.load(Ordering::Acquire) {
         return Ok(0);
     }
-    if last.is_some_and(|time| time.elapsed() < Duration::from_secs(1)) {
-        return Ok(current);
-    }
-    let index = probe_physical_index().map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::NotConnected,
-            format!("物理网络不可用：{error}"),
-        )
-    })?;
-    PHYSICAL.store(index, Ordering::Relaxed);
-    *last = Some(Instant::now());
-    Ok(index)
-}
-
-/// The kernel's own default-route interface; the service's split routes never
-/// replace the default entry, so this stays valid while TUN is active.
-/// The kernel's own default-route interface; the service's split routes never
-/// replace the default entry, so this stays valid while TUN is active.
-fn default_route_interface() -> io::Result<String> {
-    let output = Command::new("/sbin/route")
-        .arg("-n")
-        .arg("get")
-        .arg("default")
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other("没有默认路由"));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .find(|line| line.trim_start().starts_with("interface:"))
-        .and_then(|line| line.split_once(':'))
-        .map(|(_, name)| name.trim().to_owned())
-        .ok_or_else(|| io::Error::other("无法解析默认网卡"))
-}
-
-fn probe_physical_index() -> io::Result<u32> {
-    let interface = default_route_interface()?;
-    let name = CString::new(interface).map_err(|_| io::Error::other("网卡名称无效"))?;
+    let name = CString::new(crate::network::interface(ipv6)?)?;
     let index = unsafe { if_nametoindex(name.as_ptr()) };
     if index == 0 {
-        return Err(io::Error::other("默认网卡不存在"));
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "出口网卡暂不可用",
+        ));
     }
     Ok(index)
 }
-
-/// Interface name for auxiliary cores that bind their own outbound sockets.
 pub(crate) fn uplink_name() -> Option<String> {
-    default_route_interface().ok()
+    crate::network::interface(false)
+        .or_else(|_| crate::network::interface(true))
+        .ok()
 }
 
 fn set_bound_if(socket: &Socket, index: u32, ipv6: bool) -> io::Result<()> {
@@ -125,7 +82,7 @@ pub(crate) fn connect_tcp(addr: SocketAddr, timeout: Duration) -> io::Result<Tcp
     if addr.ip().is_loopback() {
         return TcpStream::connect_timeout(&addr, timeout);
     }
-    let index = physical_index()?;
+    let index = physical_index(addr.is_ipv6())?;
     if index == 0 {
         return TcpStream::connect_timeout(&addr, timeout);
     }
@@ -151,7 +108,7 @@ pub(crate) fn bind_udp(local: SocketAddr) -> io::Result<UdpSocket> {
     if local.ip().is_loopback() {
         return UdpSocket::bind(local);
     }
-    let index = physical_index()?;
+    let index = physical_index(local.is_ipv6())?;
     if index == 0 {
         return UdpSocket::bind(local);
     }

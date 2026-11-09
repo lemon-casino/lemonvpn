@@ -481,7 +481,7 @@ mod imp {
 
     /// One protocol's settings for one network service, as `networksetup`
     /// reports and accepts them.
-    #[derive(Clone, Default, Deserialize, Serialize)]
+    #[derive(Clone, Default, Deserialize, Serialize, PartialEq)]
     struct ProxyConfig {
         enabled: bool,
         host: Option<String>,
@@ -508,7 +508,10 @@ mod imp {
     const STATE_FILE: &str = "system-proxy.json";
 
     fn state_path() -> PathBuf {
-        crate::default_data_dir().join(STATE_FILE)
+        std::env::var_os("LEMONVPN_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(crate::default_data_dir)
+            .join(STATE_FILE)
     }
 
     fn load_state() -> Option<ProxyState> {
@@ -524,12 +527,15 @@ mod imp {
             std::fs::create_dir_all(parent).map_err(|err| format!("创建数据目录失败:{err}"))?;
         }
         let bytes = serde_json::to_vec(state).map_err(|err| err.to_string())?;
-        std::fs::write(&path, bytes).map_err(|err| format!("写入代理状态失败:{err}"))?;
+        let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::write(&temporary, bytes).map_err(|err| format!("写入代理状态失败:{err}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+                .map_err(|err| format!("设置代理状态权限失败:{err}"))?;
         }
+        std::fs::rename(&temporary, &path).map_err(|err| format!("保存代理状态失败:{err}"))?;
         Ok(())
     }
 
@@ -542,7 +548,7 @@ mod imp {
     }
 
     fn networksetup(args: &[&str]) -> Result<String, String> {
-        let output = Command::new("networksetup")
+        let output = Command::new("/usr/sbin/networksetup")
             .args(args)
             .output()
             .map_err(|err| format!("无法运行 networksetup:{err}"))?;
@@ -680,10 +686,17 @@ mod imp {
     }
 
     /// Restores one service's recorded settings verbatim.
-    fn restore_service(service: &str, saved: &ServiceSnapshot) -> Result<(), String> {
+    fn restore_service(service: &str, saved: &ServiceSnapshot, host: &str, port: u16) -> Result<bool, String> {
+        let mut restored = false;
+        let mut original_or_owned = true;
         for (protocol, config) in
             [("web", &saved.web), ("secure", &saved.secure), ("socks", &saved.socks)]
         {
+            let current = read_config(protocol, service)?;
+            if !current.enabled || current.host.as_deref() != Some(host) || current.port != Some(port) {
+                original_or_owned &= current == *config;
+                continue;
+            }
             if let (Some(host), Some(port)) = (config.host.as_deref(), config.port) {
                 networksetup(&[set_flag(protocol), service, host, &port.to_string()])?;
             }
@@ -692,6 +705,11 @@ mod imp {
                 service,
                 if config.enabled { "on" } else { "off" },
             ])?;
+            restored = true;
+        }
+        // Bypass domains may also have been edited independently while enabled.
+        if !original_or_owned || read_bypass(service)?.as_deref() != Some(&["127.0.0.1".to_owned(), "localhost".to_owned()]) {
+            return Ok(restored);
         }
         match &saved.bypass {
             Some(domains) if !domains.is_empty() => {
@@ -699,7 +717,7 @@ mod imp {
                 set_bypass(service, &refs)
             }
             _ => set_bypass(service, &[]),
-        }
+        }.map(|()| true)
     }
 
     /// Whether any protocol on this service still points at our server.
@@ -748,14 +766,10 @@ mod imp {
                 }
             }
         }
-        if applied == 0 {
-            // Nothing took effect; undo the recorded takeover so the state
-            // file does not claim settings that were never installed.
-            let snapshot = state.services.clone();
-            for (name, saved) in &snapshot {
-                let _ = restore_service(name, saved);
-            }
-            clear_state()?;
+        if applied == 0 || first_error.is_some() {
+            // A protocol can be changed even if a later operation failed.
+            // Retain the snapshot if rollback fails so recovery can retry.
+            disable_impl(server, Some(std::process::id()))?;
             return Err(first_error.unwrap_or_else(|| "没有可用的网络服务".to_string()));
         }
         Ok(())
@@ -787,14 +801,12 @@ mod imp {
         let mut changed = false;
         let mut first_error = None;
         for (name, saved) in &state.services {
-            // A service the user reconfigured themselves keeps their choice;
-            // an unreadable service is treated the same way.
-            if current_is_ours(name, host, port) {
-                match restore_service(name, saved) {
-                    Ok(()) => changed = true,
-                    Err(err) => {
-                        first_error.get_or_insert(err);
-                    }
+            // Restore only protocols still owned by us. Retry a failed bypass
+            // restoration even if every protocol was restored on the last try.
+            match restore_service(name, saved, host, port) {
+                Ok(restored) => changed |= restored,
+                Err(err) => {
+                    first_error.get_or_insert(err);
                 }
             }
         }
@@ -897,7 +909,11 @@ mod imp {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+#[path = "system_proxy_linux.rs"]
+mod imp;
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 mod imp {
     use super::ProxyStatus;
 
@@ -929,3 +945,21 @@ mod imp {
 }
 
 pub use imp::{disable_for, disable_owned, enable, recover_stale, status};
+
+pub fn supported() -> bool {
+    #[cfg(target_os="linux")]
+    { imp::supported() }
+    #[cfg(not(target_os="linux"))]
+    { cfg!(any(windows,target_os="macos")) }
+}
+pub fn scope()->String {
+    #[cfg(target_os="linux")]
+    {imp::scope()}
+    #[cfg(not(target_os="linux"))]
+    {"desktop".into()}
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn session_command(name: &str, args: &[&str]) -> Result<String, String> {
+    imp::run(name, args)
+}

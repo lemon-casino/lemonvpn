@@ -35,3 +35,6 @@ windows-sys = { version = "0.52", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 socket2 = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { version = "0.6", features = ["all"] }

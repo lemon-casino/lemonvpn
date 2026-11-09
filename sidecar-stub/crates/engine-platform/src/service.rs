@@ -35,6 +35,14 @@ use windows_support::Win32::{
 
 const NAME: &str = "LemonVPN.Tun";
 const PIPE: &str = r"\\.\pipe\LemonVPN.Tun.v2";
+#[cfg(target_arch = "aarch64")]
+const DRIVER_SHA256: &str = include_str!("../assets/wintun-arm64.sha256");
+#[cfg(not(target_arch = "aarch64"))]
+const DRIVER_SHA256: &str = include_str!("../assets/wintun.sha256");
+#[cfg(target_arch = "aarch64")]
+const KERNEL_SHA256: &str = include_str!("../assets/mihomo-arm64.sha256");
+#[cfg(not(target_arch = "aarch64"))]
+const KERNEL_SHA256: &str = include_str!("../assets/mihomo.sha256");
 #[path = "pipe_io.rs"]
 mod pipe_io;
 static OWNER: OnceLock<String> = OnceLock::new();
@@ -610,12 +618,12 @@ fn install(owner: &str) -> io::Result<()> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    if driver_hash != include_str!("../assets/wintun.sha256").trim() {
+    if driver_hash != DRIVER_SHA256.trim() {
         return Err(err("Wintun 校验失败，拒绝安装提权服务"));
     }
     let digest = Sha256::digest(&core_bytes);
     let actual: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    if actual != include_str!("../assets/mihomo.sha256").trim() {
+    if actual != KERNEL_SHA256.trim() {
         return Err(err("协议内核校验失败，拒绝安装提权服务"));
     }
     let program_files = program_files_dir()?;

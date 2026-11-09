@@ -359,6 +359,9 @@ fn private() -> Ips {
 pub(crate) fn asset_path(kind: &str) -> Result<PathBuf, String> {
     let file = format!("{kind}.dat");
     let mut paths = vec![crate::config::data_dir().join(&file)];
+    if let Some(path) = crate::platform::managed::resource_path(&file) {
+        paths.push(path);
+    }
     if let Some(dir) = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))

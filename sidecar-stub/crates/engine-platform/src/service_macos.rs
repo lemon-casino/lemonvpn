@@ -31,15 +31,9 @@ struct Session {
     pid: u32,
     process: crate::managed::CoreProcess,
     config: Value,
-    /// Physical uplink the scoped default route clone was installed for.
-    uplink: String,
-}
-impl Drop for Session {
-    fn drop(&mut self) {
-        let _ = Command::new("/sbin/route")
-            .args(["delete", "-net", "0.0.0.0/0", "-ifscope", &self.uplink])
-            .status();
-    }
+    // Drop capture before its egress routes.
+    egress: crate::egress::Egress,
+    recovering: Option<String>,
 }
 fn err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
@@ -80,10 +74,7 @@ pub fn current_uid() -> io::Result<u32> {
 /// The service binary shipped next to the engine: `Contents/MacOS/lemonvpn-*`
 /// resolves to `Contents/Resources/lemonvpn-service` inside a .app bundle.
 fn bundled_service_path() -> Option<PathBuf> {
-    let directory = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    [directory.join("lemonvpn-service"), directory.join("../Resources/lemonvpn-service")]
-        .into_iter()
-        .find(|p| p.is_file())
+    crate::managed::resource_path("lemonvpn-service")
 }
 
 pub fn installed() -> bool {
@@ -294,7 +285,8 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
                     &mut config,
                     &crate::tun_bridge::process_list(&value)?,
                 )?;
-                let uplink = install_scoped_default()?;
+                // RAII also rolls back when secret generation/core startup fails.
+                let egress = crate::egress::Egress::new()?;
                 let binary = std::env::current_exe()?
                     .parent()
                     .ok_or_else(|| err("无效服务目录"))?
@@ -309,7 +301,8 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
                     pid,
                     process,
                     config,
-                    uplink,
+                    egress,
+                    recovering: None,
                 });
                 Ok(json!({"ok":true,"enabled":true}))
             }
@@ -332,11 +325,12 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
                 Ok(json!({"ok":true,"enabled":false}))
             }
             "status" => {
-                let enabled = session.as_mut().is_some_and(|s| s.process.alive());
-                if !enabled {
-                    session.take();
-                }
-                Ok(json!({"ok":true,"enabled":enabled}))
+                if session.as_ref().is_some_and(|s|!process_alive(s.pid)) {session.take();}
+                let enabled=session.is_some();
+                let recovering=session.as_mut().and_then(|s| {
+                    if !s.process.alive() {Some("协议内核恢复中".to_owned())}else{s.recovering.clone()}
+                });
+                Ok(json!({"ok":true,"enabled":enabled,"recovering":recovering}))
             }
             _ => Err(err("未知服务操作")),
         }
@@ -345,6 +339,7 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
 }
 
 fn run(owner: u32) -> io::Result<()> {
+    let _instance=crate::egress::lock_broker()?;
     // A previous daemon may have been hard-killed with a session still up;
     // only this service ever spawns the core from the protected directory.
     let _ = Command::new("/usr/bin/pkill")
@@ -352,8 +347,9 @@ fn run(owner: u32) -> io::Result<()> {
         .arg(format!("{SERVICE_DIR}/{}", crate::managed::CORE_BINARY_NAME))
         .status();
     for signum in [1, 2, 15] {
-        unsafe { signal(signum, stop_requested as usize) };
+        unsafe { signal(signum, stop_requested as extern "C" fn(i32) as usize) };
     }
+    crate::egress::cleanup_stale()?;
     let _ = fs::remove_file(SOCKET);
     let listener = UnixListener::bind(SOCKET)?;
     fs::set_permissions(SOCKET, fs::Permissions::from_mode(0o666))?;
@@ -363,6 +359,31 @@ fn run(owner: u32) -> io::Result<()> {
             let mut session = SESSION.lock().unwrap();
             if session.as_ref().is_some_and(|s| !process_alive(s.pid)) {
                 session.take();
+            } else if let Some(session) = session.as_mut() {
+                let result = (|| {
+                    let mut changed=session.egress.refresh()?;
+                    if !session.process.alive() && session.egress.routes.any() {
+                        let executable=std::env::current_exe()?;
+                        let directory=executable.parent().ok_or_else(||err("无效服务目录"))?;
+                        let next=crate::managed::CoreProcess::start(
+                            &directory.join(crate::managed::CORE_BINARY_NAME),
+                            directory.join("runtime").join(crate::managed::random_secret()?),
+                            session.config.clone(),crate::managed::random_secret()?,
+                        )?;
+                        session.process=next;
+                        changed=true;
+                    }
+                    if changed { session.process.request("DELETE", "/connections", None)?; }
+                    if session.egress.routes.any() && (changed || session.recovering.is_some()) {
+                        session.process.configure(session.config.clone())?;
+                        session.process.request("POST", "/cache/dns/flush", None)?;
+                    }
+                    if !session.egress.routes.any() {
+                        return Err(io::Error::new(io::ErrorKind::NotConnected,"等待网络恢复"));
+                    }
+                    Ok::<(),io::Error>(())
+                })();
+                session.recovering = result.err().map(|e| e.to_string());
             }
         }
         SESSION.lock().unwrap().take();
@@ -456,47 +477,6 @@ fn plist_content(executable: &str, owner: u32) -> String {
 
 fn launchctl(args: &[&str]) -> io::Result<bool> {
     Command::new("/bin/launchctl").args(args).status().map(|s| s.success())
-}
-
-/// The gateway and interface the kernel would use for unrestricted traffic,
-/// taken from the default route entry which the capture routes never replace.
-fn default_gateway() -> io::Result<(String, String)> {
-    let output = Command::new("/sbin/route").arg("-n").arg("get").arg("default").output()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut gateway = None;
-    let mut interface = None;
-    for line in text.lines() {
-        let Some((key, value)) = line.trim().split_once(':') else {
-            continue;
-        };
-        match key.trim() {
-            "gateway" => gateway = Some(value.trim().to_owned()),
-            "interface" => interface = Some(value.trim().to_owned()),
-            _ => {}
-        }
-    }
-    match (gateway, interface) {
-        (Some(gateway), Some(interface)) => Ok((gateway, interface)),
-        _ => Err(err("无法解析默认网关")),
-    }
-}
-
-/// macOS scoping quirk: TCP sockets pinned to an interface with IP_BOUND_IF
-/// only resolve routes from that interface's scoped table, which does not see
-/// the plain default entry once the capture routes exist. Install an ifscope
-/// clone of the default route so the engine's own dials reach the gateway.
-fn install_scoped_default() -> io::Result<String> {
-    let (gateway, interface) = default_gateway()?;
-    let _ = Command::new("/sbin/route")
-        .args(["delete", "-net", "0.0.0.0/0", "-ifscope", &interface])
-        .output();
-    let status = Command::new("/sbin/route")
-        .args(["add", "-net", "0.0.0.0/0", "-ifscope", &interface, &gateway])
-        .status()?;
-    if !status.success() {
-        return Err(err("无法为引擎流量创建物理网卡默认路由"));
-    }
-    Ok(interface)
 }
 
 fn install(owner: u32) -> io::Result<()> {
