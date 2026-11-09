@@ -20664,3 +20664,49 @@ index 00000000..aae10309
 +export function tunAvailable(resources: Capabilities['resources'] | undefined): boolean {
 +  return tunCapability(resources)?.available === true;
 +}
+diff --git a/src/ui/styles/palettes/qiangguo.css b/src/ui/styles/palettes/qiangguo.css
+index 60e559c8..6958dcc3 100644
+--- a/src/ui/styles/palettes/qiangguo.css
++++ b/src/ui/styles/palettes/qiangguo.css
+@@ -107,6 +107,10 @@
+   --qg-gate-end: -118px;
+   --qg-gate-top: 66px;
+   --qg-soft: 0px;
++}
++/* Resolve the background on the shell, where the desktop sidebar width is known.
++   Custom properties composed on :root would retain the web layout's offsets. */
++:root[data-family='qiangguo'] .rp-shell {
+   --qg-hero-bg:
+     linear-gradient(transparent var(--qg-fade-from), var(--rp-surface) var(--qg-fade-to)) no-repeat var(--qg-start) 0 /
+       calc(100% - var(--qg-start) - var(--qg-end)) var(--qg-hero),
+@@ -150,6 +154,30 @@
+     --qg-gate-top: 44px;
+     --qg-soft: 40px;
+   }
++  /* Desktop chrome spans the window. Keep its hero on the same boundaries as
++     the actual sidebar and content, without the web page's outer gutter. */
++  :root[data-family='qiangguo'] .rp-desktop-shell {
++    --qg-start: var(--rp-sidebar-width);
++    --qg-end: 0px;
++    --qg-gate-end: 0px;
++    --qg-soft: 0px;
++    max-width: none;
++  }
++  :root[data-family='qiangguo'] .rp-desktop-shell .rp-top {
++    max-width: none;
++  }
++  :root[data-family='qiangguo'] .rp-desktop-shell .rp-side {
++    inset-inline-start: 0;
++    background: var(--rp-base);
++  }
++  :root[data-family='qiangguo'] .rp-desktop-shell .rp-main {
++    margin-inline-end: 0;
++  }
++  :root[data-family='qiangguo'][dir='rtl'] .rp-desktop-shell {
++    --qg-start: 0px;
++    --qg-end: var(--rp-sidebar-width);
++    --qg-gate-end: var(--rp-sidebar-width);
++  }
+ }
+ :root[data-family='qiangguo'] .rp-shell {
+   background: var(--qg-hero-bg);
