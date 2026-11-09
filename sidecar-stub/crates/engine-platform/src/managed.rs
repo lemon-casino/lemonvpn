@@ -1,11 +1,16 @@
 //! Owned auxiliary cores. Dropping the owner terminates only its own process.
+#[cfg(windows)]
+use crate::kernel_windows::KernelChild as Child;
 use serde_json::Value;
+#[cfg(not(windows))]
+use std::process::{Child, Stdio};
 use std::{
     fs,
     io::{self, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::Command,
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -124,6 +129,7 @@ pub struct CoreProcess {
     pub api_port: u16,
     secret: String,
     directory: PathBuf,
+    persistent_dns: AtomicBool,
 }
 unsafe impl Send for CoreProcess {}
 
@@ -140,7 +146,9 @@ impl CoreProcess {
         config["secret"] = secret.clone().into();
         let file = directory.join("runtime.json");
         fs::write(&file, serde_json::to_vec(&config)?)?;
+        #[cfg(not(windows))]
         let mut command = Command::new(binary);
+        #[cfg(not(windows))]
         command
             .arg("-d")
             .arg(&directory)
@@ -149,11 +157,6 @@ impl CoreProcess {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000);
-        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -161,7 +164,12 @@ impl CoreProcess {
             command.process_group(0);
         }
         #[cfg(windows)]
-        let mut child = command.spawn()?;
+        let mut child = Child::spawn(
+            binary,
+            &directory,
+            &file,
+            config["tun"]["enable"].as_bool() == Some(true),
+        )?;
         #[cfg(not(windows))]
         let child = command.spawn()?;
         #[cfg(windows)]
@@ -197,6 +205,9 @@ impl CoreProcess {
             api_port,
             secret,
             directory,
+            persistent_dns: AtomicBool::new(
+                config["profile"]["store-fake-ip"].as_bool() == Some(true),
+            ),
         };
         let deadline = Instant::now() + Duration::from_secs(12);
         while Instant::now() < deadline {
@@ -223,8 +234,12 @@ impl CoreProcess {
             "PUT",
             "/configs?force=true",
             Some(&serde_json::json!({"payload":config.to_string()})),
-        )
-        .map(|_| ())
+        )?;
+        self.persistent_dns.store(
+            config["profile"]["store-fake-ip"].as_bool() == Some(true),
+            Ordering::Relaxed,
+        );
+        Ok(())
     }
     pub fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
@@ -239,6 +254,35 @@ impl Drop for CoreProcess {
             "/configs",
             Some(&serde_json::json!({"tun":{"enable":false}})),
         );
+        if self.persistent_dns.load(Ordering::Relaxed) && self.alive() {
+            #[cfg(windows)]
+            if let Some(helper) = resource_path("lemonvpn-service.exe") {
+                use std::os::windows::process::CommandExt;
+                if let Ok(mut helper) = Command::new(helper)
+                    .args(["--kernel-stop", &self.child.id().to_string()])
+                    .creation_flags(0x0800_0000)
+                    .spawn()
+                {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while Instant::now() < deadline && matches!(helper.try_wait(), Ok(None)) {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    let _ = helper.kill();
+                    let _ = helper.wait();
+                }
+            }
+            #[cfg(unix)]
+            unsafe {
+                extern "C" {
+                    fn kill(pid: i32, signal: i32) -> i32;
+                }
+                kill(self.child.id() as i32, 15);
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline && self.alive() {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
         let _ = self.child.kill();
         #[cfg(unix)]
         unsafe {
@@ -254,7 +298,15 @@ impl Drop for CoreProcess {
         unsafe {
             windows_support::Win32::Foundation::CloseHandle(self.job);
         }
-        let _ = fs::remove_file(self.directory.join("runtime.json"));
+        let file = self.directory.join("runtime.json");
+        // A recovery may already own this stable directory. Never remove its credentials.
+        if fs::read(&file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|value| value["secret"].as_str() == Some(&self.secret))
+        {
+            let _ = fs::remove_file(file);
+        }
     }
 }
 
@@ -319,8 +371,12 @@ pub fn uplink_name() -> Option<String> {
     }
     #[cfg(target_os = "linux")]
     {
-        if !crate::linux::supported() { return None; }
-        crate::network::interface(false).or_else(|_|crate::network::interface(true)).ok()
+        if !crate::linux::supported() {
+            return None;
+        }
+        crate::network::interface(false)
+            .or_else(|_| crate::network::interface(true))
+            .ok()
     }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
@@ -331,23 +387,42 @@ pub fn uplink_name() -> Option<String> {
 /// Auxiliary protocol cores select a family before assigning their interface;
 /// a global IPv4 interface must never be reused for a distinct IPv6 uplink.
 pub fn uplink_for(ipv6: bool) -> io::Result<Option<String>> {
-    #[cfg(any(target_os="macos",target_os="linux"))]
-    { crate::network::interface(ipv6).map(Some) }
-    #[cfg(not(any(target_os="macos",target_os="linux")))]
-    { let _=ipv6; Ok(uplink_name()) }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        crate::network::interface(ipv6).map(Some)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = ipv6;
+        Ok(uplink_name())
+    }
 }
 
 pub fn egress_families() -> Option<[bool; 2]> {
-    #[cfg(target_os="linux")]
-    if !crate::linux::supported() { return None; }
-    #[cfg(any(target_os="macos",target_os="linux"))]
-    { Some(crate::network::snapshot(false).map(|s|[s.routes.ipv4.is_some(),s.routes.ipv6.is_some()]).unwrap_or([false,false])) }
-    #[cfg(not(any(target_os="macos",target_os="linux")))]
-    { None }
+    #[cfg(target_os = "linux")]
+    if !crate::linux::supported() {
+        return None;
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        Some(
+            crate::network::snapshot(false)
+                .map(|s| [s.routes.ipv4.is_some(), s.routes.ipv6.is_some()])
+                .unwrap_or([false, false]),
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
 }
 pub fn network_revision() -> Option<u64> {
-    #[cfg(any(target_os="macos",target_os="linux"))]
-    { crate::network::snapshot(false).ok().map(|s|s.revision) }
-    #[cfg(not(any(target_os="macos",target_os="linux")))]
-    { None }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        crate::network::snapshot(false).ok().map(|s| s.revision)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
 }

@@ -13,6 +13,7 @@ mod connections;
 mod control;
 mod crypto;
 mod dns;
+mod dns_settings;
 mod events;
 mod fetch;
 mod flows;

@@ -7454,10 +7454,10 @@ index fedddd04..4965f7c9 100644
    ]
  }
 diff --git a/src/api/api.ts b/src/api/api.ts
-index 107878d9..c0d805a0 100644
+index 107878d9..92fa9cc3 100644
 --- a/src/api/api.ts
 +++ b/src/api/api.ts
-@@ -60,6 +60,42 @@ import type {RoutingTraceRequest, RoutingTraceResponse} from './model';
+@@ -60,6 +60,44 @@ import type {RoutingTraceRequest, RoutingTraceResponse} from './model';
  import type {components} from './types';
  import type {EngineConfig} from './engines';
  
@@ -7487,6 +7487,8 @@ index 107878d9..c0d805a0 100644
 +  udp?: string;
 +  recovering?: string | null;
 +};
++export type DnsSettings = {mode: 'fake-ip' | 'redir-host'; ipv4_range: string; ipv6_range: string; filters: string[]; store_fake_ip: boolean};
++export type DnsSettingsStatus = {settings: DnsSettings; revision: string; tun_enabled: boolean};
 +export type DesktopStatus = {
 +  observed_at: string;
 +  mixed: {address: string | null; protocols: string[]};
@@ -7500,17 +7502,19 @@ index 107878d9..c0d805a0 100644
  export interface Api {
    // The engine's configuration extension, through the routes `config` names.
    exportConfig(config: EngineConfig, signal?: AbortSignal): Promise<ConfigExport>;
-@@ -75,6 +111,9 @@ export interface Api {
+@@ -75,6 +113,11 @@ export interface Api {
    memoryHistory(query?: MemoryHistoryQuery, signal?: AbortSignal): Promise<MemoryHistory>;
    datapath(detail?: DatapathDetail, signal?: AbortSignal): Promise<Datapath>;
    runtimeMemory(signal?: AbortSignal): Promise<RuntimeMemory>;
 +  tun(signal?: AbortSignal): Promise<TunStatus>;
 +  setTun(enabled: boolean, signal?: AbortSignal): Promise<TunStatus>;
 +  desktopStatus?(signal?: AbortSignal): Promise<DesktopStatus>;
++  dnsSettings?(signal?: AbortSignal): Promise<DnsSettingsStatus>;
++  setDnsSettings?(revision: string, settings: DnsSettings, signal?: AbortSignal): Promise<DnsSettingsStatus>;
    nodes(query?: NodeQuery, signal?: AbortSignal): Promise<NodeList>;
    groups(signal?: AbortSignal): Promise<GroupSummary[]>;
    group(id: string, signal?: AbortSignal): Promise<Group>;
-@@ -101,8 +140,15 @@ export interface Api {
+@@ -101,8 +144,15 @@ export interface Api {
    runtimeSettings(signal?: AbortSignal): Promise<RuntimeSettings>;
    providers(query?: ProviderQuery, signal?: AbortSignal): Promise<ProviderList>;
    refreshProvider(providerId: string, signal?: AbortSignal): Promise<OperationAccepted>;
@@ -7527,11 +7531,11 @@ index 107878d9..c0d805a0 100644
    deleteNode(nodeId: string, signal?: AbortSignal): Promise<DeleteCount | OperationAccepted>;
    geodata(signal?: AbortSignal): Promise<GeoData>;
 diff --git a/src/api/client.ts b/src/api/client.ts
-index 77fae15f..f9f24600 100644
+index 77fae15f..66e50e06 100644
 --- a/src/api/client.ts
 +++ b/src/api/client.ts
 @@ -1,14 +1,17 @@
-+import type {RuleScope, RuleDefaults, RuleManagementResult, GroupRemovalRequest, GroupRemovalResult} from './api';
++import type {RuleScope, RuleDefaults, RuleManagementResult, GroupRemovalRequest, GroupRemovalResult, DnsSettings, DnsSettingsStatus} from './api';
 +import type {Provider} from './model';
  import createClient, {type Middleware} from 'openapi-fetch';
  import type {components, paths as StandardPaths} from './types';
@@ -7549,7 +7553,7 @@ index 77fae15f..f9f24600 100644
    type LogOptions,
    type LogRecord,
    type OperationAccepted,
-@@ -159,6 +162,44 @@ export function createApi(base: string, token?: string, clock: ServerClock = cre
+@@ -159,6 +162,48 @@ export function createApi(base: string, token?: string, clock: ServerClock = cre
    };
    const client = createClient<paths>(options);
    client.use(failures);
@@ -7591,15 +7595,21 @@ index 77fae15f..f9f24600 100644
 +    GET(path: '/api/v1/desktop/status', init?: {signal?: AbortSignal}): Promise<{data?: DesktopStatus; response: Response}>;
 +    POST(path: string, init: {body: {enabled: boolean}; signal?: AbortSignal}): Promise<{data?: TunStatus; response: Response}>;
 +  };
++  const dnsSettingsClient = client as unknown as {
++    GET(path: '/api/v1/dns/settings', init?: {signal?: AbortSignal}): Promise<{data?: DnsSettingsStatus; response: Response}>;
++    PUT(path: '/api/v1/dns/settings', init: {body: {revision: string; settings: DnsSettings}; signal?: AbortSignal}): Promise<{data?: DnsSettingsStatus; response: Response}>;
++  };
    // A fresh key per operation start prevents transport retries from starting a second operation.
    const starts = createClient<OperationStarts>(options);
    starts.use({onRequest: ({request}) => request.headers.set('Idempotency-Key', uuid())}, failures);
-@@ -320,13 +361,29 @@ export function createApi(base: string, token?: string, clock: ServerClock = cre
+@@ -320,13 +365,31 @@ export function createApi(base: string, token?: string, clock: ServerClock = cre
      memoryHistory: async (query, signal) => read(await client.GET('/api/v1/runtime/memory/history', {params: {query}, signal})),
      datapath: async (detail, signal) => read(await client.GET('/api/v1/datapath', {params: {query: {detail}}, signal})),
      runtimeMemory: async signal => read(await client.GET('/api/v1/runtime/memory', {signal})),
 +    tun: async signal => data(await tunClient.GET('/api/v1/tun', {signal})),
 +    desktopStatus: async signal => data(await tunClient.GET('/api/v1/desktop/status', {signal})),
++    dnsSettings: async signal => data(await dnsSettingsClient.GET('/api/v1/dns/settings', {signal})),
++    setDnsSettings: (revision, settings, signal) => writesConfig(dnsSettingsClient.PUT('/api/v1/dns/settings', {body: {revision, settings}, signal}).then(data)),
 +    setTun: async (enabled, signal) => data(await tunClient.POST('/api/v1/tun/set', {body: {enabled}, signal})),
      nodes: async (query, signal) => read(await client.GET('/api/v1/nodes', {params: {query}, signal})),
      groups: async signal => read(await client.GET('/api/v1/groups', {signal})),
@@ -7626,7 +7636,7 @@ index 77fae15f..f9f24600 100644
      patchGroup: async (groupId, body, ifMatch, signal) => {
        const result = await starts.PATCH('/api/v1/groups/{group_id}/config', {
          params: {path: {group_id: groupId}, header: {'If-Match': ifMatch}},
-@@ -362,8 +419,19 @@ export function createApi(base: string, token?: string, clock: ServerClock = cre
+@@ -362,8 +425,19 @@ export function createApi(base: string, token?: string, clock: ServerClock = cre
      refreshProvider: async (id, signal) => accepted(await starts.POST('/api/v1/providers/{provider_id}/refresh', {params: {path: {provider_id: id}}, signal})),
      // Node and provider writes may answer 202 with an operation, yet the contract keeps them out of Idempotency-Key
      // replay, so they go through the plain client.
@@ -7773,7 +7783,7 @@ index 754b4622..8405600f 100644
    globalSettings: SettingsSection | null;
    // The global settings the engine applies only when it restarts, so a write that changes them is refused.
 diff --git a/src/api/invalidation.ts b/src/api/invalidation.ts
-index 710af1d1..7fb24038 100644
+index 710af1d1..ee0b463a 100644
 --- a/src/api/invalidation.ts
 +++ b/src/api/invalidation.ts
 @@ -8,6 +8,7 @@ export type ResourceName =
@@ -7784,7 +7794,7 @@ index 710af1d1..7fb24038 100644
    | 'nodes'
    | 'groups'
    | 'group'
-@@ -17,6 +18,9 @@ export type ResourceName =
+@@ -17,7 +18,11 @@ export type ResourceName =
    | 'flow'
    | 'datapath'
    | 'runtimeMemory'
@@ -7792,9 +7802,11 @@ index 710af1d1..7fb24038 100644
 +  | 'desktopStatus'
 +  | 'desktopProxy'
    | 'dnsCache'
++  | 'dnsSettings'
    | 'dnsLog'
    | 'runtimeSettings'
-@@ -29,23 +33,26 @@ export type ResourceName =
+   | 'configRevisions'
+@@ -29,23 +34,28 @@ export type ResourceName =
  
  // The contract's Invalidates column (events.md). An operation's own changes arrive as the `runtime.updated` or
  // `generation.changed` they produce, and its waiter refetches the operation, so `operation.updated` refreshes nothing here.
@@ -7813,6 +7825,8 @@ index 710af1d1..7fb24038 100644
        'memoryHistory',
        'runtimeMemory',
 +      'desktopStatus',
++      'dnsSettings',
++      'tun',
        'runtimeSettings',
        'groups',
        'group',
@@ -7824,7 +7838,7 @@ index 710af1d1..7fb24038 100644
      ]
    },
    'flow.updated': {now: ['flows', 'flow']},
-@@ -66,6 +73,11 @@ export const invalidations: Record<EventKind, {now: ResourceName[] | 'all'}> = {
+@@ -66,6 +76,11 @@ export const invalidations: Record<EventKind, {now: ResourceName[] | 'all'}> = {
        'geodata',
        'rules',
        'dnsRules',
@@ -8645,10 +8659,10 @@ index 4629eb53..b37d1119 100644
 +export {ChainActivity} from './ChainActivity';
 diff --git a/src/features/config/DesktopModules.tsx b/src/features/config/DesktopModules.tsx
 new file mode 100644
-index 00000000..32df2228
+index 00000000..53d5aa1b
 --- /dev/null
 +++ b/src/features/config/DesktopModules.tsx
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,119 @@
 +import type {EffectiveConfig} from '../../api/model';
 +import {useCapabilities, useProviders, useNodes, useGroups, useRules, useDnsRules} from '../../store';
 +import {offered} from '../../api/capabilities';
@@ -8656,6 +8670,7 @@ index 00000000..32df2228
 +import {Card, Link, ErrorMessage} from '../../ui/ui';
 +import {href} from '../../shell/route';
 +import {dnsUpstreams} from '../../dae/ruleText';
++import {dnsSettingsAvailable} from '../../store/desktop';
 +
 +export function DesktopModules({config}: {config: EffectiveConfig}) {
 +  const t = useT();
@@ -8721,6 +8736,7 @@ index 00000000..32df2228
 +      retry: dns.refetch,
 +      actions: [
 +        {label: t('dns.upstreamsTitle'), href: href('dns', {tab: 'upstreams'})},
++        ...(dnsSettingsAvailable(caps) ? [{label: t('dns.fakeIpTitle'), href: href('dns', {tab: 'fakeip'})}] : []),
 +        {label: t('rule.dnsTitle'), href: href('rules', {tab: 'dns'})},
 +        {label: t('dns.query'), href: href('dns', {tab: 'query'})}
 +      ]
@@ -8854,18 +8870,19 @@ index dddfa35d..516cd124 100644
    const resources = useCapabilities().data?.resources;
    const quick = useQuickRule(go);
 diff --git a/src/features/dns/Dns.tsx b/src/features/dns/Dns.tsx
-index a891f553..ea0b5f62 100644
+index a891f553..657ca795 100644
 --- a/src/features/dns/Dns.tsx
 +++ b/src/features/dns/Dns.tsx
-@@ -34,6 +34,7 @@ import {
+@@ -34,6 +34,8 @@ import {
  import type {PageProps} from '../../shell/routes';
  import {useDns, useDnsCacheTab, useDnsLogTab, type DnsRowRule} from './useDns';
  import {DnsStats} from './Analysis';
 +import {Upstreams} from './Upstreams';
++import {FakeIpSettings} from './FakeIpSettings';
  import type {MatchKind} from './match';
  import type {dnsAnswerView} from './view';
  import {QuickRuleButton, RuleDialog} from '../shared/RuleDialog';
-@@ -68,6 +69,7 @@ export function Dns(props: PageProps) {
+@@ -68,6 +70,7 @@ export function Dns(props: PageProps) {
    const vm = useDns(props);
    const queryTab = (
      <>
@@ -8873,10 +8890,11 @@ index a891f553..ea0b5f62 100644
        {vm.queryError && <ErrorMessage error={vm.queryError} onRetry={vm.submit} message={error => t('dns.queryFailed', {error})} />}
        <Form
          className={cardClass()}
-@@ -139,6 +141,7 @@ export function Dns(props: PageProps) {
+@@ -139,6 +142,8 @@ export function Dns(props: PageProps) {
      </>
    );
    const content: Record<string, React.ReactNode> = {
++    fakeip: <FakeIpSettings />,
 +    upstreams: <Upstreams />,
      stats: <DnsStats enabled={vm.logEnabled} links={{cache: vm.cacheHref, log: vm.logHref}} />,
      query: queryTab,
@@ -9091,20 +9109,24 @@ index 00000000..159ba4f3
 +  );
 +}
 diff --git a/src/features/dns/nav.ts b/src/features/dns/nav.ts
-index c71f7571..dbeb3a28 100644
+index c71f7571..bc634332 100644
 --- a/src/features/dns/nav.ts
 +++ b/src/features/dns/nav.ts
-@@ -1,14 +1,16 @@
+@@ -1,14 +1,20 @@
  import type {Capabilities} from '../../api/model';
  import {offered} from '../../api/capabilities';
 +import {hasDesktop} from '../../desktop';
++import {dnsSettingsAvailable} from '../../store/desktop';
  import type {Key} from '../../i18n';
  
  // What the log says comes first and is the default, then the two listings, the log and the cache; a query is an
  // occasional action and comes last.
 -export function dnsTabs(resources: Capabilities['resources'] | undefined): Array<{id: 'stats' | 'log' | 'query' | 'cache'; titleKey: Key}> {
-+export function dnsTabs(resources: Capabilities['resources'] | undefined): Array<{id: 'stats' | 'log' | 'query' | 'cache' | 'upstreams'; titleKey: Key}> {
++export function dnsTabs(
++  resources: Capabilities['resources'] | undefined
++): Array<{id: 'stats' | 'log' | 'query' | 'cache' | 'upstreams' | 'fakeip'; titleKey: Key}> {
    return [
++    ...(dnsSettingsAvailable(resources) ? [{id: 'fakeip' as const, titleKey: 'dns.fakeIpTitle' as const}] : []),
      ...(offered(resources, 'dns_log', {whileLoading: true}) ? [{id: 'stats' as const, titleKey: 'dns.tab.stats' as const}] : []),
      ...(offered(resources, 'dns_log', {whileLoading: true}) ? [{id: 'log' as const, titleKey: 'dns.log' as const}] : []),
      ...(offered(resources, 'dns_cache', {whileLoading: true}) ? [{id: 'cache' as const, titleKey: 'ui.cache' as const}] : []),
@@ -14264,7 +14286,7 @@ index 0becab1b..e47e7609 100644
        // A DNS list with no place has no single dns routing section to add it to; the section is written in the
        // configuration, which opens beside the dialog so the rule stays here.
 diff --git a/src/i18n/locales/en.json b/src/i18n/locales/en.json
-index 1c5ca031..99adaf8f 100644
+index 1c5ca031..14dd2153 100644
 --- a/src/i18n/locales/en.json
 +++ b/src/i18n/locales/en.json
 @@ -487,7 +487,7 @@
@@ -14428,7 +14450,7 @@ index 1c5ca031..99adaf8f 100644
    "widgets.hide": "Hide widgets",
    "widgets.inspector": "Widget settings",
    "widgets.large": "Large",
-@@ -2378,5 +2424,210 @@
+@@ -2378,5 +2424,236 @@
    "widgets.unpin": "Unpin panel",
    "widgets.up": "Move up",
    "wordmark.gradient": "Gradient",
@@ -14638,10 +14660,36 @@ index 1c5ca031..99adaf8f 100644
 +  "group.reference.global": "Global outbound",
 +  "group.reference.group-filter": "Group filter",
 +  "group.reference.chain": "Chain endpoint",
-+  "group.reference.group-final": "Group fallback"
++  "group.reference.group-final": "Group fallback",
++  "dns.fakeIpTitle": "Fake-IP settings",
++  "dns.fakeIpScope": "Applies to TUN. System proxy DNS continues to resolve real addresses.",
++  "dns.fakeIpMode": "DNS mode",
++  "dns.fakeIpModeFake": "Fake-IP (virtual addresses)",
++  "dns.fakeIpModeReal": "Redir-Host (real addresses)",
++  "dns.fakeIpPersistence": "Persist mappings",
++  "dns.fakeIpPersistenceHelp": "Keep domain-to-address mappings across normal shutdowns.",
++  "dns.fakeIpRange4": "IPv4 pool",
++  "dns.fakeIpRange6": "IPv6 pool",
++  "dns.fakeIpRange6Help": "Leave blank to return real IPv6 addresses.",
++  "dns.fakeIpFilters": "Excluded domains",
++  "dns.fakeIpFiltersHelp": "One per line; supports *.example.com and +.example.com. Up to 256 entries.",
++  "dns.fakeIpHotHelp": "Saving applies immediately. Changing address pools rebuilds mappings.",
++  "dns.fakeIpRealHelp": "Pools, exclusions and persistence apply only in Fake-IP mode.",
++  "dns.fakeIpApply": "Save and apply",
++  "dns.fakeIpDefaults": "Restore defaults",
++  "dns.fakeIpDiscard": "Discard / reload",
++  "dns.fakeIpActive": "TUN is active; current settings are applied",
++  "dns.fakeIpInactive": "TUN is off; these settings will be used when enabled",
++  "dns.fakeIpApplied": "DNS settings saved and applied",
++  "dns.fakeIpSaved": "DNS settings saved; TUN is off",
++  "dns.fakeIpConflict": "Settings changed elsewhere. Reload before saving.",
++  "dns.fakeIpRange4Error": "Enter an IPv4 CIDR with a /8–/29 prefix.",
++  "dns.fakeIpRange6Error": "Enter an IPv6 CIDR with a /8–/125 prefix, or leave blank.",
++  "dns.fakeIpFilterError": "Up to 256 excluded domains are allowed.",
++  "dns.fakeIpTunSettings": "TUN settings"
  }
 diff --git a/src/i18n/locales/zh-CN.json b/src/i18n/locales/zh-CN.json
-index 7681175f..6dbb701f 100644
+index 7681175f..c6ccfcd9 100644
 --- a/src/i18n/locales/zh-CN.json
 +++ b/src/i18n/locales/zh-CN.json
 @@ -430,7 +430,7 @@
@@ -14807,7 +14855,7 @@ index 7681175f..6dbb701f 100644
    "widgets.hide": "隐藏小工具",
    "widgets.inspector": "小工具设置",
    "widgets.large": "大",
-@@ -2159,5 +2205,210 @@
+@@ -2159,5 +2205,236 @@
    "widgets.unpin": "取消固定面板",
    "widgets.up": "上移",
    "wordmark.gradient": "渐变",
@@ -15017,10 +15065,36 @@ index 7681175f..6dbb701f 100644
 +  "group.reference.global": "全局出站",
 +  "group.reference.group-filter": "组筛选",
 +  "group.reference.chain": "链路端点",
-+  "group.reference.group-final": "组回退"
++  "group.reference.group-final": "组回退",
++  "dns.fakeIpTitle": "Fake-IP 设置",
++  "dns.fakeIpScope": "用于 TUN 模式；系统代理继续使用真实地址解析。",
++  "dns.fakeIpMode": "DNS 模式",
++  "dns.fakeIpModeFake": "Fake-IP（虚拟地址）",
++  "dns.fakeIpModeReal": "Redir-Host（真实地址）",
++  "dns.fakeIpPersistence": "映射持久化",
++  "dns.fakeIpPersistenceHelp": "正常退出后保留域名与虚拟地址映射。",
++  "dns.fakeIpRange4": "IPv4 地址池",
++  "dns.fakeIpRange6": "IPv6 地址池",
++  "dns.fakeIpRange6Help": "留空则 IPv6 返回真实地址。",
++  "dns.fakeIpFilters": "排除名单",
++  "dns.fakeIpFiltersHelp": "每行一个域名，支持 *.example.com 和 +.example.com，最多 256 项。",
++  "dns.fakeIpHotHelp": "保存后立即热更新；地址池变更会重建映射。",
++  "dns.fakeIpRealHelp": "地址池、排除名单和持久化仅在 Fake-IP 模式生效。",
++  "dns.fakeIpApply": "保存并应用",
++  "dns.fakeIpDefaults": "恢复默认值",
++  "dns.fakeIpDiscard": "取消修改 / 重新加载",
++  "dns.fakeIpActive": "TUN 已开启，当前设置生效中",
++  "dns.fakeIpInactive": "TUN 未开启，设置会在开启时使用",
++  "dns.fakeIpApplied": "DNS 设置已保存并热更新",
++  "dns.fakeIpSaved": "DNS 设置已保存；TUN 当前关闭",
++  "dns.fakeIpConflict": "设置已被修改，请重新加载后保存。",
++  "dns.fakeIpRange4Error": "请输入有效 IPv4 CIDR，前缀 /8～/29。",
++  "dns.fakeIpRange6Error": "请输入有效 IPv6 CIDR，前缀 /8～/125，或留空。",
++  "dns.fakeIpFilterError": "排除名单最多 256 项。",
++  "dns.fakeIpTunSettings": "TUN 设置"
  }
 diff --git a/src/i18n/locales/zh-TW.json b/src/i18n/locales/zh-TW.json
-index 70960ec5..56c2f241 100644
+index 70960ec5..657fcd2a 100644
 --- a/src/i18n/locales/zh-TW.json
 +++ b/src/i18n/locales/zh-TW.json
 @@ -430,7 +430,7 @@
@@ -15145,7 +15219,7 @@ index 70960ec5..56c2f241 100644
    "widgets.hide": "隱藏小工具",
    "widgets.inspector": "小工具設定",
    "widgets.large": "大",
-@@ -2159,5 +2192,210 @@
+@@ -2159,5 +2192,236 @@
    "widgets.unpin": "取消固定面板",
    "widgets.up": "上移",
    "wordmark.gradient": "漸層",
@@ -15355,7 +15429,33 @@ index 70960ec5..56c2f241 100644
 +  "group.reference.global": "全域出站",
 +  "group.reference.group-filter": "組篩選",
 +  "group.reference.chain": "鏈路端點",
-+  "group.reference.group-final": "組後備"
++  "group.reference.group-final": "組後備",
++  "dns.fakeIpTitle": "Fake-IP 設定",
++  "dns.fakeIpScope": "用於 TUN 模式；系統代理繼續使用真實位址解析。",
++  "dns.fakeIpMode": "DNS 模式",
++  "dns.fakeIpModeFake": "Fake-IP（虛擬位址）",
++  "dns.fakeIpModeReal": "Redir-Host（真實位址）",
++  "dns.fakeIpPersistence": "映射持久化",
++  "dns.fakeIpPersistenceHelp": "正常結束後保留網域與虛擬位址映射。",
++  "dns.fakeIpRange4": "IPv4 位址池",
++  "dns.fakeIpRange6": "IPv6 位址池",
++  "dns.fakeIpRange6Help": "留空則 IPv6 回傳真實位址。",
++  "dns.fakeIpFilters": "排除清單",
++  "dns.fakeIpFiltersHelp": "每行一個網域，支援 *.example.com 和 +.example.com，最多 256 項。",
++  "dns.fakeIpHotHelp": "儲存後立即熱更新；位址池變更會重建映射。",
++  "dns.fakeIpRealHelp": "位址池、排除清單與持久化僅在 Fake-IP 模式生效。",
++  "dns.fakeIpApply": "儲存並套用",
++  "dns.fakeIpDefaults": "恢復預設值",
++  "dns.fakeIpDiscard": "取消修改 / 重新載入",
++  "dns.fakeIpActive": "TUN 已開啟，目前設定生效中",
++  "dns.fakeIpInactive": "TUN 未開啟，設定會在開啟時使用",
++  "dns.fakeIpApplied": "DNS 設定已儲存並熱更新",
++  "dns.fakeIpSaved": "DNS 設定已儲存；TUN 目前關閉",
++  "dns.fakeIpConflict": "設定已被修改，請重新載入後儲存。",
++  "dns.fakeIpRange4Error": "請輸入有效 IPv4 CIDR，前綴 /8～/29。",
++  "dns.fakeIpRange6Error": "請輸入有效 IPv6 CIDR，前綴 /8～/125，或留空。",
++  "dns.fakeIpFilterError": "排除清單最多 256 項。",
++  "dns.fakeIpTunSettings": "TUN 設定"
  }
 diff --git a/src/logo.png b/src/logo.png
 new file mode 100644
@@ -20626,10 +20726,10 @@ index 0c1e0862..9b76060d 100644
      // The links the about box and the sidebar open: doona's own repository, and the organisation whose engine
 diff --git a/src/store/desktop.ts b/src/store/desktop.ts
 new file mode 100644
-index 00000000..aae10309
+index 00000000..de6c0fce
 --- /dev/null
 +++ b/src/store/desktop.ts
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,38 @@
 +import {getApi} from '../api';
 +import type {Capabilities} from '../api/model';
 +import type {DesktopStatus} from '../api/api';
@@ -20663,6 +20763,10 @@ index 00000000..aae10309
 +
 +export function tunAvailable(resources: Capabilities['resources'] | undefined): boolean {
 +  return tunCapability(resources)?.available === true;
++}
++
++export function dnsSettingsAvailable(resources: unknown): boolean {
++  return hasDesktop && (resources as Record<string, {available?: boolean}> | undefined)?.['x-dns-settings']?.available === true;
 +}
 diff --git a/src/ui/styles/palettes/qiangguo.css b/src/ui/styles/palettes/qiangguo.css
 index 60e559c8..6958dcc3 100644
@@ -20710,3 +20814,204 @@ index 60e559c8..6958dcc3 100644
  }
  :root[data-family='qiangguo'] .rp-shell {
    background: var(--qg-hero-bg);
+diff --git a/src/features/dns/FakeIpSettings.tsx b/src/features/dns/FakeIpSettings.tsx
+new file mode 100644
+index 00000000..3e4469d9
+--- /dev/null
++++ b/src/features/dns/FakeIpSettings.tsx
+@@ -0,0 +1,170 @@
++import {useState} from 'react';
++import {getApi} from '../../api';
++import type {DnsSettings, DnsSettingsStatus} from '../../api/api';
++import {ipLiteral} from '../../api/selectors';
++import {dnsSettingsAvailable} from '../../store/desktop';
++import {useT} from '../../i18n';
++import {useCapabilities} from '../../store';
++import {useResource} from '../../store/resource';
++import {useAction} from '../../store/action';
++import {useDraftGuard} from '../../shell/draft';
++import {Badge, Button, Card, Empty, ErrorMessage, Form, InlineAlert, LabeledSelect, Link, Switch, TextField, Toolbar, toast} from '../../ui/ui';
++import {href} from '../../shell/route';
++import {TextArea} from '../../ui/TextArea';
++import '../../ui/styles/fakeip-settings.css';
++
++type Draft = {revision: string; settings: DnsSettings; filters: string};
++const defaults: DnsSettings = {mode: 'fake-ip', ipv4_range: '198.18.0.1/16', ipv6_range: 'fc00::/18', filters: [], store_fake_ip: false};
++function rangeValid(text: string, ipv6: boolean): boolean {
++  if (ipv6 && !text.trim()) return true;
++  const match = /^([^/]+)\/(\d+)$/.exec(text.trim());
++  if (!match) return false;
++  const ip = ipLiteral(match[1]);
++  return !!ip && ip.includes(':') === ipv6 && Number(match[2]) >= 8 && Number(match[2]) <= (ipv6 ? 125 : 29);
++}
++export function FakeIpSettings() {
++  const t = useT();
++  const api = getApi();
++  const capabilities = useCapabilities();
++  const enabled = dnsSettingsAvailable(capabilities.data?.resources) && !!api.dnsSettings;
++  const resource = useResource({key: ['dnsSettings'], fetch: signal => api.dnsSettings!(signal)}, {enabled});
++  const action = useAction<'save'>({shared: 'dns-settings'});
++  const [draft, setDraft] = useState<Draft | null>(null);
++  const [written, setWritten] = useState<DnsSettingsStatus | null>(null);
++  const [lastRead, setLastRead] = useState(resource.data);
++  if (lastRead !== resource.data) {
++    setLastRead(resource.data);
++    setWritten(null);
++  }
++  const data = written ?? resource.data;
++  const filters = draft
++    ? draft.filters
++        .split(/\r?\n/)
++        .map(line => line.trim())
++        .filter(Boolean)
++    : (data?.settings.filters ?? []);
++  const settings = draft ? {...draft.settings, filters} : data?.settings;
++  const dirty =
++    !!settings &&
++    !!data &&
++    JSON.stringify([settings.mode, settings.ipv4_range, settings.ipv6_range, settings.filters, settings.store_fake_ip]) !==
++      JSON.stringify([data.settings.mode, data.settings.ipv4_range, data.settings.ipv6_range, data.settings.filters, data.settings.store_fake_ip]);
++  const stale = !!draft && !!data && draft.revision !== data.revision;
++  const guard = useDraftGuard(dirty, () => setDraft(null), 'dns.fakeIpTitle');
++  const busy = !!action.busy;
++  const edit = (value: Partial<DnsSettings>, text?: string) => {
++    if (!data || !settings) return;
++    setDraft({
++      revision: draft?.revision ?? data.revision,
++      settings: {...settings, ...value},
++      filters: text ?? draft?.filters ?? data.settings.filters.join('\n')
++    });
++  };
++  const save = async () => {
++    if (!data || !settings || !api.setDnsSettings) return;
++    if (busy || !dirty || stale || !rangeValid(settings.ipv4_range, false) || !rangeValid(settings.ipv6_range, true) || filters.length > 256) return;
++    const result = await action.run('save', signal => api.setDnsSettings!(draft?.revision ?? data.revision, settings, signal));
++    if (result) {
++      setWritten(result);
++      setDraft(null);
++      guard.clear();
++      resource.refetch();
++      toast('positive', t(result.tun_enabled ? 'dns.fakeIpApplied' : 'dns.fakeIpSaved'));
++    }
++  };
++  if (!enabled) return null;
++  const v4error = settings && !rangeValid(settings.ipv4_range, false) ? t('dns.fakeIpRange4Error') : undefined;
++  const v6error = settings && !rangeValid(settings.ipv6_range, true) ? t('dns.fakeIpRange6Error') : undefined;
++  const filterError = filters.length > 256 ? t('dns.fakeIpFilterError') : undefined;
++  return (
++    <Card title={t('dns.fakeIpTitle')} note={t('dns.fakeIpScope')}>
++      <ErrorMessage error={resource.error ?? action.error} onRetry={resource.refetch} />
++      {!settings || !data ? (
++        <Empty>{t('ui.loading')}</Empty>
++      ) : (
++        <Form
++          className="rp-fakeip-form"
++          onSubmit={event => {
++            event.preventDefault();
++            void save();
++          }}
++        >
++          <Toolbar>
++            <Badge>{data.settings.mode}</Badge>
++            <span className="rp-note">{t(data.tun_enabled ? 'dns.fakeIpActive' : 'dns.fakeIpInactive')}</span>
++            <span className="rp-grow" />
++            <Link href={href('settings', {card: 'tun'})}>{t('dns.fakeIpTunSettings')}</Link>
++          </Toolbar>
++          <p className="rp-note">{t('dns.fakeIpRealHelp')}</p>
++          <div className="rp-fakeip-grid">
++            <LabeledSelect
++              label={t('dns.fakeIpMode')}
++              value={settings.mode}
++              isDisabled={busy}
++              onChange={mode => edit({mode: mode as DnsSettings['mode']})}
++              items={[
++                {id: 'fake-ip', label: t('dns.fakeIpModeFake')},
++                {id: 'redir-host', label: t('dns.fakeIpModeReal')}
++              ]}
++            />
++            <Switch
++              isSelected={settings.store_fake_ip}
++              isDisabled={busy}
++              onChange={store_fake_ip => edit({store_fake_ip})}
++              description={t('dns.fakeIpPersistenceHelp')}
++            >
++              {t('dns.fakeIpPersistence')}
++            </Switch>
++            <TextField
++              label={t('dns.fakeIpRange4')}
++              value={settings.ipv4_range}
++              isDisabled={busy}
++              onChange={ipv4_range => edit({ipv4_range})}
++              placeholder="198.18.0.1/16"
++              error={v4error}
++            />
++            <TextField
++              label={t('dns.fakeIpRange6')}
++              value={settings.ipv6_range}
++              isDisabled={busy}
++              onChange={ipv6_range => edit({ipv6_range})}
++              placeholder="fc00::/18"
++              error={v6error}
++              description={t('dns.fakeIpRange6Help')}
++            />
++          </div>
++          <TextArea
++            label={t('dns.fakeIpFilters')}
++            value={draft?.filters ?? filters.join('\n')}
++            isDisabled={busy}
++            onChange={text => edit({}, text)}
++            placeholder={'*.lan\n+.example.com'}
++            error={filterError}
++            description={t('dns.fakeIpFiltersHelp')}
++          />
++          {stale && <InlineAlert>{t('dns.fakeIpConflict')}</InlineAlert>}
++          <p className="rp-note">{t('dns.fakeIpHotHelp')}</p>
++          <Toolbar>
++            <Button accent type="submit" isPending={busy} isDisabled={!dirty || stale || !!v4error || !!v6error || !!filterError}>
++              {t('dns.fakeIpApply')}
++            </Button>
++            <Button isDisabled={busy} onPress={() => setDraft({revision: data.revision, settings: {...defaults}, filters: ''})}>
++              {t('dns.fakeIpDefaults')}
++            </Button>
++            <Button
++              quiet
++              isDisabled={busy || !draft}
++              onPress={() => {
++                setDraft(null);
++                guard.clear();
++                resource.refetch();
++              }}
++            >
++              {t('dns.fakeIpDiscard')}
++            </Button>
++          </Toolbar>
++        </Form>
++      )}
++    </Card>
++  );
++}
+diff --git a/src/ui/styles/fakeip-settings.css b/src/ui/styles/fakeip-settings.css
+new file mode 100644
+index 00000000..10e0f6de
+--- /dev/null
++++ b/src/ui/styles/fakeip-settings.css
+@@ -0,0 +1,19 @@
++.rp-fakeip-form {
++  display: grid;
++  gap: var(--rp-space-6);
++  min-inline-size: 0;
++}
++.rp-fakeip-grid {
++  display: grid;
++  grid-template-columns: repeat(2, minmax(0, 1fr));
++  align-items: start;
++  gap: var(--rp-space-6);
++}
++.rp-fakeip-grid > * {
++  min-inline-size: 0;
++}
++@media (max-width: 699px) {
++  .rp-fakeip-grid {
++    grid-template-columns: minmax(0, 1fr);
++  }
++}

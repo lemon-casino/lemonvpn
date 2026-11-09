@@ -73,6 +73,8 @@ git clone https://github.com/Zakkaus/doona.git doona
 
 桌面 UI 使用 `DOONA_DESKTOP_REVISION` 和合并补丁 `doona-lemonvpn-desktop.patch`，包含 Windows 路径、模块名、API、LemonVPN 品牌、固定本机引擎、TUN 设置及桌面状态页适配。旧的单项补丁保留供参考，不需再次应用。
 
+DNS 页面提供 Fake-IP 设置：切换 `fake-ip` / `redir-host`，配置 IPv4/IPv6 地址池、域名排除名单和映射持久化。设置保存在用户数据目录的 `dns-settings.json`；`GET/PUT /api/v1/dns/settings` 通过修订摘要防止并发覆盖，运行中的 TUN 内核确认热更新后才保存，失败时恢复运行配置。普通系统代理的 DNS 不受此设置影响。TUN 服务需更新到同一版本；内核工作目录保持稳定，正常退出时保存持久映射。Windows 的退出信号通过隐藏控制台与独立辅助进程发送，不改变宿主控制台。此功能仅执行静态检查与构建，未运行网络、TUN 或 UI 测试。
+
 品牌图标采用“石墨黑白折纸猫机 + 笔记本”，键盘/底座为黑色，折纸猫机为白色。透明主图保存在 `app/branding/logo.png`，已缩减留白以放大桌面图标，页面顶部与登录页也使用更大的展示尺寸。`app/branding/web/` 保存页面、favicon、PWA 与 Apple 图标，`app/src-tauri/icons/` 保存桌面窗口、托盘、Windows 程序/安装包及 macOS 图标。桌面开发和构建会自动运行 `prepare-branding.mjs`，在已有桌面适配上幂等应用 `doona-lemonvpn-branding.patch` 并同步资源；单独开发前端时先执行 `pnpm --dir app prepare:branding`。这样新克隆的上游工作副本和重新打包的程序都会使用同一套图标。
 
 ## 本地运行骨架

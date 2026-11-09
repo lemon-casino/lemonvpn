@@ -695,8 +695,11 @@ pub(crate) fn status_json() -> String {
         return r#"{"enabled":false,"supported":false}"#.to_owned();
     }
     if crate::compat::available() {
+        let ipv4 = crate::dns_settings::current().map(|settings|
+            settings.ipv4_range.split('/').next().unwrap_or("198.18.0.1").to_owned()
+        ).unwrap_or_else(|_|"198.18.0.1".to_owned());
         return serde_json::json!({"enabled":crate::compat::tun_active(),"supported":true,"adapter":"LemonVPN",
-            "address":"198.18.0.1 / fdfe:dcba:9876::1","udp":"full","ipv6":true,"backend":"mihomo",
+            "address":format!("{ipv4} / fdfe:dcba:9876::1"),"udp":"full","ipv6":true,"backend":"mihomo",
             "recovering":crate::compat::tun_recovery()}).to_string();
     }
     if !supported() {

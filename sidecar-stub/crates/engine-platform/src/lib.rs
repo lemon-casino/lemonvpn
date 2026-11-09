@@ -230,6 +230,9 @@ pub(crate) fn default_data_dir() -> PathBuf {
 pub mod system_proxy;
 pub mod managed;
 pub mod tun_bridge;
+pub mod dns_settings;
+#[cfg(windows)]
+pub mod kernel_windows;
 pub mod process;
 #[cfg(unix)]
 pub mod desktop_activation;

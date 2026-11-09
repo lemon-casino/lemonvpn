@@ -334,6 +334,7 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
                     .filter(|p| *p >= 1024 && *p <= 65535)
                     .ok_or_else(|| err("无效 DNS 端口"))? as u16;
                 let mut config = crate::tun_bridge::configuration(port, dns_port, password)?;
+                crate::dns_settings::DnsSettings::from_request(&value)?.apply(&mut config);
                 crate::tun_bridge::apply_processes(
                     &mut config,
                     &crate::tun_bridge::process_list(&value)?,
@@ -361,6 +362,15 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
                     egress,
                     recovering: None,
                 });
+                Ok(json!({"ok":true,"enabled":true}))
+            }
+            "dns_settings" => {
+                let settings = crate::dns_settings::DnsSettings::from_request(&value)?;
+                let session = session.as_mut().ok_or_else(||err("TUN 未运行"))?;
+                let mut next = session.config.clone();
+                settings.apply(&mut next);
+                crate::dns_settings::hot_apply(&session.process,&session.config,&next)?;
+                session.config = next;
                 Ok(json!({"ok":true,"enabled":true}))
             }
             "process_rules" => {
@@ -393,7 +403,7 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
                         s.recovering.clone()
                     }
                 });
-                Ok(json!({"ok":true,"enabled":enabled,"recovering":recovering}))
+                Ok(json!({"ok":true,"enabled":enabled,"recovering":recovering,"dns_settings_version":1}))
             }
             _ => Err(err("未知服务操作")),
         }
@@ -435,9 +445,7 @@ fn run(owner: u32) -> io::Result<()> {
                         let directory = executable.parent().ok_or_else(|| err("无效服务目录"))?;
                         let next = crate::managed::CoreProcess::start(
                             &directory.join(crate::managed::CORE_BINARY_NAME),
-                            directory
-                                .join("runtime")
-                                .join(crate::managed::random_secret()?),
+                            directory.join("runtime"),
                             session.config.clone(),
                             crate::managed::random_secret()?,
                         )?;

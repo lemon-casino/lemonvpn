@@ -1,6 +1,13 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 fn main() {
     #[cfg(windows)]
+    if std::env::args().nth(1).as_deref()==Some("--kernel-stop") {
+        let result = std::env::args().nth(2).and_then(|s|s.parse::<u32>().ok())
+            .ok_or_else(||std::io::Error::other("无效内核 PID"))
+            .and_then(lemonvpn_engine_platform::kernel_windows::signal);
+        std::process::exit(if result.is_ok() {0} else {1});
+    }
+    #[cfg(windows)]
     if let Err(error) = lemonvpn_engine_platform::service::entry() {
         eprintln!("LemonVPN TUN service: {error}");
         std::process::exit(1);

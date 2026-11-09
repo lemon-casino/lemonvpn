@@ -79,6 +79,13 @@ pub(crate) fn tun_recovery() -> Option<String> {
     TUN.lock().unwrap().as_ref().and_then(|bridge|bridge.recovery().map(str::to_owned))
 }
 
+pub(crate) fn apply_dns_settings(settings: &crate::platform::dns_settings::DnsSettings) -> io::Result<()> {
+    if let Some(bridge) = TUN.lock().unwrap().as_mut() {
+        bridge.update_dns(settings.clone())?;
+    }
+    Ok(())
+}
+
 fn base_config(
     entries: &BTreeMap<String, (Value, u16)>,
     direct_port: u16,
@@ -630,6 +637,8 @@ pub(crate) fn refresh_network() {
 }
 
 pub(crate) fn enable_tun() -> io::Result<()> {
+    // Read preferences before the bridge mutex: settings writes take settings -> TUN.
+    let dns_settings = crate::dns_settings::current()?;
     if !crate::platform::current().tun_supported() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -656,6 +665,7 @@ pub(crate) fn enable_tun() -> io::Result<()> {
         password,
         config::data_dir().join("compat"),
         remember_process_names(),
+        dns_settings,
     ) {
         Ok(bridge) => bridge,
         Err(error) => {

@@ -369,6 +369,7 @@ dependencies = [
  "regex",
  "ring",
  "rustls",
+ "serde",
  "serde_json",
  "serde_yaml",
  "sha3",

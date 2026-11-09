@@ -1,6 +1,7 @@
 //! A fixed TUN-to-authenticated-loopback bridge. Privileged code never receives
 //! proxy definitions, executable paths, arbitrary core configs or API requests.
 use crate::managed::{self, CoreProcess};
+use crate::dns_settings::DnsSettings;
 #[cfg(windows)]
 use crate::service as broker;
 #[cfg(target_os = "macos")]
@@ -132,6 +133,7 @@ pub struct TunBridge {
     cached: bool,
     stopped: bool,
     config: Value,
+    dns_settings: DnsSettings,
     process_names: Vec<String>,
     #[cfg(any(target_os="macos",target_os="linux"))]
     start_request: Value,
@@ -145,6 +147,7 @@ impl TunBridge {
         password: &str,
         directory: PathBuf,
         process_names: Vec<String>,
+        dns_settings: DnsSettings,
     ) -> io::Result<Self> {
         if !crate::current().tun_supported() {
             return Err(io::Error::new(
@@ -153,12 +156,17 @@ impl TunBridge {
             ));
         }
         let mut config = configuration(router_port, dns_port, password)?;
+        dns_settings.apply(&mut config);
         apply_processes(&mut config, &process_names)?;
         #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         {
             if broker::installed() {
+                let status = broker::request(&json!({"action":"status"}))?;
+                if status.get("dns_settings_version").and_then(Value::as_u64)!=Some(1) {
+                    return Err(io::Error::other("请先在 TUN 模式中更新服务，以支持 DNS 设置热更新"));
+                }
                 broker::request(
-                    &json!({"action":"start","router_port":router_port,"dns_port":dns_port,"password":password,"process_names":process_names}),
+                    &json!({"action":"start","router_port":router_port,"dns_port":dns_port,"password":password,"process_names":process_names,"dns_settings":dns_settings}),
                 )?;
                 return Ok(Self {
                     owner: Owner::Service,
@@ -166,9 +174,10 @@ impl TunBridge {
                     cached: true,
                     stopped: false,
                     config,
+                    dns_settings: dns_settings.clone(),
                     process_names,
                     #[cfg(any(target_os="macos",target_os="linux"))]
-                    start_request: json!({"action":"start","router_port":router_port,"dns_port":dns_port,"password":password}),
+                    start_request: json!({"action":"start","router_port":router_port,"dns_port":dns_port,"password":password,"dns_settings":dns_settings}),
                     #[cfg(any(target_os="macos",target_os="linux"))]
                     recovery: None,
                 });
@@ -182,7 +191,7 @@ impl TunBridge {
         }
         let process = CoreProcess::start(
             &managed::core_path().ok_or_else(|| io::Error::other("缺少 TUN 兼容内核"))?,
-            directory.join(format!("tun-{}", std::process::id())),
+            directory.join("tun"),
             config.clone(),
             managed::random_secret()?,
         )?;
@@ -192,12 +201,35 @@ impl TunBridge {
             cached: true,
             stopped: false,
             config,
+            dns_settings: dns_settings.clone(),
             process_names,
             #[cfg(any(target_os="macos",target_os="linux"))]
-            start_request: json!({"action":"start","router_port":router_port,"dns_port":dns_port,"password":password}),
+            start_request: json!({"action":"start","router_port":router_port,"dns_port":dns_port,"password":password,"dns_settings":dns_settings}),
             #[cfg(any(target_os="macos",target_os="linux"))]
             recovery: None,
         })
+    }
+    pub fn update_dns(&mut self, settings: DnsSettings) -> io::Result<()> {
+        let settings = settings.validated()?;
+        if self.stopped || self.dns_settings == settings { return Ok(()); }
+        let mut next = self.config.clone();
+        settings.apply(&mut next);
+        match &self.owner {
+            Owner::Local(process) => crate::dns_settings::hot_apply(process,&self.config,&next)?,
+            #[cfg(any(windows, target_os="macos", target_os="linux"))]
+            Owner::Service => {
+                let response = broker::request(&json!({"action":"dns_settings","dns_settings":settings}))
+                    .map_err(|error|io::Error::other(format!("DNS 热更新失败，请在 TUN 模式中确认服务已更新：{error}")))?;
+                if response.get("enabled").and_then(Value::as_bool)!=Some(true) {
+                    return Err(io::Error::other("TUN 服务当前未运行，DNS 热更新未完成；请先恢复 TUN 服务"));
+                }
+            }
+        }
+        self.config = next;
+        self.dns_settings = settings.clone();
+        #[cfg(any(target_os="macos",target_os="linux"))]
+        { self.start_request["dns_settings"] = json!(settings); }
+        Ok(())
     }
     pub fn update_processes(&mut self, names: Vec<String>) -> io::Result<()> {
         if self.stopped || self.process_names == names {
