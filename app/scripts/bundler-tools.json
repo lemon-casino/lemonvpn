@@ -66,6 +66,24 @@
       "url": "https://api.github.com/repos/tauri-apps/nsis-tauri-utils/releases/assets/345882097",
       "sha256": "5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709",
       "destination": "NSIS/Plugins/x86-unicode/additional/nsis_tauri_utils.dll"
+    },
+    {
+      "platform": "linux",
+      "arch": "arm64",
+      "name": "runtime-aarch64",
+      "url": "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/657373827",
+      "sha256": "9a72a744d221576c9347ec074243acc5c3c7568896b12714e0e82e9f0bf47900",
+      "destination": "runtime-aarch64",
+      "environment": "LDAI_RUNTIME_FILE"
+    },
+    {
+      "platform": "linux",
+      "arch": "x64",
+      "name": "runtime-x86_64",
+      "url": "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/657374641",
+      "sha256": "617aa77314d57c8b8e4fae9c3f0b35af7b30d5529cb69e98f64f92510ed98a46",
+      "destination": "runtime-x86_64",
+      "environment": "LDAI_RUNTIME_FILE"
     }
   ]
 }

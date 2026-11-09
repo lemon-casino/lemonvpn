@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { download } from './download.mjs';
@@ -49,6 +49,7 @@ for (const asset of assets) {
     mkdirSync(dirname(destination), { recursive: true });
     writeFileSync(destination, bytes);
     if (process.platform !== 'win32') chmodSync(destination, 0o755);
+    if (asset.environment) appendFileSync(process.env.GITHUB_ENV, `${asset.environment}=${destination}\n`);
   }
   console.log(`[prepare] ${asset.name}: verified SHA256 and prepared packaging cache`);
 }

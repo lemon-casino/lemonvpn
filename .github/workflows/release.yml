@@ -114,7 +114,8 @@ jobs:
           workspaces: |
             app/src-tauri -> target
             sidecar-stub -> target
-          key: desktop-release-${{ matrix.target }}-${{ hashFiles('pins.env', 'app/scripts/bundler-tools.json') }}
+          # Packaging pins are verified on every restore; they do not invalidate compiled Rust libraries.
+          key: desktop-release-${{ matrix.target }}-${{ hashFiles('pins.env') }}
           cache-directories: |
             app/src-tauri/target/compat-cache
             app/src-tauri/target/geodata-cache
