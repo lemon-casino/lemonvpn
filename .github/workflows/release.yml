@@ -114,17 +114,32 @@ jobs:
           workspaces: |
             app/src-tauri -> target
             sidecar-stub -> target
-          key: desktop-release-${{ matrix.target }}-${{ hashFiles('pins.env') }}
+          key: desktop-release-${{ matrix.target }}-${{ hashFiles('pins.env', 'app/scripts/bundler-tools.json') }}
           cache-directories: |
             app/src-tauri/target/compat-cache
             app/src-tauri/target/geodata-cache
+            app/src-tauri/target/bundler-cache
           cache-on-failure: true
+      - name: Prepare verified official packaging tools with download fallback
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node app/scripts/prepare-bundler.mjs
       - name: Build unsigned installers (no tests or app launch)
+        if: matrix.platform != 'windows'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          pnpm --dir app build --target "$BUILD_TARGET" --bundles "$BUILD_BUNDLES" --no-sign --ci -- --locked \
+          pnpm --dir app build --verbose --target "$BUILD_TARGET" --bundles "$BUILD_BUNDLES" --no-sign --ci -- --locked \
             2>&1 | tee "$RUNNER_TEMP/lemonvpn-build.log"
+      - name: Build unsigned Windows installer (no tests or app launch)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          & pnpm --dir app build --verbose --target $env:BUILD_TARGET --bundles $env:BUILD_BUNDLES --no-sign --ci -- --locked 2>&1 |
+            Tee-Object -FilePath "$env:RUNNER_TEMP\lemonvpn-build.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify architecture and collect packages with checksums
         run: node app/scripts/release.mjs collect
       - name: Upload this platform's complete packages

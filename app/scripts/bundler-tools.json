@@ -1,0 +1,71 @@
+{
+  "tauriCli": "2.12.4",
+  "source": "Official release asset SHA256 digests; paths follow tauri-cli-v2.12.4 bundler sources.",
+  "assets": [
+    {
+      "platform": "linux",
+      "arch": "arm64",
+      "name": "AppRun-aarch64",
+      "url": "https://api.github.com/repos/tauri-apps/binary-releases/releases/assets/274691716",
+      "sha256": "072f17c0895a85c490282fe5395c5007e5fc75da727e553b3b8fb680feb11578",
+      "destination": "AppRun-aarch64"
+    },
+    {
+      "platform": "linux",
+      "arch": "x64",
+      "name": "AppRun-x86_64",
+      "url": "https://api.github.com/repos/tauri-apps/binary-releases/releases/assets/274691722",
+      "sha256": "f30140a43a0a59e46db21bdefdf749b9e9f2c6946e92afabbacf98b8ae73fb4f",
+      "destination": "AppRun-x86_64"
+    },
+    {
+      "platform": "linux",
+      "arch": "arm64",
+      "name": "linuxdeploy-aarch64.AppImage",
+      "url": "https://api.github.com/repos/tauri-apps/binary-releases/releases/assets/576944620",
+      "sha256": "556ab80baa98e600aa80f0dcedfb70bca0e1ce7e9f147fb345be3fcc3e91b2b1",
+      "destination": "linuxdeploy-07333c6-aarch64.AppImage"
+    },
+    {
+      "platform": "linux",
+      "arch": "x64",
+      "name": "linuxdeploy-x86_64.AppImage",
+      "url": "https://api.github.com/repos/tauri-apps/binary-releases/releases/assets/576945544",
+      "sha256": "36a2d7e274d12e1050d0e9ecfe11d339ed54720b2bec464c286d53f8b07f5c62",
+      "destination": "linuxdeploy-07333c6-x86_64.AppImage"
+    },
+    {
+      "platform": "linux",
+      "arch": "arm64",
+      "name": "linuxdeploy-plugin-appimage-aarch64.AppImage",
+      "url": "https://api.github.com/repos/linuxdeploy/linuxdeploy-plugin-appimage/releases/assets/602435012",
+      "sha256": "518f4b49a561c157b23fd1ba4e857b8fa2271a038ac711bdedab6f018acbe7e5",
+      "destination": "linuxdeploy-plugin-appimage.AppImage"
+    },
+    {
+      "platform": "linux",
+      "arch": "x64",
+      "name": "linuxdeploy-plugin-appimage-x86_64.AppImage",
+      "url": "https://api.github.com/repos/linuxdeploy/linuxdeploy-plugin-appimage/releases/assets/602435573",
+      "sha256": "49d6a17160675a6bd1781699aae6bdf7692d98552e02a3671d2183d10547842e",
+      "destination": "linuxdeploy-plugin-appimage.AppImage"
+    },
+    {
+      "platform": "win32",
+      "arch": "all",
+      "name": "nsis-3.13.zip",
+      "url": "https://api.github.com/repos/tauri-apps/binary-releases/releases/assets/623832696",
+      "sha256": "ba63dffc4410ee89193e1cb5a41989991bd77c61068da17e3156d136b7b0b3d8",
+      "destination": "nsis-3.13.zip",
+      "archiveDirectory": "nsis-3.13"
+    },
+    {
+      "platform": "win32",
+      "arch": "all",
+      "name": "nsis_tauri_utils.dll",
+      "url": "https://api.github.com/repos/tauri-apps/nsis-tauri-utils/releases/assets/345882097",
+      "sha256": "5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709",
+      "destination": "NSIS/Plugins/x86-unicode/additional/nsis_tauri_utils.dll"
+    }
+  ]
+}

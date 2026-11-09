@@ -42,6 +42,11 @@ if (-not (Test-Path -LiteralPath $developerCommand)) { throw 'VsDevCmd.bat is mi
 $environmentCommand = "call `"$developerCommand`" -no_logo -arch=$targetArch -host_arch=$hostArch >nul && set"
 $compilerEnvironment = & "$env:SystemRoot\System32\cmd.exe" /d /c $environmentCommand
 if ($LASTEXITCODE -ne 0) { throw "Cannot initialize the $hostArch -> $targetArch MSVC environment." }
+$linker = Join-Path (Split-Path -Parent $compiler) 'link.exe'
+if (-not (Test-Path -LiteralPath $linker)) { throw 'The selected MSVC linker is missing.' }
+$rustTarget = $env:BUILD_TARGET.ToUpperInvariant().Replace('-', '_')
+[System.IO.File]::AppendAllText($env:GITHUB_ENV, "CARGO_TARGET_${rustTarget}_LINKER=$linker`n")
+Write-Host "Selected Rust linker: $linker"
 $allow = @('INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VCToolsInstallDir', 'VCToolsVersion', 'WindowsSdkDir', 'WindowsSDKVersion', 'UniversalCRTSdkDir', 'UCRTVersion')
 foreach ($line in $compilerEnvironment) {
     $at = $line.IndexOf('=')
