@@ -2,6 +2,7 @@
 import {createHash} from 'node:crypto';
 import {copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync} from 'node:fs';
 import {join} from 'node:path';
+import {download} from './download.mjs';
 
 export async function prepareGeodata(root, binaries) {
   const pins = Object.fromEntries(readFileSync(join(root, 'pins.env'), 'utf8').split(/\r?\n/).filter(line => /^[A-Z_0-9]+=/.test(line)).map(line => {
@@ -16,10 +17,7 @@ export async function prepareGeodata(root, binaries) {
     const cached = join(cache, `${expected}.dat`);
     const digest = bytes => createHash('sha256').update(bytes).digest('hex');
     if (!existsSync(cached) || digest(readFileSync(cached)) !== expected) {
-      const response = await fetch(url, {signal: AbortSignal.timeout(120000)});
-      if (!response.ok) throw new Error(`${kind} 下载失败: HTTP ${response.status}`);
-      const bytes = Buffer.from(await response.arrayBuffer());
-      if (bytes.length > 64 * 1024 * 1024 || digest(bytes) !== expected) throw new Error(`${kind} SHA256 不匹配`);
+      const bytes = await download(url, {description:kind,sha256:expected,maxBytes:64*1024*1024});
       writeFileSync(cached, bytes);
     }
     copyFileSync(cached, join(binaries, `${kind}.dat`));
@@ -27,10 +25,7 @@ export async function prepareGeodata(root, binaries) {
     const licenseSha = pins[`${kind.toUpperCase()}_LICENSE_SHA256`];
     if (!/^[a-f0-9]{64}$/.test(licenseSha ?? '')) throw new Error(`${kind} 缺少许可证摘要`);
     if (!existsSync(license) || digest(readFileSync(license)) !== licenseSha) {
-      const response = await fetch(pins[`${kind.toUpperCase()}_LICENSE_URL`], {signal: AbortSignal.timeout(30000)});
-      if (!response.ok) throw new Error(`${kind} 许可证下载失败`);
-      const bytes = Buffer.from(await response.arrayBuffer());
-      if (digest(bytes) !== licenseSha) throw new Error(`${kind} 许可证 SHA256 不匹配`);
+      const bytes = await download(pins[`${kind.toUpperCase()}_LICENSE_URL`], {description:`${kind} license`,sha256:licenseSha,maxBytes:1024*1024,timeoutMs:30000});
       writeFileSync(license, bytes);
     }
 

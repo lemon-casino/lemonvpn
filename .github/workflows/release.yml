@@ -114,7 +114,11 @@ jobs:
           workspaces: |
             app/src-tauri -> target
             sidecar-stub -> target
-          key: desktop-release-${{ matrix.target }}
+          key: desktop-release-${{ matrix.target }}-${{ hashFiles('pins.env') }}
+          cache-directories: |
+            app/src-tauri/target/compat-cache
+            app/src-tauri/target/geodata-cache
+          cache-on-failure: true
       - name: Build unsigned installers (no tests or app launch)
         run: |
           pnpm --dir app build --target "$BUILD_TARGET" --bundles "$BUILD_BUNDLES" --no-sign --ci -- --locked \

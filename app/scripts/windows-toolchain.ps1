@@ -12,9 +12,30 @@ $vswhere = @(
     "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe"
 ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if (-not $vswhere) { throw 'Visual Studio Installer/vswhere is missing from the Windows runner.' }
-$component = if ($targetArch -eq 'arm64') { 'Microsoft.VisualStudio.Component.VC.Tools.ARM64' } else { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
-$installation = (& $vswhere -latest -products '*' -requires $component -property installationPath | Select-Object -First 1)
-if ($LASTEXITCODE -ne 0 -or -not $installation) { throw "The runner is missing MSVC tools for $targetArch ($component)." }
+$instances = @((& $vswhere -all -products '*' -format json | Out-String | ConvertFrom-Json))
+if ($LASTEXITCODE -ne 0 -or -not $instances.Count) { throw 'Visual Studio installation discovery failed.' }
+$installation = $null
+foreach ($instance in ($instances | Sort-Object { [Version]$_.installationVersion } -Descending)) {
+    $toolsets = Join-Path $instance.installationPath 'VC\Tools\MSVC'
+    if (-not (Test-Path -LiteralPath $toolsets)) { continue }
+    foreach ($toolset in (Get-ChildItem -LiteralPath $toolsets -Directory | Sort-Object Name -Descending)) {
+        foreach ($compilerHost in @($hostArch, 'x64', 'x86') | Select-Object -Unique) {
+            $compiler = Join-Path $toolset.FullName "bin\Host$compilerHost\$targetArch\cl.exe"
+            if (Test-Path -LiteralPath $compiler) {
+                $installation = $instance.installationPath
+                $hostArch = $compilerHost
+                Write-Host "Selected compiler: $compiler"
+                break
+            }
+        }
+        if ($installation) { break }
+    }
+    if ($installation) { break }
+}
+if (-not $installation) {
+    $instances | Select-Object installationPath, installationVersion | Format-Table | Out-Host
+    throw "No installed MSVC compiler can target $targetArch."
+}
 $developerCommand = Join-Path $installation 'Common7\Tools\VsDevCmd.bat'
 if (-not (Test-Path -LiteralPath $developerCommand)) { throw 'VsDevCmd.bat is missing.' }
 # Only fixed compiler setup arguments are passed to cmd; no file operations.

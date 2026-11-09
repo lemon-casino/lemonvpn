@@ -5,6 +5,7 @@ import {join, resolve} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {gunzipSync} from 'node:zlib';
 import {kernelBinaryName, verifyPeMachine} from './engine-artifacts.mjs';
+import {download} from './download.mjs';
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 const psQuote=s=>`'${s.replaceAll("'","''")}'`;
 const loadPins=repoRoot=>Object.fromEntries(readFileSync(join(repoRoot,'pins.env'),'utf8').split(/\r?\n/).filter(line=>/^[A-Z_0-9]+=/.test(line)).map(line=>line.split('=',2)));
@@ -12,10 +13,7 @@ async function fetchPinned(cache,version,asset,assetSha){
   mkdirSync(cache,{recursive:true});
   const archive=join(cache,asset);
   if(!existsSync(archive)||hash(readFileSync(archive))!==assetSha){
-    const response=await fetch(`https://github.com/MetaCubeX/mihomo/releases/download/${version}/${asset}`,{signal:AbortSignal.timeout(600000)});
-    if(!response.ok)throw new Error(`下载 mihomo 失败: HTTP ${response.status}`);
-    const bytes=Buffer.from(await response.arrayBuffer());
-    if(hash(bytes)!==assetSha)throw new Error('mihomo 官方发布包 SHA256 不匹配');
+    const bytes=await download(`https://github.com/MetaCubeX/mihomo/releases/download/${version}/${asset}`,{description:`mihomo ${asset}`,sha256:assetSha});
     writeFileSync(archive,bytes);
   }
   return archive;
@@ -23,9 +21,8 @@ async function fetchPinned(cache,version,asset,assetSha){
 async function fetchLicense(cache,version,binaries){
   const licensePath=join(cache,'LICENSE');
   if(!existsSync(licensePath)){
-    const response=await fetch(`https://raw.githubusercontent.com/MetaCubeX/mihomo/${version}/LICENSE`,{signal:AbortSignal.timeout(60000)});
-    if(!response.ok)throw new Error('缺少 mihomo GPL 许可证');
-    writeFileSync(licensePath,await response.text());
+    const bytes=await download(`https://raw.githubusercontent.com/MetaCubeX/mihomo/${version}/LICENSE`,{description:'mihomo license',maxBytes:1024*1024,timeoutMs:30000});
+    writeFileSync(licensePath,bytes);
   }
   copyFileSync(licensePath,join(binaries,'mihomo.LICENSE.txt'));
 }
