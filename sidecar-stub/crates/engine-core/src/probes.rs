@@ -406,7 +406,7 @@ fn probe(node: &config::Node, kind: &str, version: &'static str) -> Outcome {
         _ => probe_tcp(node, version),
     };
     // A failure of just one address family does not prove the entire node unavailable.
-    if kind == "http" && (version == "any" || outcome.state == "healthy") {
+    if kind == "http" && outcome.state != "unknown" && (version == "any" || outcome.state == "healthy") {
         crate::group_policy::probe_result(node, "tcp", outcome.state == "healthy", outcome.latency);
     }
     outcome
@@ -626,7 +626,7 @@ fn addresses(host: &str, version: &'static str) -> Result<Vec<IpAddr>, String> {
     let all = match host.parse::<IpAddr>() {
         Ok(ip) => vec![ip],
         Err(_) => {
-            crate::dns::resolve(host).map_err(|error| format!("解析节点地址失败：{error}"))?
+            crate::dns::bootstrap_resolve(host).map_err(|error| format!("节点地址引导解析失败：{error}"))?
         }
     };
     let filtered: Vec<IpAddr> = all
@@ -645,7 +645,7 @@ fn addresses(host: &str, version: &'static str) -> Result<Vec<IpAddr>, String> {
 
 fn unresolved(version: &'static str, purpose: &'static str, error: String) -> Outcome {
     Outcome {
-        state: "unavailable",
+        state: "unknown",
         latency: None,
         ip_version: if version == "ipv6" { "ipv6" } else { "ipv4" },
         error: Some(error),

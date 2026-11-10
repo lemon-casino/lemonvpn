@@ -121,6 +121,20 @@ fn download(
     route: &DownloadRoute,
     headers: &BTreeMap<String, String>,
 ) -> Result<Response, String> {
+    // All downloads are infrastructure requests, including subscriptions using
+    // the default direct route. Resolve their endpoints independently of the
+    // user's domain policies so they can repair an unavailable proxy group.
+    crate::dns_transport::with_bootstrap(|| {
+        download_inner(address, user_agent, max_bytes, route, headers)
+    })
+}
+fn download_inner(
+    address: &str,
+    user_agent: &str,
+    max_bytes: usize,
+    route: &DownloadRoute,
+    headers: &BTreeMap<String, String>,
+) -> Result<Response, String> {
     if user_agent.len() > 512
         || user_agent.contains(['\r', '\n', '\0'])
         || headers.len() > 32

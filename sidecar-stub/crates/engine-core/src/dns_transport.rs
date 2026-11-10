@@ -253,7 +253,15 @@ pub fn exchange_pool(id: &str, query: &[u8]) -> io::Result<Vec<u8>> {
 }
 pub fn exchange(resolver: &Resolver, query: &[u8]) -> io::Result<Vec<u8>> {
     let started = Instant::now();
-    let result = with_bootstrap(|| once(resolver, query));
+    let result = with_bootstrap(|| once(resolver, query)).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "DNS 上游“{}”经出站“{}”查询失败：{error}",
+                resolver.name, resolver.outbound
+            ),
+        )
+    });
     let mut all = STATS.get_or_init(Default::default).lock().unwrap();
     if all.len() >= 256 && !all.contains_key(&resolver.id) {
         all.pop_first();

@@ -1301,19 +1301,37 @@ pub fn outbound_seed() -> Vec<(String, &'static str)> {
 
 /// Explicit infrastructure egress, without re-routing the resolver/provider
 /// server through the very DNS policy it is trying to establish.
-pub(crate) fn connect_outbound(name:&str,host:&str,port:u16)->std::io::Result<std::net::TcpStream>{
-    if name=="direct" {return crate::proxy::dial(host,port)}
-    let (target,_,_)=resolve_outbound_for(&current(),name,&mut Vec::new(),"tcp",false).ok_or_else(||std::io::Error::other(format!("出站 {name} 不存在或没有可用成员")))?;
-    match target {
-        Target::Direct=>crate::proxy::dial(host,port),
-        Target::Node(node)=>crate::outbound::connect(&node,host,port),
-        Target::Chain{nodes,..}=>crate::compat::connect_chain(&nodes,host,port),
-        Target::Block=>Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"基础设施请求不能使用阻断出站")),
+pub(crate) fn connect_outbound(name: &str, host: &str, port: u16) -> std::io::Result<std::net::TcpStream> {
+    let decision = infrastructure_decision(name, "tcp")?;
+    if decision.blocked() {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "下载和 DNS 请求不能使用阻断出站"));
     }
+    // Include actual infrastructure connections in the same success/failure
+    // feedback as user traffic, so recovery does not depend on the probe URL.
+    crate::proxy::connect(&decision, host, port)
 }
-pub(crate) fn infrastructure_decision(name:&str,network:&str)->std::io::Result<Decision>{
-    let config=current();let(target,chain,dependencies)=resolve_outbound_for(&config,name,&mut Vec::new(),network,false).ok_or_else(||std::io::Error::other("基础设施出站不可用"))?;
-    Ok(Decision{epoch:crate::connections::route_epoch_for(&dependencies,network),process:None,outbound:name.into(),chain,dependencies,target,rule_id:"infrastructure".into(),generation:config.generation.clone(),expression:format!("DNS via {name}")})
+pub(crate) fn infrastructure_decision(name: &str, network: &str) -> std::io::Result<Decision> {
+    let config = current();
+    let (target, chain, dependencies) = resolve_outbound_for(&config, name, &mut Vec::new(), network, false).ok_or_else(|| {
+        let reason = match config.groups.iter().find(|group| group.name == name) {
+            Some(group) if group.dialer.is_some() => "链式出站的前置或落地暂未选出成员",
+            Some(group) if group.members.is_empty() => "策略组没有匹配的节点",
+            Some(_) => "组内节点暂时处于连接失败后的退避期",
+            None => "出站不存在或已移除",
+        };
+        std::io::Error::new(std::io::ErrorKind::NotConnected, format!("出站“{name}”无法选出 {network} 连接：{reason}"))
+    })?;
+    Ok(Decision {
+        epoch: crate::connections::route_epoch_for(&dependencies, network),
+        process: None,
+        outbound: name.into(),
+        chain,
+        dependencies,
+        target,
+        rule_id: "infrastructure".into(),
+        generation: config.generation.clone(),
+        expression: format!("DNS/download via {name}"),
+    })
 }
 
 pub(crate) fn apply_resources(snapshot:std::sync::Arc<crate::rules_runtime::Snapshot>)->Result<String,String>{

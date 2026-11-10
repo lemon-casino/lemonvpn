@@ -26,6 +26,7 @@ struct Health {
 #[derive(Clone, Copy)]
 struct Quality {
     available: bool,
+    recoverable: bool,
     moving: f64,
     average: f64,
     latest: f64,
@@ -73,6 +74,7 @@ impl Health {
         };
         Quality {
             available: (!failed_check || network == "udp") && !failed_dial,
+            recoverable: !failed_dial,
             moving: self.moving.or(self.dial_delay).unwrap_or(1e12) + penalty,
             average: average.or(self.dial_delay).unwrap_or(1e12) + penalty,
             latest: samples.last().copied().or(self.dial_delay).unwrap_or(1e12) + penalty,
@@ -180,7 +182,7 @@ pub(crate) fn select(
 ) -> Option<String> {
     let mut state = state();
     let now = Instant::now();
-    let candidates: Vec<(&Node, Quality)> = group
+    let mut candidates: Vec<(&Node, Quality)> = group
         .members
         .iter()
         .filter_map(|name| {
@@ -190,9 +192,15 @@ pub(crate) fn select(
                 || Health::default().quality(now, network),
                 |health| health.quality(now, network),
             );
-            quality.available.then_some((node, quality))
+            quality.recoverable.then_some((node, quality))
         })
         .collect();
+    // Prefer positive/unknown health as before. If every benchmark failed,
+    // allow an actual connection to recover a member instead of leaving the
+    // group empty. Actual dial failures still observe FAILURE_COOLDOWN.
+    if candidates.iter().any(|(_, quality)| quality.available) {
+        candidates.retain(|(_, quality)| quality.available);
+    }
     if candidates.is_empty() {
         return None;
     }
