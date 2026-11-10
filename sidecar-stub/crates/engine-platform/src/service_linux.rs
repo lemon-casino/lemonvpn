@@ -364,6 +364,7 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
                 });
                 Ok(json!({"ok":true,"enabled":true}))
             }
+            "dns_artifact_begin" | "dns_artifact_part" | "dns_artifact_commit" => crate::dns_artifact::handle(&value).unwrap(),
             "dns_settings" => {
                 let settings = crate::dns_settings::DnsSettings::from_request(&value)?;
                 let session = session.as_mut().ok_or_else(||err("TUN 未运行"))?;
@@ -371,7 +372,7 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
                 settings.apply(&mut next);
                 crate::dns_settings::hot_apply(&session.process,&session.config,&next)?;
                 session.config = next;
-                Ok(json!({"ok":true,"enabled":true}))
+                Ok(json!({"ok":true,"enabled":true,"dns_settings_version":2,"dns_settings_sha256":crate::dns_artifact::settings_digest(&settings)?}))
             }
             "process_rules" => {
                 let names = crate::tun_bridge::process_list(&value)?;
@@ -380,6 +381,11 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
                 crate::tun_bridge::apply_processes(&mut next, &names)?;
                 session.process.configure(next.clone())?;
                 session.config = next;
+                Ok(json!({"ok":true,"enabled":true}))
+            }
+            "flush_fakeip" => {
+                let session = session.as_ref().ok_or_else(|| err("TUN 未运行"))?;
+                session.process.request("POST", "/cache/fakeip/flush", None)?;
                 Ok(json!({"ok":true,"enabled":true}))
             }
             "flush_dns" => {
@@ -403,7 +409,7 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
                         s.recovering.clone()
                     }
                 });
-                Ok(json!({"ok":true,"enabled":enabled,"recovering":recovering,"dns_settings_version":1}))
+                Ok(json!({"ok":true,"enabled":enabled,"recovering":recovering,"dns_settings_version":2}))
             }
             _ => Err(err("未知服务操作")),
         }

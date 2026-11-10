@@ -1,27 +1,30 @@
-//! A small blocking HTTP/1.1 client for subscription downloads.
-//!
-//! Only what a subscription URL needs: GET, redirects, `Content-Length` and
-//! chunked bodies, and TLS through rustls with the platform-independent
-//! Mozilla root set. The connection is dialed through [`crate::proxy::dial`],
-//! so the engine's DNS upstreams apply.
-
-use std::io::{Read, Write};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
-
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
-
+//! Bounded HTTP/1.1 downloads with verified TLS and explicit egress.
+//! Retries restart a GET; incomplete TLS/HTTP bodies are never accepted as files.
+use rustls::{pki_types::ServerName, ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use std::{
+    collections::BTreeMap,
+    io::{self, Read, Write},
+    net::{IpAddr, TcpStream},
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const MAX_REDIRECTS: usize = 5;
 const TIMEOUT: Duration = Duration::from_secs(15);
-
+const ATTEMPTS: usize = 2;
+#[derive(Clone, Debug)]
+pub(crate) enum DownloadRoute {
+    Direct,
+    Routing,
+    Outbound(String),
+}
 pub struct Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    pub download_outbound: Option<String>,
+    pub fetched_url: String,
 }
-
 impl Response {
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
@@ -30,284 +33,499 @@ impl Response {
             .map(|(_, value)| value.as_str())
     }
 }
-
-struct Url {
-    scheme: String,
-    host: String,
-    port: u16,
-    path: String,
+struct Failure {
+    message: String,
+    retryable: bool,
 }
-
-/// Downloads `url`. A response with a non-2xx status is returned, not treated
-/// as a transport failure, so the caller can report the server's answer.
+impl Failure {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+    fn io(stage: &str, error: io::Error) -> Self {
+        let retryable = matches!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::NotConnected
+        );
+        Self {
+            message: format!("{stage}：{error}"),
+            retryable,
+        }
+    }
+    fn closed(stage: &str) -> Self {
+        Self {
+            message: format!("{stage}：服务器提前关闭连接"),
+            retryable: true,
+        }
+    }
+}
 pub fn get(url: &str, user_agent: &str, max_bytes: usize) -> Result<Response, String> {
-    let mut url = parse_url(url)?;
-    for _ in 0..=MAX_REDIRECTS {
-        let response = once(&url, user_agent, max_bytes)?;
-        let redirect = matches!(response.status, 301 | 302 | 303 | 307 | 308);
-        let Some(location) = response.header("location").map(str::to_owned) else {
-            return Ok(response);
-        };
-        if !redirect {
-            return Ok(response);
-        }
-        url = resolve(&url, &location)?;
-    }
-    Err("订阅地址重定向次数过多".to_owned())
+    get_via(url, user_agent, max_bytes, "direct")
 }
-
-fn parse_url(url: &str) -> Result<Url, String> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or_else(|| "订阅地址缺少 scheme".to_owned())?;
-    let scheme = scheme.to_ascii_lowercase();
-    if scheme != "http" && scheme != "https" {
-        return Err(format!("不支持的订阅地址 scheme `{scheme}`"));
-    }
-    let (authority, path) = match rest.find('/') {
-        Some(index) => (&rest[..index], &rest[index..]),
-        None => (rest, "/"),
+pub(crate) fn get_via(
+    url: &str,
+    user_agent: &str,
+    max_bytes: usize,
+    outbound: &str,
+) -> Result<Response, String> {
+    get_via_headers(url, user_agent, max_bytes, outbound, &BTreeMap::new())
+}
+pub(crate) fn get_via_headers(
+    url: &str,
+    user_agent: &str,
+    max_bytes: usize,
+    outbound: &str,
+    headers: &BTreeMap<String, String>,
+) -> Result<Response, String> {
+    let route = if outbound == "direct" {
+        DownloadRoute::Direct
+    } else {
+        DownloadRoute::Outbound(outbound.to_owned())
     };
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
-    let (host, port) = split_host_port(authority)?;
-    Ok(Url {
-        port: port.unwrap_or(if scheme == "https" { 443 } else { 80 }),
-        scheme,
-        host,
-        path: path.to_owned(),
-    })
+    download(url, user_agent, max_bytes, &route, headers)
 }
-
-fn split_host_port(authority: &str) -> Result<(String, Option<u16>), String> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let (host, tail) = rest
-            .split_once(']')
-            .ok_or_else(|| "订阅地址的 IPv6 缺少 `]`".to_owned())?;
-        let port = match tail.strip_prefix(':') {
-            Some(port) => Some(port.parse::<u16>().map_err(|_| "订阅地址端口无效".to_owned())?),
-            None => None,
-        };
-        return Ok((host.to_owned(), port));
+pub(crate) fn get_routed(
+    url: &str,
+    user_agent: &str,
+    max_bytes: usize,
+    route: &DownloadRoute,
+) -> Result<Response, String> {
+    download(url, user_agent, max_bytes, route, &BTreeMap::new())
+}
+pub(crate) fn valid_url(value: &str) -> Result<url::Url, String> {
+    if value.len() > 8192 || value.chars().any(char::is_control) {
+        return Err("下载地址过长或含控制字符".into());
     }
-    match authority.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() => Ok((
-            host.to_owned(),
-            Some(port.parse::<u16>().map_err(|_| "订阅地址端口无效".to_owned())?),
-        )),
-        Some(_) => Err("订阅地址缺少主机名".to_owned()),
-        None => {
-            if authority.is_empty() {
-                return Err("订阅地址缺少主机名".to_owned());
+    let url = url::Url::parse(value).map_err(|_| "下载地址格式无效")?;
+    if !matches!(url.scheme(), "https" | "http")
+        || url.host_str().is_none()
+        || url.fragment().is_some()
+    {
+        return Err("下载地址须为不含片段的 HTTP(S) URL".into());
+    }
+    Ok(url)
+}
+fn download(
+    address: &str,
+    user_agent: &str,
+    max_bytes: usize,
+    route: &DownloadRoute,
+    headers: &BTreeMap<String, String>,
+) -> Result<Response, String> {
+    if user_agent.len() > 512
+        || user_agent.contains(['\r', '\n', '\0'])
+        || headers.len() > 32
+        || headers
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 4)
+            .sum::<usize>()
+            > 16384
+    {
+        return Err("下载请求头超过上限".into());
+    }
+    if headers.iter().any(|(key, value)| {
+        matches!(
+            key.to_ascii_lowercase().as_str(),
+            "host" | "content-length" | "transfer-encoding" | "connection" | "accept-encoding"
+        ) || key.is_empty()
+            || key.len() > 128
+            || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || value.len() > 4096
+            || value.contains(['\r', '\n', '\0'])
+    }) {
+        return Err("下载请求头无效".into());
+    }
+    let mut url = valid_url(address)?;
+    let mut headers = headers.clone();
+    if !url.username().is_empty() || url.password().is_some() {
+        let user = crate::share::percent_decode(url.username());
+        let password = crate::share::percent_decode(url.password().unwrap_or(""));
+        headers.entry("Authorization".into()).or_insert_with(|| {
+            format!(
+                "Basic {}",
+                crate::base64::encode(format!("{user}:{password}").as_bytes())
+            )
+        });
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    for redirects in 0..=MAX_REDIRECTS {
+        let mut response = None;
+        let mut failure = None;
+        for attempt in 0..ATTEMPTS {
+            if crate::runtime::stopping() {
+                return Err("引擎正在退出，下载已取消".into());
             }
-            Ok((authority.to_owned(), None))
+            match once(&url, user_agent, max_bytes, route, &headers, attempt) {
+                Ok(value)
+                    if matches!(value.status, 408 | 429 | 500 | 502 | 503 | 504)
+                        && attempt + 1 < ATTEMPTS =>
+                {
+                    let delay = value
+                        .header("retry-after")
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(1)
+                        .min(2);
+                    std::thread::sleep(Duration::from_secs(delay));
+                }
+                Ok(value) => {
+                    response = Some(value);
+                    break;
+                }
+                Err(error) => {
+                    let retry = error.retryable;
+                    failure = Some(error.message);
+                    if !retry || attempt + 1 == ATTEMPTS {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+            }
         }
+        let mut response = response.ok_or_else(|| {
+            format!(
+                "{}：{}",
+                url.host_str().unwrap_or("下载服务器"),
+                failure.unwrap_or_else(|| "下载失败".into())
+            )
+        })?;
+        if !matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+            response.fetched_url = url.to_string();
+            return Ok(response);
+        }
+        if redirects == MAX_REDIRECTS {
+            return Err("下载地址重定向次数超过上限".into());
+        }
+        let location = response
+            .header("location")
+            .ok_or("下载重定向缺少 Location")?;
+        let next = url.join(location).map_err(|_| "下载重定向地址无效")?;
+        let next = valid_url(next.as_str())?;
+        if !next.username().is_empty() || next.password().is_some() {
+            return Err("下载重定向不能引入认证信息".into());
+        }
+        if url.scheme() == "https" && next.scheme() != "https" {
+            return Err("HTTPS 来源不能重定向到明文 HTTP".into());
+        }
+        if url.origin() != next.origin() {
+            headers.retain(|k, _| {
+                !k.eq_ignore_ascii_case("authorization") && !k.eq_ignore_ascii_case("cookie")
+            });
+        }
+        url = next;
     }
+    Err("下载重定向次数超过上限".into())
 }
-
-fn resolve(base: &Url, location: &str) -> Result<Url, String> {
-    let location = location.trim();
-    if location.contains("://") {
-        return parse_url(location);
-    }
-    let scheme = base.scheme.clone();
-    if let Some(rest) = location.strip_prefix("//") {
-        return parse_url(&format!("{scheme}://{rest}"));
-    }
-    let path = if location.starts_with('/') {
-        location.to_owned()
+fn direct(host: &str, port: u16, attempt: usize) -> io::Result<TcpStream> {
+    let ips = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![ip]
     } else {
-        let directory = base.path.rsplit_once('/').map_or("/", |(directory, _)| directory);
-        format!("{directory}/{location}")
+        crate::dns::resolve(host)?
     };
-    Ok(Url {
-        scheme,
-        host: base.host.clone(),
-        port: base.port,
-        path,
-    })
-}
-
-fn once(url: &Url, user_agent: &str, max_bytes: usize) -> Result<Response, String> {
-    let stream = crate::proxy::dial(&url.host, url.port)
-        .map_err(|error| format!("连接订阅服务器失败：{error}"))?;
-    stream
-        .set_read_timeout(Some(TIMEOUT))
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(Some(TIMEOUT))
-        .map_err(|error| error.to_string())?;
-
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
-        url.path,
-        host_header(url),
-        user_agent,
-    );
-    if url.scheme == "https" {
-        let server_name = ServerName::try_from(url.host.clone())
-            .map_err(|_| format!("订阅地址主机名无效：{}", url.host))?;
-        let connection = ClientConnection::new(tls_config().clone(), server_name)
-            .map_err(|error| format!("TLS 初始化失败：{error}"))?;
-        let mut stream = StreamOwned::new(connection, stream);
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|error| format!("发送订阅请求失败：{error}"))?;
-        stream.flush().map_err(|error| error.to_string())?;
-        read_response(&mut stream, max_bytes)
-    } else {
-        let mut stream = stream;
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|error| format!("发送订阅请求失败：{error}"))?;
-        stream.flush().map_err(|error| error.to_string())?;
-        read_response(&mut stream, max_bytes)
+    if ips.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "下载主机没有可用地址",
+        ));
     }
-}
-
-fn host_header(url: &Url) -> String {
-    let default = if url.scheme == "https" { 443 } else { 80 };
-    if url.port == default {
-        if url.host.contains(':') {
-            format!("[{}]", url.host)
-        } else {
-            url.host.clone()
+    let mut error = io::Error::new(io::ErrorKind::NotConnected, "下载连接不可用");
+    for index in 0..ips.len().min(8) {
+        let ip = ips[(index + attempt) % ips.len()];
+        match crate::proxy::dial(&ip.to_string(), port) {
+            Ok(socket) => return Ok(socket),
+            Err(e) => error = e,
         }
-    } else if url.host.contains(':') {
-        format!("[{}]:{}", url.host, url.port)
-    } else {
-        format!("{}:{}", url.host, url.port)
+    }
+    Err(error)
+}
+fn connect(
+    route: &DownloadRoute,
+    host: &str,
+    port: u16,
+    attempt: usize,
+) -> io::Result<(TcpStream, Option<String>)> {
+    match route {
+        DownloadRoute::Direct => {
+            direct(host, port, attempt).map(|socket| (socket, Some("direct".into())))
+        }
+        DownloadRoute::Routing => {
+            let decision = crate::config::decide_connection(host, port, None, "tcp");
+            let socket = if matches!(decision.target, crate::config::Target::Direct) {
+                direct(host, port, attempt)
+            } else {
+                crate::proxy::connect(&decision, host, port)
+            }?;
+            Ok((socket, Some(decision.outbound)))
+        }
+        DownloadRoute::Outbound(name) => crate::config::connect_outbound(name, host, port)
+            .map(|socket| (socket, Some(name.clone()))),
     }
 }
 
-fn tls_config() -> &'static Arc<ClientConfig> {
+fn once(
+    url: &url::Url,
+    user_agent: &str,
+    max_bytes: usize,
+    route: &DownloadRoute,
+    headers: &BTreeMap<String, String>,
+    attempt: usize,
+) -> Result<Response, Failure> {
+    let host = url.host_str().unwrap().trim_matches(['[', ']']);
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| Failure::invalid("下载端口无效"))?;
+    let (mut socket, download_outbound) =
+        connect(route, host, port, attempt).map_err(|e| Failure::io("连接下载服务器失败", e))?;
+    socket
+        .set_read_timeout(Some(TIMEOUT))
+        .map_err(|e| Failure::io("设置下载超时失败", e))?;
+    socket
+        .set_write_timeout(Some(TIMEOUT))
+        .map_err(|e| Failure::io("设置下载超时失败", e))?;
+    let mut target = url.path().to_string();
+    if target.is_empty() {
+        target.push('/')
+    }
+    if let Some(query) = url.query() {
+        target.push('?');
+        target.push_str(query)
+    }
+    let mut authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    if let Some(port) = url.port() {
+        authority.push_str(&format!(":{port}"))
+    }
+    let extra = headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect::<String>();
+    let request=format!("GET {target} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: {user_agent}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n{extra}\r\n");
+    if url.scheme() == "https" {
+        let name = ServerName::try_from(host.to_owned())
+            .map_err(|_| Failure::invalid("下载 TLS 主机名无效"))?;
+        let mut connection = ClientConnection::new(tls_config().clone(), name)
+            .map_err(|e| Failure::invalid(format!("下载 TLS 初始化失败：{e}")))?;
+        while connection.is_handshaking() {
+            connection
+                .complete_io(&mut socket)
+                .map_err(|e| Failure::io("下载 TLS 握手失败", e))?;
+        }
+        let mut stream = StreamOwned::new(connection, socket);
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|e| Failure::io("发送下载请求失败", e))?;
+        stream
+            .flush()
+            .map_err(|e| Failure::io("发送下载请求失败", e))?;
+        let mut response = read_response(&mut stream, max_bytes)?;
+        response.download_outbound = download_outbound;
+        Ok(response)
+    } else {
+        socket
+            .write_all(request.as_bytes())
+            .map_err(|e| Failure::io("发送下载请求失败", e))?;
+        socket
+            .flush()
+            .map_err(|e| Failure::io("发送下载请求失败", e))?;
+        let mut response = read_response(&mut socket, max_bytes)?;
+        response.download_outbound = download_outbound;
+        Ok(response)
+    }
+}
+pub(crate) fn tls_config() -> &'static Arc<ClientConfig> {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     CONFIG.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let roots = RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
         };
-        Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        )
+        let mut config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Arc::new(config)
     })
 }
-
-fn read_response(stream: &mut dyn Read, max_bytes: usize) -> Result<Response, String> {
-    let mut head = Vec::with_capacity(1024);
-    let mut byte = [0u8; 1];
-    while head.len() < MAX_HEADER_BYTES {
-        if stream.read(&mut byte).map_err(|error| format!("读取订阅响应失败：{error}"))? == 0 {
-            return Err("订阅服务器在响应头结束前关闭了连接".to_owned());
+fn line(stream: &mut dyn Read, limit: usize) -> Result<Vec<u8>, Failure> {
+    let mut line = Vec::new();
+    let mut byte = [0];
+    while line.len() < limit {
+        match stream.read(&mut byte) {
+            Ok(0) => return Err(Failure::closed("读取下载响应失败")),
+            Ok(_) => line.push(byte[0]),
+            Err(e) => return Err(Failure::io("读取下载响应失败", e)),
         }
-        head.push(byte[0]);
-        if head.ends_with(b"\r\n\r\n") {
-            break;
-        }
-    }
-    if !head.ends_with(b"\r\n\r\n") {
-        return Err("订阅响应头超过大小上限".to_owned());
-    }
-    let text = String::from_utf8_lossy(&head).into_owned();
-    let mut lines = text.split("\r\n");
-    let status_line = lines.next().unwrap_or("");
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or_else(|| "订阅响应状态行无效".to_owned())?;
-    let mut headers = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
+        if line.ends_with(b"\r\n") {
+            return Ok(line);
         }
     }
-    let header = |name: &str| {
-        headers
-            .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str())
-    };
-
-    let chunked = header("transfer-encoding")
-        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
-    let body = if chunked {
-        read_chunked(stream, max_bytes)?
-    } else if let Some(length) = header("content-length").and_then(|value| value.parse::<usize>().ok()) {
-        if length > max_bytes {
-            return Err(format!("订阅内容超过 {max_bytes} 字节上限"));
-        }
-        let mut body = vec![0u8; length];
-        stream
-            .read_exact(&mut body)
-            .map_err(|error| format!("读取订阅内容失败：{error}"))?;
-        body
-    } else {
-        let mut body = Vec::new();
-        stream
-            .take(max_bytes as u64 + 1)
-            .read_to_end(&mut body)
-            .map_err(|error| format!("读取订阅内容失败：{error}"))?;
-        if body.len() > max_bytes {
-            return Err(format!("订阅内容超过 {max_bytes} 字节上限"));
-        }
-        body
-    };
-    Ok(Response {
-        status,
-        headers,
-        body,
-    })
+    Err(Failure::invalid("下载响应行超过上限"))
 }
-
-fn read_chunked(stream: &mut dyn Read, max_bytes: usize) -> Result<Vec<u8>, String> {
+fn read_response(stream: &mut dyn Read, max_bytes: usize) -> Result<Response, Failure> {
+    for _ in 0..4 {
+        let status_line = line(stream, MAX_HEADER_BYTES)?;
+        let text = std::str::from_utf8(&status_line)
+            .map_err(|_| Failure::invalid("下载响应状态行无效"))?;
+        let mut status_parts = text.split_whitespace();
+        if !matches!(status_parts.next(), Some("HTTP/1.1" | "HTTP/1.0")) {
+            return Err(Failure::invalid("下载服务器未返回 HTTP/1.x"));
+        }
+        let status = status_parts
+            .next()
+            .and_then(|v| v.parse::<u16>().ok())
+            .filter(|s| (100..600).contains(s))
+            .ok_or_else(|| Failure::invalid("下载 HTTP 状态无效"))?;
+        let mut total = status_line.len();
+        let mut headers = Vec::new();
+        loop {
+            let bytes = line(stream, MAX_HEADER_BYTES)?;
+            total += bytes.len();
+            if total > MAX_HEADER_BYTES {
+                return Err(Failure::invalid("下载响应头超过上限"));
+            }
+            if bytes == b"\r\n" {
+                break;
+            }
+            let text =
+                std::str::from_utf8(&bytes).map_err(|_| Failure::invalid("下载响应头编码无效"))?;
+            let (name, value) = text
+                .trim_end_matches("\r\n")
+                .split_once(':')
+                .ok_or_else(|| Failure::invalid("下载响应头格式无效"))?;
+            if name.is_empty()
+                || name
+                    .bytes()
+                    .any(|b| !b.is_ascii_alphanumeric() && b != b'-')
+            {
+                return Err(Failure::invalid("下载响应头名称无效"));
+            }
+            headers.push((name.to_ascii_lowercase(), value.trim().to_owned()));
+        }
+        if status < 200 {
+            continue;
+        }
+        let header = |name: &'static str| {
+            headers
+                .iter()
+                .filter(move |(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        let lengths = header("content-length").collect::<Vec<_>>();
+        if lengths.len() > 1 {
+            return Err(Failure::invalid("下载响应包含重复长度"));
+        }
+        let length = lengths
+            .first()
+            .map(|v| {
+                v.parse::<usize>()
+                    .map_err(|_| Failure::invalid("下载内容长度无效"))
+            })
+            .transpose()?;
+        let encodings = header("transfer-encoding").collect::<Vec<_>>();
+        if encodings.len() > 1 {
+            return Err(Failure::invalid("下载传输编码重复"));
+        }
+        let chunked = encodings
+            .first()
+            .is_some_and(|v| v.eq_ignore_ascii_case("chunked"));
+        if !encodings.is_empty() && !chunked {
+            return Err(Failure::invalid("下载传输编码不受支持"));
+        }
+        if chunked && length.is_some() {
+            return Err(Failure::invalid("下载响应长度与分块编码冲突"));
+        }
+        if header("content-encoding").any(|v| !v.eq_ignore_ascii_case("identity")) {
+            return Err(Failure::invalid("服务器返回了未请求的压缩下载内容"));
+        }
+        let body = if matches!(status, 204 | 304) {
+            Vec::new()
+        } else if chunked {
+            read_chunked(stream, max_bytes)?
+        } else if let Some(length) = length {
+            if length > max_bytes {
+                return Err(Failure::invalid(format!(
+                    "下载内容超过 {max_bytes} 字节上限"
+                )));
+            }
+            let mut body = vec![0; length];
+            stream
+                .read_exact(&mut body)
+                .map_err(|e| Failure::io("下载内容不完整", e))?;
+            body
+        } else {
+            let mut body = Vec::new();
+            stream
+                .take(max_bytes as u64 + 1)
+                .read_to_end(&mut body)
+                .map_err(|e| Failure::io("下载内容不完整", e))?;
+            if body.len() > max_bytes {
+                return Err(Failure::invalid(format!(
+                    "下载内容超过 {max_bytes} 字节上限"
+                )));
+            }
+            body
+        };
+        return Ok(Response {
+            status,
+            headers,
+            body,
+            download_outbound: None,
+            fetched_url: String::new(),
+        });
+    }
+    Err(Failure::invalid("下载服务器返回过多临时响应"))
+}
+fn read_chunked(stream: &mut dyn Read, max_bytes: usize) -> Result<Vec<u8>, Failure> {
     let mut body = Vec::new();
     loop {
-        let line = read_line(stream)?;
-        let size_text = line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_text, 16)
-            .map_err(|_| "订阅响应的分块长度无效".to_owned())?;
+        let bytes = line(stream, 1024)?;
+        let text =
+            std::str::from_utf8(&bytes).map_err(|_| Failure::invalid("下载分块长度编码无效"))?;
+        let size = usize::from_str_radix(text.trim().split(';').next().unwrap_or(""), 16)
+            .map_err(|_| Failure::invalid("下载分块长度无效"))?;
         if size == 0 {
-            // Trailing headers, ended by an empty line.
+            let mut trailers = 0;
             loop {
-                if read_line(stream)?.is_empty() {
-                    break;
+                let bytes = line(stream, MAX_HEADER_BYTES)?;
+                trailers += bytes.len();
+                if trailers > MAX_HEADER_BYTES {
+                    return Err(Failure::invalid("下载尾部响应头超过上限"));
+                }
+                if bytes == b"\r\n" {
+                    return Ok(body);
                 }
             }
-            break;
         }
-        if body.len() + size > max_bytes {
-            return Err(format!("订阅内容超过 {max_bytes} 字节上限"));
+        if size > max_bytes.saturating_sub(body.len()) {
+            return Err(Failure::invalid(format!(
+                "下载内容超过 {max_bytes} 字节上限"
+            )));
         }
-        let mut chunk = vec![0u8; size];
+        let at = body.len();
+        body.resize(at + size, 0);
         stream
-            .read_exact(&mut chunk)
-            .map_err(|error| format!("读取订阅内容失败：{error}"))?;
-        body.extend_from_slice(&chunk);
-        let _ = read_line(stream)?;
-    }
-    Ok(body)
-}
-
-fn read_line(stream: &mut dyn Read) -> Result<String, String> {
-    let mut line = Vec::new();
-    let mut byte = [0u8; 1];
-    while line.len() < 1024 {
-        if stream.read(&mut byte).map_err(|error| error.to_string())? == 0 {
-            break;
-        }
-        if byte[0] == b'\n' {
-            break;
-        }
-        if byte[0] != b'\r' {
-            line.push(byte[0]);
+            .read_exact(&mut body[at..])
+            .map_err(|e| Failure::io("下载分块内容不完整", e))?;
+        let mut end = [0; 2];
+        stream
+            .read_exact(&mut end)
+            .map_err(|e| Failure::io("下载分块内容不完整", e))?;
+        if end != *b"\r\n" {
+            return Err(Failure::invalid("下载分块结束标记无效"));
         }
     }
-    Ok(String::from_utf8_lossy(&line).into_owned())
 }
 
 /// The `subscription-userinfo` values some providers send, in bytes and Unix
@@ -328,7 +546,9 @@ pub fn user_info(response: &Response) -> Option<UserInfo> {
         expire: None,
     };
     for pair in value.split(';') {
-        let Some((key, value)) = pair.split_once('=') else { continue };
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
         let number = value.trim().parse::<u64>().ok().filter(|value| *value > 0);
         match key.trim() {
             "upload" => info.upload = number,

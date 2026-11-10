@@ -12,7 +12,22 @@ use crate::logs;
 use crate::proxy;
 use crate::state;
 
-pub fn handle(mut client: TcpStream) -> io::Result<()> {
+pub fn handle(client: TcpStream) -> io::Result<()> {
+    handle_inner(client, false, None, None)
+}
+pub(crate) fn handle_lan(
+    client: TcpStream,
+    auth: Option<&crate::lan::Credentials>,
+    stop: &std::sync::atomic::AtomicBool,
+) -> io::Result<()> {
+    handle_inner(client, true, auth, Some(stop))
+}
+fn handle_inner(
+    mut client: TcpStream,
+    lan: bool,
+    auth: Option<&crate::lan::Credentials>,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> io::Result<()> {
     let headers = proxy::read_headers(&mut client)?;
     let text = String::from_utf8_lossy(&headers).into_owned();
     let request_line = text.split("\r\n").next().unwrap_or("").to_string();
@@ -26,7 +41,35 @@ pub fn handle(mut client: TcpStream) -> io::Result<()> {
         return respond(&mut client, 400, r#"{"error":"bad_request"}"#);
     }
 
-    if method == "GET" && path_of(&target) == "/health" {
+    if lan {
+        if target.starts_with('/')
+            || !(method.eq_ignore_ascii_case("CONNECT") || target.starts_with("http://"))
+        {
+            return respond(&mut client, 403, r#"{"error":"proxy_only"}"#);
+        }
+        if let Some(auth) = auth {
+            let accepted = header_value(&text, "Proxy-Authorization")
+                .and_then(|value| value.split_once(' '))
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Basic"))
+                .and_then(|(_, value)| crate::base64::decode(value))
+                .is_some_and(|value| {
+                    value
+                        .iter()
+                        .position(|byte| *byte == b':')
+                        .is_some_and(|index| auth.matches(&value[..index], &value[index + 1..]))
+                });
+            if !accepted {
+                return respond_with(
+                    &mut client,
+                    407,
+                    r#"{"error":"proxy_authentication_required"}"#,
+                    "Proxy-Authenticate: Basic realm=\"LemonVPN LAN\"\r\n",
+                );
+            }
+        }
+    }
+
+    if !lan && method == "GET" && path_of(&target) == "/health" {
         return respond(&mut client, 200, &health());
     }
 
@@ -44,7 +87,7 @@ pub fn handle(mut client: TcpStream) -> io::Result<()> {
 
     // The native API is this listener's own; only origin-form requests address
     // it, so an absolute URI for another host keeps going to that host.
-    if target.starts_with('/') {
+    if !lan && target.starts_with('/') {
         let path = path_of(&target);
         if is_api_path(path) {
             return api::handle(client, &method, &target, &text, &cors);
@@ -82,7 +125,7 @@ pub fn handle(mut client: TcpStream) -> io::Result<()> {
         }
         let flow =
             peer.map(|peer| flows::begin(peer, &host, port, domain, domain_source, &decision));
-        let upstream = match proxy::connect(&decision, &host, port) {
+        let upstream = match proxy::connect_inbound(&decision, &host, port, lan) {
             Ok(stream) => stream,
             Err(err) => {
                 if let Some(flow) = flow {
@@ -103,7 +146,7 @@ pub fn handle(mut client: TcpStream) -> io::Result<()> {
         );
         client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
         client.flush()?;
-        return proxy::tunnel(client, upstream, flow, &decision, (&host, port));
+        return proxy::tunnel(client, upstream, flow, &decision, (&host, port), stop);
     }
 
     let Some((host, port, path)) = split_absolute(&target) else {
@@ -120,7 +163,7 @@ pub fn handle(mut client: TcpStream) -> io::Result<()> {
         return respond(&mut client, 403, r#"{"error":"blocked_by_rule"}"#);
     }
     let flow = peer.map(|peer| flows::begin(peer, &host, port, domain, domain_source, &decision));
-    let upstream = match proxy::connect(&decision, &host, port) {
+    let upstream = match proxy::connect_inbound(&decision, &host, port, lan) {
         Ok(stream) => stream,
         Err(err) => {
             if let Some(flow) = flow {
@@ -143,7 +186,23 @@ pub fn handle(mut client: TcpStream) -> io::Result<()> {
     // Origin-form for the upstream; everything after the request line is
     // forwarded untouched, including the body still sitting in the socket.
     let rewritten = format!("{method} {path} {version}\r\n");
-    let rest = &headers[request_line.len() + 2..];
+    // Never forward LAN proxy credentials to the destination server.
+    let cleaned = text
+        .split("\r\n")
+        .skip(1)
+        .filter(|line| {
+            !line.split_once(':').is_some_and(|(name, _)| {
+                name.eq_ignore_ascii_case("Proxy-Authorization")
+                    || name.eq_ignore_ascii_case("Proxy-Connection")
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    let rest = if lan {
+        cleaned.as_bytes()
+    } else {
+        &headers[request_line.len() + 2..]
+    };
     let mut request = Vec::with_capacity(rewritten.len() + rest.len());
     request.extend_from_slice(rewritten.as_bytes());
     request.extend_from_slice(rest);
@@ -156,7 +215,7 @@ pub fn handle(mut client: TcpStream) -> io::Result<()> {
     // charge them here; a body still in the socket is counted by the tunnel.
     state::add_upload(request.len() as u64);
 
-    proxy::tunnel(client, upstream, flow, &decision, (&host, port))
+    proxy::tunnel(client, upstream, flow, &decision, (&host, port), stop)
 }
 
 /// A target is a domain only when it is not already an IP literal; the flow
@@ -264,6 +323,7 @@ pub(crate) fn respond_with(
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        407 => "Proxy Authentication Required",
         409 => "Conflict",
         422 => "Unprocessable Entity",
         502 => "Bad Gateway",

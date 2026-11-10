@@ -1692,7 +1692,7 @@ dependencies = [
 
 [[package]]
 name = "lemonvpn"
-version = "0.1.34"
+version = "0.1.40"
 dependencies = [
  "lemonvpn-engine-platform",
  "serde",
@@ -1707,6 +1707,7 @@ name = "lemonvpn-engine-platform"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

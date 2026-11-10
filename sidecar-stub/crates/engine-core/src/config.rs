@@ -75,6 +75,8 @@ pub enum Condition {
     DomainFull(String),
     DomainSuffix(String),
     DomainKeyword(String),
+    DomainPattern(crate::rules_runtime::Pattern),
+    RuleSet(crate::rules_runtime::SetRef),
     GeoSite(crate::geodata::DomainRef),
     GeoIp(crate::geodata::IpRef),
     SourceGeoIp(crate::geodata::IpRef),
@@ -148,7 +150,7 @@ fn condition_matches(condition: &Condition, host: &str) -> bool {
     condition_matches_input(condition, &RoutingInput::new(host, "tcp"))
 }
 
-fn condition_matches_input(condition: &Condition, input: &RoutingInput<'_>) -> bool {
+pub(crate) fn condition_matches_input(condition: &Condition, input: &RoutingInput<'_>) -> bool {
     let host = input.host;
     match condition {
         Condition::DomainFull(value) => host == value,
@@ -159,6 +161,8 @@ fn condition_matches_input(condition: &Condition, input: &RoutingInput<'_>) -> b
                     .is_some_and(|prefix| prefix.ends_with('.'))
         }
         Condition::DomainKeyword(value) => host.contains(value),
+        Condition::DomainPattern(pattern) => pattern.matches(host),
+        Condition::RuleSet(set) => set.set.matches(input),
         Condition::GeoSite(set) => host.parse::<IpAddr>().is_err() && set.matches(host),
         Condition::GeoIp(set) => input
             .destination_ip
@@ -202,8 +206,9 @@ fn condition_matches_input(condition: &Condition, input: &RoutingInput<'_>) -> b
     }
 }
 
-fn condition_known(condition: &Condition, input: &RoutingInput<'_>) -> bool {
+pub(crate) fn condition_known(condition: &Condition, input: &RoutingInput<'_>) -> bool {
     match condition {
+        Condition::RuleSet(set) => set.set.known(input),
         Condition::Process(_) => input.process.is_some(),
         Condition::GeoIp(_) | Condition::IpCidr(..) => {
             input.destination_ip.is_some() || !input.answer_ips.is_empty()
@@ -330,6 +335,7 @@ pub struct Config {
     pub sha256: String,
     pub generation: String,
     pub revision: String,
+    pub resource_revision: String,
     pub rules: Vec<Rule>,
     pub fallback: Rule,
     pub nodes: Vec<Node>,
@@ -430,6 +436,7 @@ pub(crate) fn set_data_dir(directory: Option<PathBuf>) -> std::io::Result<()> {
 /// Loads the source file, creating the default one when it does not exist yet.
 /// Called once before the listener starts serving.
 pub fn start() {
+    crate::rules_runtime::recover_sources();
     let path = config_path();
     let content = match fs::read_to_string(&path) {
         Ok(content) => content,
@@ -473,6 +480,8 @@ fn publish(config: &mut Config, mut next: Config) {
                 .zip(right)
                 .all(|(a, b)| a.condition == b.condition && a.upstream == b.upstream)
     };
+    let routing_changed = config.nodes != next.nodes || config.groups != next.groups || !rules_equal(&config.rules,&next.rules) || config.fallback.outbound!=next.fallback.outbound;
+    let changed_nodes=config.nodes.iter().filter(|old| !next.nodes.iter().any(|n|n==*old)).map(|n|format!("node-{}",n.name)).collect::<std::collections::HashSet<_>>();
     let changed = config.nodes != next.nodes
         || config.groups != next.groups
         || config.upstreams != next.upstreams
@@ -481,7 +490,8 @@ fn publish(config: &mut Config, mut next: Config) {
         || !dns_equal(&config.dns_rules, &next.dns_rules)
         || !dns_equal(&config.dns_response_rules, &next.dns_response_rules)
         || config.dns_request_fallback != next.dns_request_fallback
-        || config.dns_response_fallback != next.dns_response_fallback;
+        || config.dns_response_fallback != next.dns_response_fallback
+        || config.resource_revision != next.resource_revision;
     next.include_stamps = include_stamps(&next.include_contents);
     for group in &config.groups {
         if !next.groups.iter().any(|item| item.name == group.name) {
@@ -490,7 +500,13 @@ fn publish(config: &mut Config, mut next: Config) {
     }
     *config = next;
     if changed {
-        let count = crate::connections::configuration_changed();
+        let count = if routing_changed {crate::connections::configuration_changed_selective(|entry| {
+            let Some(previous)=&entry.route else{return false};
+            if previous.chain.iter().any(|id|changed_nodes.contains(id)){return false}
+            let mut input=RoutingInput::new(&entry.host,entry.network);input.destination_port=Some(entry.port);input.source_ip=entry.source.map(|s|s.ip());input.source_port=entry.source.map(|s|s.port());input.process=previous.process.as_ref();
+            let decision=decide_input(config,input,false);
+            !decision.blocked() && decision.outbound==previous.outbound && decision.selection_path()==previous.chain
+        })}else{0};
         crate::dns::flush();
         crate::compat::queue_hot_apply();
         logs::info(
@@ -656,6 +672,7 @@ pub(crate) fn dns_route_for(host: &str, kind: Option<&str>) -> Option<(String, S
         .iter()
         .find(|rule| condition_matches_input(&rule.condition, &input))
         .map(|rule| (rule.upstream.clone(), rule.expression.clone()))
+        .or_else(|| crate::rules_runtime::dns_route(&host, kind))
         .or_else(|| {
             config
                 .dns_request_fallback
@@ -684,10 +701,12 @@ pub(crate) fn dns_response_action(
         .unwrap_or_else(|| config.dns_response_fallback.clone())
 }
 
-pub(crate) fn process_names() -> Vec<String> {
+pub(crate) fn process_names() -> Vec<String> {process_names_for(&current())}
+fn process_names_for(config:&Config)->Vec<String>{
     fn collect(condition: &Condition, values: &mut Vec<String>) {
         match condition {
             Condition::Process(names) => values.extend(names.iter().cloned()),
+            Condition::RuleSet(set)=>values.extend(set.set.process_names()),
             Condition::Not(inner) => collect(inner, values),
             Condition::And(parts) | Condition::Any(parts) => {
                 for part in parts {
@@ -697,7 +716,6 @@ pub(crate) fn process_names() -> Vec<String> {
             _ => {}
         }
     }
-    let config = current();
     let mut names = Vec::new();
     for rule in &config.rules {
         if let Some(condition) = &rule.condition {
@@ -867,57 +885,30 @@ pub(crate) fn delete_managed_node(id: &str) -> Result<String, (u16, &'static str
 
 /// Keep the accepted configuration and both Geo assets on one rollback boundary.
 pub(crate) fn replace_geodata(assets: &[(String, Vec<u8>)]) -> Result<String, String> {
-    let mut config = current();
-    let previous = assets
-        .iter()
-        .map(|(kind, _)| {
-            let path = data_dir().join(format!("{kind}.dat"));
-            let bytes = fs::read(&path).ok();
-            (path, bytes)
-        })
-        .collect::<Vec<_>>();
-    let result = (|| {
-        for ((_, bytes), (path, _)) in assets.iter().zip(&previous) {
-            crate::storage::write_atomic(path, bytes).map_err(|error| error.to_string())?;
-        }
-        let next = build(config.content.clone(), config.modified);
-        let errors = next
-            .diagnostics
-            .iter()
-            .filter(|row| row.level == "error")
-            .map(|row| row.message.clone())
-            .collect::<Vec<_>>();
-        if !errors.is_empty() {
-            return Err(errors.join("；"));
-        }
-        Ok(next)
+    let _serial=crate::rules_runtime::APPLY.lock().unwrap_or_else(|p|p.into_inner());
+    let before=crate::rules_runtime::current();
+    let old_dns=crate::dns_settings::effective()?;
+    let previous=assets.iter().map(|(kind,_)|{
+        let path=data_dir().join(format!("{kind}.dat"));
+        let bytes=match fs::read(&path) {Ok(bytes)=>Some(bytes),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>None,Err(e)=>return Err(format!("无法备份旧地理数据：{e}"))};
+        Ok((path,bytes))
+    }).collect::<Result<Vec<_>,String>>()?;
+    let result=(||{
+        for((_,bytes),(path,_))in assets.iter().zip(&previous){crate::storage::write_atomic(path,bytes).map_err(|e|e.to_string())?;}
+        crate::geodata::invalidate();
+        let snapshot=std::sync::Arc::new(crate::rules_runtime::compile(before.document.clone())?);
+        apply_resources_impl(snapshot, &std::collections::HashMap::new(), None, true)
     })();
-    match result {
-        Ok(next) => {
-            let old = config.generation.clone();
-            let generation = next.generation.clone();
-            publish(&mut config, next);
-            drop(config);
-            crate::events::generation_changed(&old, &generation);
-            Ok(generation)
+    if let Err(mut message)=result{
+        for(path,bytes)in previous{
+            let restored=if let Some(bytes)=bytes{crate::storage::write_atomic(&path,&bytes)}else{match fs::remove_file(&path){Err(e)if e.kind()==std::io::ErrorKind::NotFound=>Ok(()),other=>other}};
+            if let Err(e)=restored{message.push_str(&format!("；恢复地理数据失败：{e}"));}
         }
-        Err(mut message) => {
-            for (path, bytes) in previous {
-                let result = if let Some(bytes) = bytes {
-                    crate::storage::write_atomic(&path, &bytes)
-                } else {
-                    match fs::remove_file(&path) {
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                        other => other,
-                    }
-                };
-                if let Err(error) = result {
-                    message.push_str(&format!("；恢复 {} 失败：{error}", path.display()));
-                }
-            }
-            Err(message)
-        }
+        crate::geodata::invalidate();
+        if let Err(e)=crate::compat::apply_dns_settings(&old_dns){message.push_str(&format!("；恢复 DNS 策略失败：{e}"));}
+        return Err(message)
     }
+    result
 }
 
 /// Every node name the merged configuration currently offers.
@@ -961,6 +952,7 @@ pub(crate) fn decide_connection_for(
     input.process = process.as_ref();
     fn needs_ip(condition: &Condition) -> bool {
         match condition {
+            Condition::RuleSet(set) => !set.set.domain_only,
             Condition::GeoIp(_) | Condition::IpCidr(..) => true,
             Condition::Not(part) => needs_ip(part),
             Condition::And(parts) | Condition::Any(parts) => parts.iter().any(needs_ip),
@@ -1044,6 +1036,7 @@ fn trace_condition(
         {
             Some("dst_ip")
         }
+        Condition::RuleSet(set) if !set.set.known(input) => Some("rule_context"),
         Condition::SourceIpCidr(..) | Condition::SourceGeoIp(_) if input.source_ip.is_none() => {
             Some("src_ip")
         }
@@ -1306,6 +1299,97 @@ pub fn outbound_seed() -> Vec<(String, &'static str)> {
     seed
 }
 
+/// Explicit infrastructure egress, without re-routing the resolver/provider
+/// server through the very DNS policy it is trying to establish.
+pub(crate) fn connect_outbound(name:&str,host:&str,port:u16)->std::io::Result<std::net::TcpStream>{
+    if name=="direct" {return crate::proxy::dial(host,port)}
+    let (target,_,_)=resolve_outbound_for(&current(),name,&mut Vec::new(),"tcp",false).ok_or_else(||std::io::Error::other(format!("出站 {name} 不存在或没有可用成员")))?;
+    match target {
+        Target::Direct=>crate::proxy::dial(host,port),
+        Target::Node(node)=>crate::outbound::connect(&node,host,port),
+        Target::Chain{nodes,..}=>crate::compat::connect_chain(&nodes,host,port),
+        Target::Block=>Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"基础设施请求不能使用阻断出站")),
+    }
+}
+pub(crate) fn infrastructure_decision(name:&str,network:&str)->std::io::Result<Decision>{
+    let config=current();let(target,chain,dependencies)=resolve_outbound_for(&config,name,&mut Vec::new(),network,false).ok_or_else(||std::io::Error::other("基础设施出站不可用"))?;
+    Ok(Decision{epoch:crate::connections::route_epoch_for(&dependencies,network),process:None,outbound:name.into(),chain,dependencies,target,rule_id:"infrastructure".into(),generation:config.generation.clone(),expression:format!("DNS via {name}")})
+}
+
+pub(crate) fn apply_resources(snapshot:std::sync::Arc<crate::rules_runtime::Snapshot>)->Result<String,String>{
+    apply_resources_with_sources(snapshot,&std::collections::HashMap::new())
+}
+pub(crate) fn apply_resources_with_sources(snapshot:std::sync::Arc<crate::rules_runtime::Snapshot>,sources:&std::collections::HashMap<String,String>)->Result<String,String>{apply_resources_checked(snapshot,sources,None)}
+pub(crate) fn apply_resources_checked(snapshot:std::sync::Arc<crate::rules_runtime::Snapshot>,sources:&std::collections::HashMap<String,String>,expected:Option<&str>)->Result<String,String>{
+    apply_resources_impl(snapshot, sources, expected, false)
+}
+fn apply_resources_impl(snapshot:std::sync::Arc<crate::rules_runtime::Snapshot>,sources:&std::collections::HashMap<String,String>,expected:Option<&str>,force:bool)->Result<String,String>{
+    let mut config=current();
+    if expected.is_some_and(|g|g!=config.generation){return Err("配置已被其他写入修改，请重新加载".into())}
+    if !force&&sources.is_empty()&&snapshot.signature==crate::rules_runtime::current().signature{crate::rules_runtime::persist(&snapshot)?;crate::rules_runtime::install(snapshot);return Ok(config.generation.clone())}
+    let main=sources.get(SOURCE_PATH).cloned().unwrap_or_else(||config.content.clone());
+    let names=parse(&main).nodes.into_iter().map(|n|n.name).collect::<Vec<_>>();
+    let next=crate::rules_runtime::with_candidate(snapshot.clone(),||build_with_sources(main,None,&crate::providers::nodes(&names),sources));
+    let errors:Vec<_>=next.diagnostics.iter().filter(|d|d.level=="error").map(|d|d.message.clone()).collect();
+    if !errors.is_empty(){return Err(errors.join("；"))}
+    let allowed=|name:&str|name=="direct"||next.nodes.iter().any(|n|n.name==name)||next.groups.iter().any(|g|g.name==name);
+    for resolver in &snapshot.document.resolvers{if !allowed(&resolver.outbound){return Err(format!("上游 {} 引用的出站不存在",resolver.name))}}
+    for provider in &snapshot.document.providers{if !allowed(&provider.outbound){return Err(format!("规则集 {} 的下载出站不存在",provider.name))}}
+    let mut originals=Vec::new();
+    for name in sources.keys(){
+        if !source_name_valid(name)||!(name==SOURCE_PATH||config.include_contents.iter().any(|(n,_)|n==name)){return Err("不能修改未知配置源".into())}
+        let text=fs::read_to_string(data_dir().join(name)).map_err(|e|e.to_string())?;originals.push((name.clone(),text));
+    }
+    let old_processes=process_names_for(&config);let next_processes=process_names_for(&next);
+    let old_dns=crate::dns_settings::effective()?;let new_dns=crate::dns_settings::effective_for(&snapshot)?;
+    if !originals.is_empty(){crate::rules_runtime::source_journal(&snapshot.revision,&originals)?;}
+    let applied=(||{
+        for(name,content)in sources{crate::storage::write_atomic(&data_dir().join(name),content.as_bytes()).map_err(|e|e.to_string())?;}
+        if old_processes!=next_processes{crate::compat::apply_process_names(next_processes.clone()).map_err(|e|e.to_string())?;}
+        crate::compat::apply_dns_settings(&new_dns).map_err(|e|e.to_string())?;
+        crate::compat::flush_tun_dns().map_err(|e|e.to_string())?;
+        crate::rules_runtime::persist(&snapshot)
+    })();
+    if let Err(mut error)=applied{
+        if old_processes!=next_processes{if let Err(e)=crate::compat::apply_process_names(old_processes){error.push_str(&format!("；进程条件恢复失败：{e}"));}}
+        if let Err(rollback)=crate::compat::apply_dns_settings(&old_dns){error.push_str(&format!("；内核恢复失败：{rollback}"));}
+        let mut restored=true;for(name,content)in &originals{if let Err(e)=crate::storage::write_atomic(&data_dir().join(name),content.as_bytes()){restored=false;error.push_str(&format!("；源文件恢复失败：{e}"));}}
+        if restored{crate::rules_runtime::finish_source_journal();}return Err(error);
+    }
+    let previous=config.generation.clone();let generation=next.generation.clone();
+    crate::rules_runtime::install(snapshot);publish(&mut config,next);drop(config);
+    crate::rules_runtime::finish_source_journal();crate::events::generation_changed(&previous,&generation);Ok(generation)
+}
+pub(crate) fn refers_to(condition:&Condition,id:&str)->bool{match condition{Condition::RuleSet(set)=>set.id==id,Condition::Not(c)=>refers_to(c,id),Condition::And(parts)|Condition::Any(parts)=>parts.iter().any(|p|refers_to(p,id)),_=>false}}
+pub(crate) fn resource_references(kind:&str,id:&str)->Vec<serde_json::Value>{
+    let config=current();let mut rows=Vec::new();
+    if kind=="provider"{for rule in config.rules.iter().filter(|r|r.line>0&&r.condition.as_ref().is_some_and(|c|refers_to(c,id))){rows.push(serde_json::json!({"scope":"source-routing","source_id":rule.source_id,"line":rule.line,"expression":rule.expression}));}}
+    for rule in config.dns_rules.iter().chain(&config.dns_response_rules){if kind=="pool"&&rule.upstream==id||kind=="provider"&&refers_to(&rule.condition,id){rows.push(serde_json::json!({"scope":"source-dns","source_id":rule.source_id,"line":rule.line,"expression":rule.expression}));}}
+    if kind=="pool"&&config.dns_request_fallback.as_deref()==Some(id){rows.push(serde_json::json!({"scope":"source-dns-fallback"}));}rows
+}
+pub(crate) fn rewrite_set_condition(expression:&str,id:&str,replacement:&str)->Result<String,String>{
+    let pattern=format!(r#"(?P<lead>\bruleset\s*(?:\(\s*|:\s*)['"]?){}(?P<tail>['"]?\s*(?:\)|,))"#,regex::escape(id));
+    let regex=regex::Regex::new(&pattern).map_err(|e|e.to_string())?;
+    Ok(regex.replace_all(expression,format!("${{lead}}{replacement}${{tail}}")).into_owned())
+}
+pub(crate) fn rewrite_resource_sources(kind:&str,id:&str,replacement:Option<&str>)->Result<std::collections::HashMap<String,String>,String>{rewrite_resource_sources_from(kind,id,replacement,&std::collections::HashMap::new())}
+pub(crate) fn rewrite_resource_sources_from(kind:&str,id:&str,replacement:Option<&str>,prior:&std::collections::HashMap<String,String>)->Result<std::collections::HashMap<String,String>,String>{
+    let config=current();let mut originals=vec![(SOURCE_PATH.to_string(),config.content.clone())];originals.extend(config.include_contents.clone());let mut changes=prior.clone();
+    for(name,original)in originals{let text=prior.get(&name).cloned().unwrap_or(original);
+        let parsed=parse(&text);let mut lines=std::collections::HashSet::new();
+        if kind=="provider"{for rule in &parsed.rules{if rule.condition.as_ref().is_some_and(|c|refers_to(c,id)){lines.insert(rule.line);}}}
+        for rule in parsed.dns_rules.iter().chain(&parsed.dns_response_rules){if kind=="pool"&&rule.upstream==id||kind=="provider"&&refers_to(&rule.condition,id){lines.insert(rule.line);}}
+        if kind=="pool"&&parsed.dns_request_fallback.as_deref()==Some(id){if let Some((line,_))=parsed.dns_request_fallback_source{lines.insert(line);}}
+        if lines.is_empty(){continue}
+        let mut updated=Vec::new();for(index,line)in text.lines().enumerate(){
+            if !lines.contains(&(index as u32+1)){updated.push(line.to_string());continue}
+            let Some(replacement)=replacement else{updated.push(format!("# Removed resource reference: {line}"));continue};
+            if kind=="provider"{updated.push(rewrite_set_condition(line,id,replacement)?);}else if let Some((left,_))=line.split_once("->"){updated.push(format!("{left}-> '{replacement}'"));}else{let indent=line.len()-line.trim_start().len();updated.push(format!("{}fallback: '{replacement}'",&line[..indent]));}
+        }
+        changes.insert(name,updated.join("\n")+"\n");
+    }Ok(changes)
+}
+
 /// Replaces the main source. The caller has already checked the revision; the
 /// new text is parsed and becomes the accepted snapshot immediately.
 #[cfg(test)]
@@ -1342,6 +1426,7 @@ pub(crate) fn replace_source(
     content: &str,
     expected: Option<&str>,
 ) -> Result<(), SourceWriteError> {
+    let _serial=crate::rules_runtime::APPLY.lock().unwrap_or_else(|p|p.into_inner());
     if content.len() > MAX_BYTES {
         return Err(write_error(413, "request_too_large", "配置超过 max_bytes"));
     }
@@ -1355,7 +1440,7 @@ pub(crate) fn replace_source(
         return Err(write_error(404, "resource_not_found", "无效配置源"));
     }
     let path = data_dir().join(&name);
-    let mut config = current();
+    let config = current();
     let previous = fs::read_to_string(&path)
         .map_err(|error| write_error(404, "resource_not_found", error.to_string()))?;
     if expected.is_some_and(|expected| sha256::hex(previous.as_bytes()) != expected) {
@@ -1363,7 +1448,7 @@ pub(crate) fn replace_source(
     }
     let mut overlay = std::collections::HashMap::new();
     if !main {
-        overlay.insert(name, content.to_owned());
+        overlay.insert(name.clone(), content.to_owned());
     }
     let main_content = if main {
         content.to_owned()
@@ -1372,7 +1457,7 @@ pub(crate) fn replace_source(
     };
     let parsed = parse(&main_content);
     let names: Vec<_> = parsed.nodes.iter().map(|node| node.name.clone()).collect();
-    let mut next = build_with_sources(
+    let next = build_with_sources(
         main_content,
         None,
         &crate::providers::nodes(&names),
@@ -1398,21 +1483,9 @@ pub(crate) fn replace_source(
             .join("；");
         return Err(write_error(422, "invalid_config", errors));
     }
-    crate::storage::write_atomic(&path, content.as_bytes())
-        .map_err(|error| write_error(500, "internal_error", format!("写入配置失败：{error}")))?;
-    next.modified = fs::metadata(config_path())
-        .ok()
-        .and_then(|meta| meta.modified().ok());
-    let previous_generation = config.generation.clone();
-    let generation = next.generation.clone();
-    publish(&mut config, next);
-    drop(config);
-    crate::events::generation_changed(&previous_generation, &generation);
-    logs::info(
-        "engine::config",
-        "Configuration source replaced.",
-        Some(logs::fields(&[("generation", &generation)])),
-    );
+    let generation=config.generation.clone();drop(config);
+    let changes=std::collections::HashMap::from([(name,content.to_string())]);
+    apply_resources_checked(crate::rules_runtime::current(),&changes,Some(&generation)).map_err(|e|write_error(422,"config_hot_apply_failed",e))?;
     Ok(())
 }
 
@@ -1523,7 +1596,7 @@ pub fn rules_json() -> String {
     refresh();
     let config = current();
     let mut entries = Vec::with_capacity(config.rules.len() + 1);
-    for rule in config.rules.iter().chain(std::iter::once(&config.fallback)) {
+    for rule in config.rules.iter().filter(|r|r.line>0).chain(std::iter::once(&config.fallback)) {
         let source = source_json(rule.line, rule.source_id.as_deref());
         let kind = if rule.condition.is_some() {
             "rule"
@@ -1628,10 +1701,11 @@ fn node_entry(node: &Node, groups: &[&Group]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        r#"{{"id":"node-{}","name":"{}","protocol":"{}","stream_transport":"tcp","subscription_tag":{},"provider_id":{},"group_ids":[{}],"health":{}}}"#,
+        r#"{{"id":"node-{}","name":"{}","protocol":"{}","stream_transport":"{}","subscription_tag":{},"provider_id":{},"group_ids":[{}],"health":{}}}"#,
         json::escape(&node.name),
         json::escape(&node.name),
         json::escape(&node.protocol),
+        json::escape(&crate::compat::stream_transport(node)),
         optional(&node.subscription_tag),
         optional(&node.provider),
         group_ids,
@@ -1908,7 +1982,16 @@ fn build_with_sources(
     let sha256 = sha256::hex(content.as_bytes());
     let mut parsed = parse(&content);
     merge_includes(&mut parsed, sources);
+    let resources = crate::rules_runtime::current();
+    for (binding, condition) in &resources.bindings {
+        parsed.rules.push(RawRule {source_id: None, expression: format!("{} -> {}", binding.condition, binding.outbound), outbound: binding.outbound.clone(), condition: Some(condition.clone()), line: 0});
+    }
+    for pool in &resources.document.pools {
+        if parsed.upstreams.iter().any(|p|p.name==pool.id) { parsed.diagnostics.push(diagnostic(0,"dns_pool_collision",format!("解析池 ID {} 与旧上游名称冲突",pool.id))); }
+        parsed.upstreams.push(Upstream{name:pool.id.clone(),protocol:"pool",host:pool.id.clone(),port:0});
+    }
     let mut generation_seed = sha256.clone();
+    generation_seed.push_str(&resources.signature);
     let mut include_contents = Vec::new();
     for name in &parsed.includes {
         let text = sources
@@ -1934,6 +2017,7 @@ fn build_with_sources(
     fn processes(condition: &Condition, names: &mut Vec<String>) {
         match condition {
             Condition::Process(values) => names.extend(values.iter().cloned()),
+            Condition::RuleSet(set)=>names.extend(set.set.process_names()),
             Condition::Not(inner) => processes(inner, names),
             Condition::Any(parts) | Condition::And(parts) => {
                 for part in parts {
@@ -2112,7 +2196,11 @@ fn build_with_sources(
             }
         }
     }
+    for (name,outbound) in resources.document.resolvers.iter().map(|r|(&r.name,&r.outbound)).chain(resources.document.providers.iter().map(|p|(&p.name,&p.outbound))){
+        if outbound!="direct"&&!parsed.nodes.iter().any(|n|&n.name==outbound)&&!groups.iter().any(|g|&g.name==outbound){parsed.diagnostics.push(diagnostic(0,"resource_outbound",format!("资源 {name} 引用的出站 {outbound} 不存在或不适用于基础设施连接")));}
+    }
     Config {
+        resource_revision: resources.signature.clone(),
         generation: format!("generation-{}", &effective_sha[..16]),
         revision: sha256.clone(),
         sha256,
@@ -2554,7 +2642,7 @@ fn merge_includes(parsed: &mut Parsed, sources: &std::collections::HashMap<Strin
     }
 }
 
-fn routing_condition_supported(condition: &Condition) -> bool {
+pub(crate) fn routing_condition_supported(condition: &Condition) -> bool {
     match condition {
         Condition::QueryType(_) | Condition::Upstream(_) => false,
         Condition::Not(inner) => routing_condition_supported(inner),
@@ -2565,8 +2653,10 @@ fn routing_condition_supported(condition: &Condition) -> bool {
     }
 }
 
-fn dns_condition_supported(condition: &Condition, response: bool) -> bool {
+pub(crate) fn dns_condition_supported(condition: &Condition, response: bool) -> bool {
     match condition {
+        Condition::DomainPattern(_) => true,
+        Condition::RuleSet(set) => set.set.dns_supported(response),
         Condition::DomainFull(_)
         | Condition::DomainSuffix(_)
         | Condition::DomainKeyword(_)
@@ -2730,7 +2820,7 @@ fn outbound_name(text: &str) -> Option<String> {
     Some(text)
 }
 
-fn parse_condition(text: &str) -> Option<Condition> {
+pub(crate) fn parse_condition(text: &str) -> Option<Condition> {
     let text = text.trim();
     let any = crate::group_filter::split_top(text, "||").ok()?;
     if any.len() > 1 {
@@ -2762,6 +2852,13 @@ fn parse_condition(text: &str) -> Option<Condition> {
         return None;
     }
     match call {
+        "ruleset" => {
+            if arguments.len()!=1{return None;}
+            let id=unquote(arguments[0]);
+            let set=crate::rules_runtime::resolve_set(&id);
+            if set.is_none(){crate::geodata::set_error(format!("规则集 {id} 未启用或不存在"));}
+            set.map(Condition::RuleSet)
+        }
         "pname" | "upstream" => {
             let values: Vec<_> = arguments.into_iter().map(unquote).collect();
             if values.iter().any(|value| {
@@ -2863,6 +2960,8 @@ fn parse_condition(text: &str) -> Option<Condition> {
                         "full" => Some(Condition::DomainFull(value)),
                         "suffix" => Some(Condition::DomainSuffix(value)),
                         "keyword" => Some(Condition::DomainKeyword(value)),
+                        "regex" => crate::rules_runtime::Pattern::new(&value).ok().map(Condition::DomainPattern),
+                        "ruleset" => crate::rules_runtime::resolve_set(&value).map(Condition::RuleSet),
                         "geosite" => {
                             crate::geodata::DomainRef::load(&value).map(Condition::GeoSite)
                         }
@@ -3241,4 +3340,36 @@ mod tests {
         assert!(!valid);
         assert!(diagnostics.contains("group_policy"));
     }
+}
+
+pub(crate) fn condition_uses_geo(c:&Condition,kind:&str,id:&str)->bool{match c{Condition::GeoSite(g)if kind=="geosite"=>g.category(id),Condition::GeoIp(g)|Condition::SourceGeoIp(g)if kind=="geoip"=>g.category(id),Condition::RuleSet(set)=>set.set.uses_geo(kind,id),Condition::And(rows)|Condition::Any(rows)=>rows.iter().any(|c|condition_uses_geo(c,kind,id)),Condition::Not(c)=>condition_uses_geo(c,kind,id),_=>false}}
+pub(crate) fn geo_references(kind:&str,id:&str)->Vec<serde_json::Value>{let snapshot=crate::rules_runtime::current();let config=current();let mut refs=Vec::new();
+    for row in config.rules.iter().filter(|r|r.line>0&&r.condition.as_ref().is_some_and(|c|condition_uses_geo(c,kind,id))){refs.push(serde_json::json!({"name":row.expression,"scope":"routing"}));}
+    for row in config.dns_rules.iter().chain(&config.dns_response_rules).filter(|r|condition_uses_geo(&r.condition,kind,id)){refs.push(serde_json::json!({"name":row.expression,"scope":"source-dns"}));}
+    for(row,c)in &snapshot.policies{if condition_uses_geo(c,kind,id){refs.push(serde_json::json!({"name":row.name,"scope":"dns/fakeip"}));}}
+    for(row,c)in &snapshot.bindings{if condition_uses_geo(c,kind,id){refs.push(serde_json::json!({"name":row.name,"scope":"routing"}));}}refs}
+
+
+pub(crate) fn collect_geo_codes(condition: &Condition, codes: &mut std::collections::BTreeMap<String, std::collections::BTreeSet<String>>) {
+    let category = match condition {
+        Condition::GeoSite(g) => g.category_id().map(|id| ("geosite", id)),
+        Condition::GeoIp(g) | Condition::SourceGeoIp(g) => g.category_id().map(|id| ("geoip", id)),
+        Condition::RuleSet(set) => {set.set.collect_geo_codes(codes); None},
+        Condition::And(rows) | Condition::Any(rows) => {for row in rows {collect_geo_codes(row, codes);} None},
+        Condition::Not(row) => {collect_geo_codes(row, codes); None},
+        _ => None,
+    };
+    if let Some((kind, code)) = category {codes.entry(kind.into()).or_default().insert(code);}
+}
+pub(crate) fn required_geodata_codes() -> serde_json::Value {
+    let snapshot = crate::rules_runtime::current();
+    let config = current();
+    let mut codes = std::collections::BTreeMap::from([
+        ("geosite".to_string(), std::collections::BTreeSet::<String>::new()),
+        ("geoip".to_string(), std::collections::BTreeSet::<String>::new()),
+    ]);
+    for row in &config.rules {if let Some(condition) = &row.condition {collect_geo_codes(condition, &mut codes);}}
+    for row in config.dns_rules.iter().chain(&config.dns_response_rules) {collect_geo_codes(&row.condition, &mut codes);}
+    for condition in snapshot.policies.iter().map(|(_, c)| c).chain(snapshot.bindings.iter().map(|(_, c)| c)) {collect_geo_codes(condition, &mut codes);}
+    serde_json::to_value(codes).unwrap()
 }

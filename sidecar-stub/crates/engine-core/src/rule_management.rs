@@ -24,6 +24,7 @@ fn rows(config: &Config, list: &str) -> Vec<Listed> {
         config
             .rules
             .iter()
+            .filter(|rule|rule.line>0)
             .map(|rule| Listed {
                 id: rule.id.clone(),
                 path: rule
@@ -151,6 +152,7 @@ fn source_line(
         .ok_or_else(|| failure("规则位置已变更"))
 }
 pub(crate) fn manage_rules(body: &str, reset: bool) -> Result<String, SourceWriteError> {
+    let _serial=crate::rules_runtime::APPLY.lock().unwrap_or_else(|p|p.into_inner());
     let value: serde_json::Value = serde_json::from_str(body)
         .map_err(|_| write_error(400, "invalid_request", "请求不是 JSON"))?;
     let object = value
@@ -172,7 +174,7 @@ pub(crate) fn manage_rules(body: &str, reset: bool) -> Result<String, SourceWrit
         .and_then(|v| v.as_str())
         .ok_or_else(|| write_error(400, "invalid_request", "缺少配置代次"))?;
     refresh();
-    let mut config = current();
+    let config = current();
     if config.generation != generation {
         return Err(failure("规则或配置已变更，请刷新后重试"));
     }
@@ -320,7 +322,7 @@ pub(crate) fn manage_rules(body: &str, reset: bool) -> Result<String, SourceWrit
         .into_iter()
         .map(|node| node.name)
         .collect::<Vec<_>>();
-    let mut next = build_with_sources(
+    let next = build_with_sources(
         sources[0].1.clone(),
         None,
         &crate::providers::nodes(&inline_names),
@@ -380,44 +382,9 @@ pub(crate) fn manage_rules(body: &str, reset: bool) -> Result<String, SourceWrit
     {
         return Err(failure("节点、策略组或 DNS 上游已变更，请刷新后重试"));
     }
-    let changed = sources
-        .iter()
-        .zip(&originals)
-        .filter(|(new, old)| new.1 != old.1)
-        .collect::<Vec<_>>();
-    let mut written: Vec<usize> = Vec::new();
-    for (index, ((path, text), (_, old))) in changed.iter().enumerate() {
-        let target = data_dir().join(path);
-        let result = if fs::read_to_string(&target).ok().as_deref() != Some(old) {
-            Err(std::io::Error::other("配置文件已被其他程序修改"))
-        } else {
-            crate::storage::write_atomic(&target, text.as_bytes())
-        };
-        if let Err(error) = result {
-            let mut message = format!("保存规则失败：{error}");
-            for index in written.into_iter().rev() {
-                let ((path, new), (_, old)) = changed[index];
-                let target = data_dir().join(path);
-                if fs::read_to_string(&target).ok().as_deref() != Some(new) {
-                    message.push_str("；文件已再次变更，未覆盖外部修改");
-                    continue;
-                }
-                if let Err(error) = crate::storage::write_atomic(&target, old.as_bytes()) {
-                    message.push_str(&format!("；恢复失败：{error}"));
-                }
-            }
-            return Err(write_error(500, "source_write_failed", message));
-        }
-        written.push(index);
-    }
-    next.modified = fs::metadata(config_path())
-        .ok()
-        .and_then(|meta| meta.modified().ok());
-    let before = config.generation.clone();
-    let generation = next.generation.clone();
-    publish(&mut config, next);
-    drop(config);
-    crate::events::generation_changed(&before, &generation);
+    let changed=sources.iter().zip(&originals).filter(|(a,b)|a.1!=b.1).map(|(a,_)|a.clone()).collect::<HashMap<_,_>>();
+    let expected=config.generation.clone();drop(config);
+    let generation=apply_resources_checked(crate::rules_runtime::current(),&changed,Some(&expected)).map_err(|e|write_error(422,"rule_hot_apply_failed",e))?;
     crate::logs::info(
         "engine::rules",
         if reset {

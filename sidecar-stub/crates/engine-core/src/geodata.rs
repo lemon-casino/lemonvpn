@@ -1,5 +1,5 @@
 //! V2Ray GeoIP/GeoSite protobuf assets. Compile only referenced categories.
-use regex::RegexSet;
+use crate::domain_regex::RegexIndex;
 use std::{
     collections::{HashMap, HashSet},
     fmt, fs,
@@ -27,6 +27,7 @@ static ASSETS: OnceLock<Mutex<HashMap<&'static str, Cached>>> = OnceLock::new();
 static DOMAINS: OnceLock<Mutex<HashMap<String, Arc<Domains>>>> = OnceLock::new();
 static IPS: OnceLock<Mutex<HashMap<String, Arc<Ips>>>> = OnceLock::new();
 thread_local! { static ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+pub(crate) fn set_error(message:String) { ERROR.with(|e|*e.borrow_mut()=Some(message)); }
 pub(crate) fn clear_error() {
     ERROR.with(|error| *error.borrow_mut() = None);
 }
@@ -62,6 +63,13 @@ macro_rules! identity {
                 f.debug_tuple("GeoData").field(&self.identity).finish()
             }
         }
+        impl $name {pub(crate) fn category(&self,id:&str)->bool{self.identity.split_once(':').is_some_and(|(_,code)|code.split('@').next()==Some(id))}}
+        impl $name {
+            pub(crate) fn category_id(&self) -> Option<String> {
+                let (digest, code) = self.identity.split_once(':')?;
+                (digest != "builtin").then(|| code.split('@').next().unwrap_or(code).to_string())
+            }
+        }
         impl PartialEq for $name {
             fn eq(&self, other: &Self) -> bool {
                 self.identity == other.identity && self.negate == other.negate
@@ -76,7 +84,7 @@ struct Domains {
     exact: HashSet<String>,
     suffix: HashSet<String>,
     keywords: Vec<String>,
-    regex: RegexSet,
+    regex: RegexIndex,
 }
 #[derive(Default)]
 struct Ips {
@@ -85,6 +93,15 @@ struct Ips {
     inverse: bool,
 }
 impl DomainRef {
+    pub(crate) fn projection(&self)->Result<Vec<String>,String>{
+        if self.negate{return Err("否定 GeoSite 暂不能无损投影到 Fake-IP；请使用显式地址例外".into())}
+        let mut lines=Vec::new();
+        lines.extend(self.set.exact.iter().map(|s|format!("DOMAIN,{s}")));
+        lines.extend(self.set.suffix.iter().map(|s|format!("DOMAIN-SUFFIX,{s}")));
+        lines.extend(self.set.keywords.iter().map(|s|format!("DOMAIN-KEYWORD,{s}")));
+        lines.extend(self.set.regex.patterns().map(|s|format!("DOMAIN-REGEX,{s}")));
+        lines.sort();Ok(lines)
+    }
     pub(crate) fn load(code: &str) -> Option<Self> {
         noted((|| {
             let (negate, code) = selector(code)?;
@@ -149,11 +166,8 @@ impl DomainRef {
                         }
                     }
                 }
-                let regex = regex::RegexSetBuilder::new(expressions)
-                    .case_insensitive(true)
-                    .size_limit(32 * 1024 * 1024)
-                    .build()
-                    .map_err(|error| format!("GeoSite 正则无效：{error}"))?;
+                let regex = RegexIndex::build(expressions)
+                    .map_err(|error| format!("GeoSite {code}：{error}"))?;
                 let set = Arc::new(Domains {
                     exact,
                     suffix,
@@ -408,6 +422,13 @@ fn asset(kind: &'static str) -> Result<Asset, String> {
     );
     Ok(asset)
 }
+
+pub(crate) fn categories(kind:&str,query:&str,offset:usize)->Result<serde_json::Value,String>{
+    let kind=match kind{"geoip"=>"geoip","geosite"=>"geosite",_=>return Err("数据种类须为 geoip 或 geosite".into())};
+    let data=asset(kind)?;let mut categories=data.entries.keys().filter(|name|name.contains(&query.to_ascii_lowercase())).cloned().collect::<Vec<_>>();categories.sort();
+    let total=categories.len();let items=categories.into_iter().skip(offset).take(100).collect::<Vec<_>>();
+    Ok(serde_json::json!({"kind":kind,"sha256":data.digest,"total":total,"offset":offset,"categories":items}))
+}
 pub(crate) fn validate_asset(kind: &str, bytes: &[u8]) -> Result<(), String> {
     let asset = index(bytes.to_vec())?;
     for range in asset.entries.values() {
@@ -563,3 +584,16 @@ fn fields(bytes: &[u8]) -> Result<Vec<Field<'_>>, String> {
     }
     Ok(out)
 }
+
+pub(crate) fn category_detail(kind:&str,id:&str)->Result<serde_json::Value,String>{
+    clear_error();
+    let (count,samples)=if kind=="geosite"{let category=DomainRef::load(id).ok_or_else(||take_error().unwrap_or_else(||"GeoSite 分类不存在".into()))?;let values=category.projection()?;(values.len(),values.into_iter().take(20).collect::<Vec<_>>())}
+    else if kind=="geoip"{let category=IpRef::load(id).ok_or_else(||take_error().unwrap_or_else(||"GeoIP 分类不存在".into()))?;let mut samples=Vec::new();let mut count=0;
+        for(p,rows)in &category.set.v4{count+=rows.len();for ip in rows.iter().take(20){if samples.len()<20{samples.push(format!("{}/{p}",std::net::Ipv4Addr::from(*ip)));}}}
+        for(p,rows)in &category.set.v6{count+=rows.len();for ip in rows.iter().take(20){if samples.len()<20{samples.push(format!("{}/{p}",std::net::Ipv6Addr::from(*ip)));}}}(count,samples)
+    }else{return Err("地理数据种类无效".into())};
+    let references=crate::config::geo_references(kind,id);
+    Ok(serde_json::json!({"count":count,"samples":samples,"references":references}))
+}
+
+pub(crate) fn invalidate(){if let Some(cache)=ASSETS.get(){cache.lock().unwrap().clear();}if let Some(cache)=DOMAINS.get(){cache.lock().unwrap().clear();}if let Some(cache)=IPS.get(){cache.lock().unwrap().clear();}}

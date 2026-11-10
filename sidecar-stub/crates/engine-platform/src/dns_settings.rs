@@ -11,6 +11,22 @@ pub struct DnsSettings {
     pub ipv6_range: String,
     pub filters: Vec<String>,
     pub store_fake_ip: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub address_rules: Vec<AddressRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_sets: Vec<DomainSet>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AddressRule {
+    pub set_id: String,
+    pub mode: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DomainSet {
+    pub id: String,
+    pub entries: Vec<String>,
 }
 impl Default for DnsSettings {
     fn default() -> Self {
@@ -20,6 +36,8 @@ impl Default for DnsSettings {
             ipv6_range: "fc00::/18".into(),
             filters: Vec::new(),
             store_fake_ip: false,
+            address_rules: Vec::new(),
+            domain_sets: Vec::new(),
         }
     }
 }
@@ -67,9 +85,54 @@ impl DnsSettings {
             }
         }
         self.filters = filters;
+        if self.address_rules.len() > 128 || self.domain_sets.len() > 128 {
+            return Err(io::Error::other("Fake-IP 分类数量超限"));
+        }
+        let valid_id = |id: &str| {
+            !id.is_empty()
+                && id.len() <= 80
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+        let mut ids = std::collections::HashSet::new();
+        let mut count = 0;
+        let mut bytes = 0;
+        for set in &self.domain_sets {
+            if !valid_id(&set.id) || !ids.insert(&set.id) {
+                return Err(io::Error::other("Fake-IP 域名集 ID 无效或重复"));
+            }
+            for entry in &set.entries {
+                count += 1;
+                bytes += entry.len();
+                let (kind, value) = entry
+                    .split_once(',')
+                    .ok_or_else(|| io::Error::other("Fake-IP 域名条目无效"))?;
+                if !matches!(
+                    kind,
+                    "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-KEYWORD" | "DOMAIN-REGEX"
+                ) || value.is_empty()
+                    || value.len() > 4096
+                    || entry.contains(['\n', '\r', '\0'])
+                {
+                    return Err(io::Error::other("Fake-IP 产物仅接受有界的域名条件"));
+                }
+            }
+        }
+        if count > 1_000_000 || bytes > 24 * 1024 * 1024 {
+            return Err(io::Error::other("Fake-IP 域名产物超过上限"));
+        }
+        for rule in &self.address_rules {
+            if !ids.contains(&rule.set_id) || !matches!(rule.mode.as_str(), "real-ip" | "fake-ip") {
+                return Err(io::Error::other("Fake-IP 分类引用或动作无效"));
+            }
+        }
         Ok(self)
     }
     pub fn from_request(value: &Value) -> io::Result<Self> {
+        if let Some(id) = value.get("dns_settings_artifact").and_then(Value::as_str) {
+            return crate::dns_artifact::read(id)?.validated();
+        }
         match value.get("dns_settings") {
             Some(value) => serde_json::from_value::<Self>(value.clone())
                 .map_err(|e| io::Error::other(format!("DNS 设置格式错误：{e}")))?
@@ -84,6 +147,37 @@ impl DnsSettings {
         config["dns"]["fake-ip-filter-mode"] = json!("blacklist");
         config["dns"]["fake-ip-filter"] = json!(self.filters);
         config["profile"]["store-fake-ip"] = json!(self.store_fake_ip);
+        config["rule-providers"] = json!({});
+        if !self.address_rules.is_empty() {
+            let mut rules = Vec::new();
+            for pattern in &self.filters {
+                if pattern == "*" {
+                    rules.push("MATCH,real-ip".to_string());
+                } else if let Some(suffix) = pattern.strip_prefix("+.") {
+                    rules.push(format!("DOMAIN-SUFFIX,{suffix},real-ip"));
+                } else if pattern.starts_with("*.") {
+                    rules.push(format!("DOMAIN-WILDCARD,{pattern},real-ip"));
+                } else {
+                    rules.push(format!("DOMAIN,{pattern},real-ip"));
+                }
+            }
+            for set in &self.domain_sets {
+                config["rule-providers"][&set.id] = json!({"type":"inline","behavior":"classical","format":"yaml","payload":set.entries});
+            }
+            for rule in &self.address_rules {
+                rules.push(format!("RULE-SET,{},{mode}", rule.set_id, mode = rule.mode));
+            }
+            rules.push("MATCH,fake-ip".into());
+            config["dns"]["fake-ip-filter-mode"] = json!("rule");
+            config["dns"]["fake-ip-filter"] = json!(rules);
+        }
+    }
+    pub fn version(&self) -> u64 {
+        if self.address_rules.is_empty() {
+            1
+        } else {
+            2
+        }
     }
 }
 fn validate_range(text: &str, ipv6: bool) -> io::Result<String> {

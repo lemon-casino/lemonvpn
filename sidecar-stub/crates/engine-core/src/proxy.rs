@@ -109,6 +109,66 @@ pub fn peek_protocol(stream: &mut TcpStream) -> io::Result<Option<u8>> {
 }
 
 /// Opens the target through the outbound the routing decision resolved to.
+pub(crate) fn connect_inbound(
+    decision: &config::Decision,
+    host: &str,
+    port: u16,
+    lan: bool,
+) -> io::Result<TcpStream> {
+    if !lan {
+        return connect(decision, host, port);
+    }
+    // LAN users must never tunnel into the loopback management API. Resolve
+    // direct destinations once and pin the checked address against rebinding.
+    let permitted = |ip: IpAddr| match ip {
+        IpAddr::V4(ip) => {
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_private()
+                && !ip.is_link_local()
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+        }
+        IpAddr::V6(ip) => {
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !ip.is_unicast_link_local()
+                && !ip.is_unique_local()
+                && ip.to_ipv4_mapped().is_none()
+        }
+    };
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if !permitted(ip) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "局域网共享仅代理公网目标",
+            ));
+        }
+    }
+    if matches!(decision.target, config::Target::Direct) {
+        let addresses: Vec<IpAddr> = if let Ok(ip) = host.parse() {
+            vec![ip]
+        } else if crate::dns::available() {
+            crate::dns::resolve(host)?
+        } else {
+            (host, port)
+                .to_socket_addrs()?
+                .map(|address| address.ip())
+                .collect()
+        };
+        let mut last = io::Error::new(io::ErrorKind::PermissionDenied, "局域网共享仅代理公网目标");
+        for address in addresses.into_iter().filter(|ip| permitted(*ip)) {
+            match connect(decision, &address.to_string(), port) {
+                Ok(stream) => return Ok(stream),
+                Err(error) => last = error,
+            }
+        }
+        return Err(last);
+    }
+    connect(decision, host, port)
+}
+
 pub fn connect(decision: &config::Decision, host: &str, port: u16) -> io::Result<TcpStream> {
     let started = Instant::now();
     let result = match &decision.target {
@@ -133,7 +193,10 @@ pub fn connect(decision: &config::Decision, host: &str, port: u16) -> io::Result
 /// dials resolve through the configured DNS upstreams; the system resolver is
 /// only the fallback when no upstream is configured.
 pub fn dial(host: &str, port: u16) -> io::Result<TcpStream> {
-    if crate::platform::managed::egress_families().is_none() && crate::compat::tun_active() && !host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+    if crate::platform::managed::egress_families().is_none()
+        && crate::compat::tun_active()
+        && !host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    {
         return crate::compat::connect(None, None, host, port);
     }
     let addrs: Vec<SocketAddr> = if let Ok(address) = host.parse::<IpAddr>() {
@@ -197,6 +260,7 @@ pub fn tunnel(
     flow: Option<flows::Guard>,
     decision: &config::Decision,
     target: (&str, u16),
+    inbound_stop: Option<&std::sync::atomic::AtomicBool>,
 ) -> io::Result<()> {
     // The guard closes the flow record when this tunnel returns.
     let _flow = flow;
@@ -219,7 +283,10 @@ pub fn tunnel(
     if let (Some(live), Ok(socket)) = (&live, upstream.try_clone()) {
         live.attach_socket(socket);
     }
-    if crate::runtime::stopping() || live.as_ref().is_some_and(|live| live.closed()) {
+    if crate::runtime::stopping()
+        || inbound_stop.is_some_and(|stop| stop.load(Ordering::Acquire))
+        || live.as_ref().is_some_and(|live| live.closed())
+    {
         return Ok(());
     }
     let retired = live.as_ref().map(|live| live.cancellation());

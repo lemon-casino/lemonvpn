@@ -20,6 +20,9 @@ import {kernelBinaryName, sidecarLayout, verifyPeMachine, wintunTarget} from './
 import {prepareCompat} from './prepare-compat.mjs';
 import {prepareGeodata} from './prepare-geodata.mjs';
 import {prepareBranding} from './prepare-branding.mjs';
+import {prepareProxyHealth} from './prepare-proxy-health.mjs';
+import {prepareRulesDns, rulesDnsApplied} from './prepare-rules-dns.mjs';
+import {prepareLanSharing} from './prepare-lan-sharing.mjs';
 
 /** Sidecar binary name, without the target triple Tauri appends. */
 const SIDECAR = 'lemonvpn-engine-stub';
@@ -124,6 +127,13 @@ function prepareFrontend(pnpm) {
   if (!existsSync(join(doonaDir, 'src', 'desktop.ts'))) {
     throw new Error('doona 尚未应用桌面适配:按 README 使用 DOONA_DESKTOP_REVISION 和 doona-lemonvpn-desktop.patch');
   }
+  // Later patches intentionally revise earlier hunks. Recognize the final
+  // layer before checking earlier layers in an already prepared checkout.
+  if (!rulesDnsApplied(doonaDir)) {
+    prepareProxyHealth(doonaDir);
+    prepareLanSharing(doonaDir);
+    prepareRulesDns(doonaDir);
+  }
   prepareBranding(doonaDir);
   if (!existsSync(join(doonaDir, 'node_modules'))) {
     throw new Error(`${doonaDir} 尚未安装依赖:先运行 pnpm --dir doona install`);
@@ -158,6 +168,13 @@ async function prepareSidecar(cargo) {
     throw new Error(`无法读取引擎依赖元数据:${result.error?.message ?? result.stderr}`);
   }
   const metadata = JSON.parse(result.stdout);
+  const notices = [['zstd', 'LICENSE'], ['zstd-safe', 'LICENSE'], ['zstd-sys', 'LICENSE'], ['zstd-sys', 'zstd/LICENSE'], ['url', 'LICENSE-MIT']]
+    .map(([name, relative]) => {
+      const dependency = metadata.packages.find(pkg => pkg.name === name);
+      if (!dependency) throw new Error(`Missing rule-resource dependency: ${name}`);
+      return `${name} ${dependency.version} — ${relative}\n\n${readFileSync(join(dirname(dependency.manifest_path), relative), 'utf8')}`;
+    }).join('\n\n----------------------------------------\n\n');
+  writeFileSync(join(binariesDir, 'rules-dns.LICENSE.txt'), notices + '\n');
   const layout = sidecarLayout(metadata.target_directory, triple);
   const sidecarBinary = layout.artifact;
 

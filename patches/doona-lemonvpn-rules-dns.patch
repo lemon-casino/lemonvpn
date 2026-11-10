@@ -1,0 +1,3638 @@
+diff --git a/src/api/api.ts b/src/api/api.ts
+--- a/src/api/api.ts
++++ b/src/api/api.ts
+@@ -87,7 +87,14 @@
+   recovering?: string | null;
+ };
+ export type LanSettings = {enabled: boolean; bind_address: string; port: number; authentication: {username: string; password: string} | null};
+-export type LanStatus = {settings: LanSettings; revision: string; active: boolean; error: string | null; addresses: Array<{interface: string; address: string}>; address_error: string | null};
++export type LanStatus = {
++  settings: LanSettings;
++  revision: string;
++  active: boolean;
++  error: string | null;
++  addresses: Array<{interface: string; address: string}>;
++  address_error: string | null;
++};
+ export type DnsSettings = {mode: 'fake-ip' | 'redir-host'; ipv4_range: string; ipv6_range: string; filters: string[]; store_fake_ip: boolean};
+ export type DnsSettingsStatus = {settings: DnsSettings; revision: string; tun_enabled: boolean};
+ export type DesktopStatus = {
+@@ -101,6 +108,7 @@
+ };
+ 
+ export interface Api {
++  rulesRuntime?<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, signal?: AbortSignal): Promise<T>;
+   // The engine's configuration extension, through the routes `config` names.
+   exportConfig(config: EngineConfig, signal?: AbortSignal): Promise<ConfigExport>;
+   importConfig(config: EngineConfig, replace: boolean, signal?: AbortSignal): Promise<OperationAccepted>;
+diff --git a/src/api/client.ts b/src/api/client.ts
+--- a/src/api/client.ts
++++ b/src/api/client.ts
+@@ -1,4 +1,14 @@
+-import type {RuleScope, RuleDefaults, RuleManagementResult, GroupRemovalRequest, GroupRemovalResult, DnsSettings, DnsSettingsStatus, LanSettings, LanStatus} from './api';
++import type {
++  RuleScope,
++  RuleDefaults,
++  RuleManagementResult,
++  GroupRemovalRequest,
++  GroupRemovalResult,
++  DnsSettings,
++  DnsSettingsStatus,
++  LanSettings,
++  LanStatus
++} from './api';
+ import type {Provider} from './model';
+ import createClient, {type Middleware} from 'openapi-fetch';
+ import type {components, paths as StandardPaths} from './types';
+@@ -202,11 +212,21 @@
+   };
+   const lanSettingsClient = client as unknown as {
+     GET(path: '/api/v1/lan/settings', init?: {signal?: AbortSignal}): Promise<{data?: LanStatus; response: Response}>;
+-    PUT(path: '/api/v1/lan/settings', init: {body: {revision: string; settings: LanSettings}; signal?: AbortSignal}): Promise<{data?: LanStatus; response: Response}>;
+-  };
++    PUT(
++      path: '/api/v1/lan/settings',
++      init: {body: {revision: string; settings: LanSettings}; signal?: AbortSignal}
++    ): Promise<{data?: LanStatus; response: Response}>;
++  };
++  const runtimeClient = client as unknown as Record<
++    'GET' | 'POST' | 'PUT' | 'DELETE',
++    (path: string, init: {body?: unknown; signal?: AbortSignal}) => Promise<{data?: unknown; response: Response}>
++  >;
+   const dnsSettingsClient = client as unknown as {
+     GET(path: '/api/v1/dns/settings', init?: {signal?: AbortSignal}): Promise<{data?: DnsSettingsStatus; response: Response}>;
+-    PUT(path: '/api/v1/dns/settings', init: {body: {revision: string; settings: DnsSettings}; signal?: AbortSignal}): Promise<{data?: DnsSettingsStatus; response: Response}>;
++    PUT(
++      path: '/api/v1/dns/settings',
++      init: {body: {revision: string; settings: DnsSettings}; signal?: AbortSignal}
++    ): Promise<{data?: DnsSettingsStatus; response: Response}>;
+   };
+   // A fresh key per operation start prevents transport retries from starting a second operation.
+   const starts = createClient<OperationStarts>(options);
+@@ -373,8 +393,14 @@
+     desktopStatus: async signal => data(await tunClient.GET('/api/v1/desktop/status', {signal})),
+     lanSettings: async signal => data(await lanSettingsClient.GET('/api/v1/lan/settings', {signal})),
+     setLanSettings: (revision, settings, signal) => lanSettingsClient.PUT('/api/v1/lan/settings', {body: {revision, settings}, signal}).then(data),
++    rulesRuntime: async <T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, signal?: AbortSignal): Promise<T> => {
++      if (!/^\/api\/v1\/(rules\/runtime|dns\/(trace|statistics|wire-cache)|geodata\/categories|runtime\/apply)([/?]|$)/.test(path))
++        throw new Error('Invalid resource path');
++      return data(await runtimeClient[method](path, {body, signal})) as T;
++    },
+     dnsSettings: async signal => data(await dnsSettingsClient.GET('/api/v1/dns/settings', {signal})),
+-    setDnsSettings: (revision, settings, signal) => writesConfig(dnsSettingsClient.PUT('/api/v1/dns/settings', {body: {revision, settings}, signal}).then(data)),
++    setDnsSettings: (revision, settings, signal) =>
++      writesConfig(dnsSettingsClient.PUT('/api/v1/dns/settings', {body: {revision, settings}, signal}).then(data)),
+     setTun: async (enabled, signal) => data(await tunClient.POST('/api/v1/tun/set', {body: {enabled}, signal})),
+     nodes: async (query, signal) => read(await client.GET('/api/v1/nodes', {params: {query}, signal})),
+     groups: async signal => read(await client.GET('/api/v1/groups', {signal})),
+diff --git a/src/api/engines/lemonvpn.ts b/src/api/engines/lemonvpn.ts
+--- a/src/api/engines/lemonvpn.ts
++++ b/src/api/engines/lemonvpn.ts
+@@ -9,6 +9,7 @@
+   ruleMust: false,
+   domainRuleCategories: [{id: 'youtube', domains: ['youtube.com', 'youtu.be', 'googlevideo.com', 'ytimg.com', 'youtube-nocookie.com']}],
+   ruleConditions: [
++    'ruleset',
+     'domain',
+     'domainSuffix',
+     'domainKeyword',
+@@ -28,7 +29,7 @@
+   dnsRuleLists: ['request', 'response'],
+   dnsRuleActions: {request: ['upstream', 'reject'], response: ['accept', 'reject', 'requery']},
+   dnsErrorActions: ['nxdomain', 'refused', 'servfail'],
+-  dnsRuleConditions: ['qnameFull', 'qnameSuffix', 'qnameKeyword', 'qnameGeosite', 'qtype', 'upstream', 'answerIp', 'answerGeoip'],
++  dnsRuleConditions: ['qnameRuleset', 'qnameFull', 'qnameSuffix', 'qnameKeyword', 'qnameGeosite', 'qtype', 'upstream', 'answerIp', 'answerGeoip'],
+   ruleTemplates: false,
+   flowDemandGraceSeconds: null,
+   reason: () => undefined,
+diff --git a/src/api/invalidation.ts b/src/api/invalidation.ts
+--- a/src/api/invalidation.ts
++++ b/src/api/invalidation.ts
+@@ -31,7 +31,14 @@
+   | 'providers'
+   | 'geodata'
+   | 'rules'
+-  | 'dnsRules';
++  | 'dnsRules'
++  | 'rulesRuntime'
++  | 'ruleReferences'
++  | 'ruleEntries'
++  | 'geoCategories'
++  | 'geoDetails'
++  | 'dnsWireStats'
++  | 'dnsWireCache';
+ 
+ // The contract's Invalidates column (events.md). An operation's own changes arrive as the `runtime.updated` or
+ // `generation.changed` they produce, and its waiter refetches the operation, so `operation.updated` refreshes nothing here.
+@@ -49,9 +56,17 @@
+       'runtimeMemory',
+       'desktopStatus',
+       'dnsSettings',
++      'rulesRuntime',
++      'ruleReferences',
++      'ruleEntries',
++      'geoCategories',
++      'geoDetails',
++      'dnsWireStats',
++      'dnsWireCache',
+       'lanSettings',
+       'tun',
+       'runtimeSettings',
++      'geodata',
+       'groups',
+       'group',
+       'groupProbeMembers',
+@@ -78,6 +93,13 @@
+       'geodata',
+       'rules',
+       'dnsRules',
++      'rulesRuntime',
++      'ruleReferences',
++      'ruleEntries',
++      'geoCategories',
++      'geoDetails',
++      'dnsWireStats',
++      'dnsWireCache',
+       'dnsCache',
+       'dnsLog',
+       'connections',
+diff --git a/src/api/rulesRuntime.ts b/src/api/rulesRuntime.ts
+new file mode 100644
+--- /dev/null
++++ b/src/api/rulesRuntime.ts
+@@ -0,0 +1,88 @@
++import {uuid} from './hash';
++import {getApi} from './index';
++import type {OperationAccepted} from './model';
++
++export type RuleProvider = {
++  id: string;
++  name: string;
++  enabled: boolean;
++  source: string;
++  url: string;
++  content: string;
++  format: string;
++  behavior: string;
++  interval: number;
++  outbound: string;
++  expected_sha256: string;
++  accepted_sha256: string;
++  updated_at: number;
++  etag: string;
++  last_modified: string;
++  headers: Record<string, string>;
++};
++export type Resolver = {id: string; name: string; url: string; outbound: string; bootstrap: string[]; tls_name: string; timeout_ms: number};
++export type Pool = {id: string; name: string; members: string[]; strategy: string};
++export type Policy = {id: string; name: string; enabled: boolean; condition: string; pool: string; address_mode: string};
++export type Binding = {id: string; name: string; enabled: boolean; condition: string; outbound: string};
++export type CacheOptions = {capacity: number; max_bytes: number; negative: boolean; stale_seconds: number; prefetch: boolean};
++export type RulesDocument = {
++  schema: number;
++  providers: RuleProvider[];
++  resolvers: Resolver[];
++  pools: Pool[];
++  policies: Policy[];
++  bindings: Binding[];
++  cache: CacheOptions;
++  bootstrap: string[];
++};
++export type ResourceKind = 'providers' | 'resolvers' | 'pools' | 'policies' | 'bindings';
++export type ResourceRow = RuleProvider | Resolver | Pool | Policy | Binding;
++export type RulesStatus = {
++  revision: string;
++  generation_id: string;
++  document: RulesDocument;
++  error: string | null;
++  resources: {id: string; sha256: string; count: number; ref_count: number; format: string; behavior: string; domain_only: boolean; fakeip: boolean}[];
++  updates: Record<string, {state: string; message?: string}>;
++  outbounds: {id: string; kind: string}[];
++};
++export type Reference = {scope: string; id?: string; name?: string; source_id?: string; line?: number; expression?: string};
++export function runtime<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path = '', body?: unknown, signal?: AbortSignal): Promise<T> {
++  const api = getApi();
++  if (!api.rulesRuntime) return Promise.reject(new Error('Rule resources unavailable'));
++  return api.rulesRuntime<T>(method, path.startsWith('/api/') ? path : '/api/v1/rules/runtime' + path, body, signal);
++}
++export async function operation(path: string, body: unknown, signal?: AbortSignal) {
++  const accepted = await runtime<Omit<OperationAccepted, 'retryAfter'>>('POST', path, body, signal);
++  const result = await getApi().pollOperation({...accepted, retryAfter: 1}, signal);
++  if (result.status !== 'succeeded') throw new Error(result.error?.message ?? result.status);
++  return runtime<RulesStatus>('GET', '', undefined, signal);
++}
++export const resourceId = () => 'r_' + uuid().replaceAll('-', '');
++export const newProvider = (): RuleProvider => ({
++  id: resourceId(),
++  name: '',
++  enabled: true,
++  source: 'http',
++  url: '',
++  content: '',
++  format: 'auto',
++  behavior: 'auto',
++  interval: 86400,
++  outbound: 'direct',
++  expected_sha256: '',
++  accepted_sha256: '',
++  updated_at: 0,
++  etag: '',
++  last_modified: '',
++  headers: {}
++});
++export function sourceLabel(provider: RuleProvider): string {
++  if (provider.source !== 'http') return provider.source;
++  try {
++    const url = new URL(provider.url);
++    return url.origin + url.pathname;
++  } catch {
++    return 'HTTP';
++  }
++}
+diff --git a/src/dae/conditions.ts b/src/dae/conditions.ts
+--- a/src/dae/conditions.ts
++++ b/src/dae/conditions.ts
+@@ -40,10 +40,12 @@
+       if (i < tokens.length && (raw(i++) !== ',' || i === tokens.length)) return null;
+     }
+     if (!args.length || args.some(arg => arg.prefix !== args[0].prefix)) return null;
+-    const kind = kinds.find(kind => {
+-      const sample = ruleCondition(kind, 'value');
+-      return sample === `${name}(${args[0].prefix ? `${args[0].prefix}: ` : ''}value)`;
+-    });
++    const kind =
++      (name === 'ruleset' && args.length === 1 ? kinds.find(kind => kind === 'ruleset' || kind === 'qnameRuleset') : undefined) ??
++      kinds.find(kind => {
++        const sample = ruleCondition(kind, 'value');
++        return sample === `${name}(${args[0].prefix ? `${args[0].prefix}: ` : ''}value)`;
++      });
+     if (!kind) return null;
+     const row = {kind, value: args.map(arg => arg.value).join(', '), negate: !!negate};
+     if (serializeConditions([row]) === null) return null;
+diff --git a/src/dae/geodata.ts b/src/dae/geodata.ts
+--- a/src/dae/geodata.ts
++++ b/src/dae/geodata.ts
+@@ -1,8 +1,7 @@
+ import type {GeoAssetKind, GeoData} from '../api/model';
+ 
+-// Known geodata sources, as measured on 2026-09-25. Each preset lists direct links only, raw first and then the
+-// jsDelivr fastly mirror: the backend does not follow redirects, so a GitHub /releases/download/ link never works.
+-// `mirrors` are other jsDelivr nodes serving the same bytes; a stored list made of them still counts as the preset.
++// Each preset keeps all mirrors in one dataset family. Fresh connections and
++// redirects are handled by the backend; the next source is tried after a failure.
+ // `categories` is the whole category list of a file small enough to know it; null means a full file.
+ export type GeodataPresetId = 'metacubex' | 'metacubex-lite' | 'loyalsoldier';
+ export type GeodataPreset = {
+@@ -50,8 +49,8 @@
+   const kinds = Object.keys(files) as GeoAssetKind[];
+   return {
+     id,
+-    urls: Object.fromEntries(kinds.map(kind => [kind, [raw(files[kind]), cdn('fastly', files[kind])]])) as GeodataPreset['urls'],
+-    mirrors: Object.fromEntries(kinds.map(kind => [kind, jsdelivr.slice(1).map(host => cdn(host, files[kind]))])) as GeodataPreset['mirrors'],
++    urls: Object.fromEntries(kinds.map(kind => [kind, [cdn('testingcf', files[kind]), raw(files[kind]), cdn('fastly', files[kind])]])) as GeodataPreset['urls'],
++    mirrors: Object.fromEntries(kinds.map(kind => [kind, jsdelivr.map(host => cdn(host, files[kind]))])) as GeodataPreset['mirrors'],
+     sizes,
+     categories
+   };
+diff --git a/src/dae/groups.ts b/src/dae/groups.ts
+--- a/src/dae/groups.ts
++++ b/src/dae/groups.ts
+@@ -360,9 +360,11 @@
+   return parts.map(part => part.trim());
+ }
+ 
+-export type ConditionKind = 'domain' | 'domainSuffix' | 'domainKeyword' | 'geosite' | 'dip' | 'geoip' | 'dport' | 'sport' | 'pname' | 'l4proto' | 'sip';
++export type ConditionKind =
++  'ruleset' | 'domain' | 'domainSuffix' | 'domainKeyword' | 'geosite' | 'dip' | 'geoip' | 'dport' | 'sport' | 'pname' | 'l4proto' | 'sip';
+ export const conditionKinds: ConditionKind[] = [
+   'domainSuffix',
++  'ruleset',
+   'domain',
+   'domainKeyword',
+   'geosite',
+@@ -376,8 +378,9 @@
+ ];
+ // DNS rule conditions, as honk's parser reads them: request rules match the query by qname, qtype and sip; response
+ // rules may also match the upstream that answered and the answer's addresses with ip.
+-export type DnsConditionKind = 'qnameSuffix' | 'qnameFull' | 'qnameKeyword' | 'qnameGeosite' | 'qtype' | 'sip' | 'upstream' | 'answerIp' | 'answerGeoip';
+-const dnsRequestKinds: DnsConditionKind[] = ['qnameSuffix', 'qnameFull', 'qnameKeyword', 'qnameGeosite', 'qtype', 'sip'];
++export type DnsConditionKind =
++  'qnameRuleset' | 'qnameSuffix' | 'qnameFull' | 'qnameKeyword' | 'qnameGeosite' | 'qtype' | 'sip' | 'upstream' | 'answerIp' | 'answerGeoip';
++const dnsRequestKinds: DnsConditionKind[] = ['qnameRuleset', 'qnameSuffix', 'qnameFull', 'qnameKeyword', 'qnameGeosite', 'qtype', 'sip'];
+ export const dnsConditionKinds: Record<'request' | 'response', DnsConditionKind[]> = {
+   request: dnsRequestKinds,
+   response: [...dnsRequestKinds, 'upstream', 'answerIp', 'answerGeoip']
+@@ -385,6 +388,7 @@
+ export type RuleConditionKind = ConditionKind | DnsConditionKind;
+ // Null when the values cannot be written as one condition, such as `a) # x` or an apostrophe that needs quoting.
+ export function ruleCondition(kind: RuleConditionKind, value: string): string | null {
++  if (kind === 'ruleset' || kind === 'qnameRuleset') return /^[A-Za-z0-9_-]{1,80}$/.test(value.trim()) ? `ruleset('${value.trim()}')` : null;
+   const values = value
+     .split(/[,\s]+/)
+     .map(v => v.trim())
+@@ -402,6 +406,9 @@
+   const list = written.join(', ');
+   const qualified = (prefix: string) => written.map(value => `${prefix}: ${value}`).join(', ');
+   switch (kind) {
++    case 'ruleset':
++    case 'qnameRuleset':
++      return `ruleset(${list})`;
+     case 'domain':
+       return `domain(${qualified('full')})`;
+     case 'domainSuffix':
+diff --git a/src/dae/ruleProviderPresets.ts b/src/dae/ruleProviderPresets.ts
+new file mode 100644
+--- /dev/null
++++ b/src/dae/ruleProviderPresets.ts
+@@ -0,0 +1,93 @@
++import type {Key} from '../i18n';
++import {newProvider, type RuleProvider} from '../api/rulesRuntime';
++
++export type ProviderPreset = {
++  id: string;
++  label: Key;
++  description: Key;
++  group: 'local' | 'region' | 'service';
++  behavior: 'domain' | 'ipcidr';
++  category?: string;
++  content?: string;
++};
++
++// Only these small, first-party lists ship as payloads. The online catalogue
++// follows MetaCubeX's documented meta/geo MRS layout; it never changes routes.
++export const providerPresets: readonly ProviderPreset[] = [
++  {
++    id: 'local_domains',
++    label: 'rr.builtinLocalDomains',
++    description: 'rr.builtinLocalDomainsHint',
++    group: 'local',
++    behavior: 'domain',
++    content: 'localhost\n+.localhost\n+.local\n+.lan\n+.home.arpa\n'
++  },
++  {
++    id: 'private_networks',
++    label: 'rr.builtinPrivateNetworks',
++    description: 'rr.builtinPrivateNetworksHint',
++    group: 'local',
++    behavior: 'ipcidr',
++    content: '10.0.0.0/8\n172.16.0.0/12\n192.168.0.0/16\n127.0.0.0/8\n169.254.0.0/16\n::1/128\nfc00::/7\nfe80::/10\n'
++  },
++  {id: 'cn_domains', label: 'rr.builtinCnDomains', description: 'rr.builtinCnDomainsHint', group: 'region', behavior: 'domain', category: 'cn'},
++  {id: 'cn_ip', label: 'rr.builtinCnIp', description: 'rr.builtinCnIpHint', group: 'region', behavior: 'ipcidr', category: 'cn'},
++  {
++    id: 'foreign_domains',
++    label: 'rr.builtinForeign',
++    description: 'rr.builtinForeignHint',
++    group: 'region',
++    behavior: 'domain',
++    category: 'geolocation-!cn'
++  },
++  {id: 'ads', label: 'rr.builtinAds', description: 'rr.builtinAdsHint', group: 'service', behavior: 'domain', category: 'category-ads-all'},
++  {id: 'ai', label: 'rr.builtinAi', description: 'rr.builtinAiHint', group: 'service', behavior: 'domain', category: 'category-ai-!cn'},
++  {id: 'youtube', label: 'rr.builtinYoutube', description: 'rr.builtinYoutubeHint', group: 'service', behavior: 'domain', category: 'youtube'},
++  {id: 'google', label: 'rr.builtinGoogle', description: 'rr.builtinGoogleHint', group: 'service', behavior: 'domain', category: 'google'},
++  {id: 'telegram', label: 'rr.builtinTelegram', description: 'rr.builtinTelegramHint', group: 'service', behavior: 'domain', category: 'telegram'},
++  {id: 'telegram_ip', label: 'rr.builtinTelegramIp', description: 'rr.builtinTelegramIpHint', group: 'service', behavior: 'ipcidr', category: 'telegram'},
++  {id: 'github', label: 'rr.builtinGithub', description: 'rr.builtinGithubHint', group: 'service', behavior: 'domain', category: 'github'},
++  {id: 'microsoft', label: 'rr.builtinMicrosoft', description: 'rr.builtinMicrosoftHint', group: 'service', behavior: 'domain', category: 'microsoft'},
++  {id: 'apple', label: 'rr.builtinApple', description: 'rr.builtinAppleHint', group: 'service', behavior: 'domain', category: 'apple'},
++  {id: 'bilibili', label: 'rr.builtinBilibili', description: 'rr.builtinBilibiliHint', group: 'service', behavior: 'domain', category: 'bilibili'},
++  {id: 'netflix', label: 'rr.builtinNetflix', description: 'rr.builtinNetflixHint', group: 'service', behavior: 'domain', category: 'netflix'},
++  {id: 'steam', label: 'rr.builtinSteam', description: 'rr.builtinSteamHint', group: 'service', behavior: 'domain', category: 'steam'}
++];
++
++export type ProviderPresetSource = 'cdn' | 'github';
++export function presetUrl(preset: ProviderPreset, source: ProviderPresetSource): string {
++  if (!preset.category) return '';
++  const file = `geo/${preset.behavior === 'domain' ? 'geosite' : 'geoip'}/${encodeURIComponent(preset.category)}.mrs`;
++  return source === 'cdn'
++    ? `https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/${file}`
++    : `https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/${file}`;
++}
++export function presetInstalled(preset: ProviderPreset, providers: RuleProvider[]): boolean {
++  return providers.some(
++    p =>
++      p.id === `preset_${preset.id}` ||
++      (preset.category &&
++        p.source === 'http' &&
++        (['cdn', 'github'] as const).some(source => {
++          try {
++            return new URL(p.url).href === new URL(presetUrl(preset, source)).href;
++          } catch {
++            return false;
++          }
++        }))
++  );
++}
++export function presetProvider(preset: ProviderPreset, name: string, source: ProviderPresetSource, outbound: string): RuleProvider {
++  return {
++    ...newProvider(),
++    id: `preset_${preset.id}`,
++    name,
++    source: preset.content ? 'inline' : 'http',
++    format: preset.content ? 'text' : 'mrs',
++    behavior: preset.behavior,
++    content: preset.content ?? '',
++    url: presetUrl(preset, source),
++    outbound: preset.content ? 'direct' : outbound,
++    interval: 86400
++  };
++}
+diff --git a/src/features/dns/Dns.tsx b/src/features/dns/Dns.tsx
+--- a/src/features/dns/Dns.tsx
++++ b/src/features/dns/Dns.tsx
+@@ -35,6 +35,8 @@
+ import {useDns, useDnsCacheTab, useDnsLogTab, type DnsRowRule} from './useDns';
+ import {DnsStats} from './Analysis';
+ import {Upstreams} from './Upstreams';
++import {DnsPolicies, DnsUpstreams, DnsLiveStats, WireCache, FakeIpPolicySummary} from '../shared/resources/DnsWorkspace';
++import {ResourceTrace} from '../shared/resources/ResourceTrace';
+ import {FakeIpSettings} from './FakeIpSettings';
+ import type {MatchKind} from './match';
+ import type {dnsAnswerView} from './view';
+@@ -142,11 +144,46 @@
+     </>
+   );
+   const content: Record<string, React.ReactNode> = {
+-    fakeip: <FakeIpSettings />,
+-    upstreams: <Upstreams />,
+-    stats: <DnsStats enabled={vm.logEnabled} links={{cache: vm.cacheHref, log: vm.logHref}} />,
+-    query: queryTab,
+-    cache: <DnsCache domain={vm.filterDomain} clearFilter={vm.clearCacheFilter} rule={vm.rule} />,
++    policies: <DnsPolicies />,
++    fakeip: (
++      <>
++        <FakeIpSettings />
++        <FakeIpPolicySummary />
++      </>
++    ),
++    upstreams: (
++      <>
++        <DnsUpstreams />
++        <details className="rr-details">
++          <summary>{t('rr.legacyUpstreams')}</summary>
++          <Upstreams />
++        </details>
++      </>
++    ),
++    stats: (
++      <>
++        <DnsLiveStats />
++        <DnsStats enabled={vm.logEnabled} links={{cache: vm.cacheHref, log: vm.logHref}} />
++      </>
++    ),
++    query: (
++      <>
++        <ResourceTrace initialDomain={vm.domain} query />
++        <details className="rr-details">
++          <summary>{t('rr.recordQuery')}</summary>
++          {queryTab}
++        </details>
++      </>
++    ),
++    cache: (
++      <>
++        <WireCache />
++        <details className="rr-details">
++          <summary>{t('rr.recordCache')}</summary>
++          <DnsCache domain={vm.filterDomain} clearFilter={vm.clearCacheFilter} rule={vm.rule} />
++        </details>
++      </>
++    ),
+     log: <DnsLog enabled={vm.logEnabled} initialName={vm.filterDomain} initialSrc={vm.filterDevice} links={vm.logLinks} rule={vm.rule} />
+   };
+   return (
+diff --git a/src/features/dns/nav.ts b/src/features/dns/nav.ts
+--- a/src/features/dns/nav.ts
++++ b/src/features/dns/nav.ts
+@@ -8,13 +8,18 @@
+ // occasional action and comes last.
+ export function dnsTabs(
+   resources: Capabilities['resources'] | undefined
+-): Array<{id: 'stats' | 'log' | 'query' | 'cache' | 'upstreams' | 'fakeip'; titleKey: Key}> {
++): Array<{id: 'stats' | 'log' | 'query' | 'cache' | 'upstreams' | 'fakeip' | 'policies'; titleKey: Key}> {
+   return [
++    ...(hasDesktop ? [{id: 'policies' as const, titleKey: 'rr.policies' as const}] : []),
++    ...(hasDesktop && offered(resources, 'config', {whileLoading: false}) ? [{id: 'upstreams' as const, titleKey: 'dns.upstreamsTitle' as const}] : []),
+     ...(dnsSettingsAvailable(resources) ? [{id: 'fakeip' as const, titleKey: 'dns.fakeIpTitle' as const}] : []),
+-    ...(offered(resources, 'dns_log', {whileLoading: true}) ? [{id: 'stats' as const, titleKey: 'dns.tab.stats' as const}] : []),
+-    ...(offered(resources, 'dns_log', {whileLoading: true}) ? [{id: 'log' as const, titleKey: 'dns.log' as const}] : []),
+     ...(offered(resources, 'dns_cache', {whileLoading: true}) ? [{id: 'cache' as const, titleKey: 'ui.cache' as const}] : []),
+     ...(offered(resources, 'dns_query', {whileLoading: true}) ? [{id: 'query' as const, titleKey: 'dns.query' as const}] : []),
+-    ...(hasDesktop && offered(resources, 'config', {whileLoading: false}) ? [{id: 'upstreams' as const, titleKey: 'dns.upstreamsTitle' as const}] : [])
++    ...(offered(resources, 'dns_log', {whileLoading: true})
++      ? [
++          {id: 'log' as const, titleKey: 'dns.log' as const},
++          {id: 'stats' as const, titleKey: 'dns.tab.stats' as const}
++        ]
++      : [])
+   ];
+ }
+diff --git a/src/features/dns/useDns.ts b/src/features/dns/useDns.ts
+--- a/src/features/dns/useDns.ts
++++ b/src/features/dns/useDns.ts
+@@ -43,7 +43,8 @@
+   // query opens it: the cache is a listing to browse, not a starting point.
+   const ids = view.tabs.map(item => item.id);
+   const linked = params.has('domain') || params.has('device');
+-  const fallback = ids.includes('log') ? (linked ? 'log' : 'stats') : ids.includes('query') ? 'query' : (ids[0] ?? 'query');
++  const fallback =
++    ids.includes('policies') && !linked ? 'policies' : ids.includes('log') ? (linked ? 'log' : 'stats') : ids.includes('query') ? 'query' : (ids[0] ?? 'query');
+   const tab = pickTab(query, ids, fallback);
+   // The upstreams a query can be sent to are the ones the configuration defines, read once the query tab opens.
+   const configReadable = offered(resources, 'config', {whileLoading: false});
+diff --git a/src/features/policies/group/GroupRemoveDialog.tsx b/src/features/policies/group/GroupRemoveDialog.tsx
+--- a/src/features/policies/group/GroupRemoveDialog.tsx
++++ b/src/features/policies/group/GroupRemoveDialog.tsx
+@@ -12,6 +12,7 @@
+ import type {PolicyDeclaration} from './useGroupDialog';
+ import {failureNotice, noticeText} from '../../../api/error';
+ import {ruleOutbounds} from '../../shared/rule';
++import {useRulesRuntime} from '../../shared/resources/common';
+ import {useModeDraft} from '../../shared/useModeDraft';
+ 
+ type Props = {name: string; open: boolean; close: () => void; source: MainSourceEdit; declaration: PolicyDeclaration};
+@@ -31,12 +32,22 @@
+   const capabilities = useCapabilities();
+   const atomic =
+     !!api.deleteGroup && (capabilities.data?.extensions?.['x-group-management'] as {replace_references?: boolean} | undefined)?.replace_references === true;
++  const resourcesEnabled = (capabilities.data?.extensions?.['x-rules-runtime'] as {available?: boolean} | undefined)?.available === true;
++  const runtime = useRulesRuntime(resourcesEnabled);
++  const document = runtime.data?.document;
++  const resourceRefs = [
++    ...(document?.bindings ?? []).filter(r => r.outbound === name).map(r => ({name: r.name, scope: 'routing'})),
++    ...(document?.resolvers ?? []).filter(r => r.outbound === name).map(r => ({name: r.name, scope: 'dns'})),
++    ...(document?.providers ?? []).filter(r => r.outbound === name).map(r => ({name: r.name, scope: 'download'}))
++  ];
++  const resourceNeedsProxy = resourceRefs.some(r => r.scope !== 'routing');
+   const config = useConfig();
+   const groups = useGroups();
+   const nodes = useNodes();
+   const sources = useMemo(() => config.data?.sources ?? [], [config.data]);
+   const complete = useCompleteness(sources);
+   const refs = useMemo(() => groupReferenceDetails(sources, name), [sources, name]);
++  const hasRefs = refs.length + resourceRefs.length > 0;
+   const excluded = useMemo(() => excludedReplacements(sources, name), [sources, name]);
+   const needsGroup = refs.some(ref => ref.kind === 'group-filter');
+   const needsProxy = refs.some(ref => ref.kind === 'chain');
+@@ -70,27 +81,35 @@
+             }
+           ]
+         : [])
+-    ].filter(section => section.items.length);
+-  }, [groups.data, nodes.data, excluded, needsGroup, needsProxy, t]);
++    ]
++      .map(section => ({...section, items: section.items.filter(item => !resourceNeedsProxy || item.id !== 'block')}))
++      .filter(section => section.items.length);
++  }, [groups.data, nodes.data, excluded, needsGroup, needsProxy, resourceNeedsProxy, t]);
+   const offered = sections.some(section => section.items.some(item => item.id === replacement));
+   const owner = declaration.owner;
+   const origin = owner && owner !== 'ambiguous' ? sources.find(item => item.id === owner.origin.id) : undefined;
+   const writable = !!origin?.writable && refs.every(ref => sources.find(item => item.id === ref.source)?.writable);
+   const ready =
+-    writable && source.writable && !!config.data?.generation_id && sources.length > 0 && sources.every(item => complete(item) === true) && !config.error;
++    (!resourcesEnabled || (!!runtime.data && !runtime.error)) &&
++    writable &&
++    source.writable &&
++    !!config.data?.generation_id &&
++    sources.length > 0 &&
++    sources.every(item => complete(item) === true) &&
++    !config.error;
+   const pending = write.busy === 'deleteGroup';
+   const remove = async () => {
+-    if (!ready || write.busy || source.busy || (refs.length > 0 && (!atomic || !offered)) || !origin) return;
++    if (!ready || write.busy || source.busy || (hasRefs && (!atomic || !offered)) || !origin) return;
+     setProblem(null);
+     try {
+       const result = await write.run('deleteGroup', async signal => {
+         if (atomic && api.deleteGroup) {
+-          const planned = planGroupRemoval(sources, name, refs.length ? replacement : null);
++          const planned = planGroupRemoval(sources, name, hasRefs ? replacement : null);
+           const result = await api.deleteGroup(
+             {
+               generation_id: config.data!.generation_id!,
+               group_id: `group-${name}`,
+-              replacement: refs.length ? replacement : null,
++              replacement: hasRefs ? replacement : null,
+               sources: planned.map(item => ({
+                 source_id: item.id,
+                 content_sha256: sources.find(old => old.id === item.id)!.content_sha256,
+@@ -128,7 +147,7 @@
+       void refetchAll();
+     }
+   };
+-  const label = t(refs.length ? 'group.replaceAndDelete' : 'ui.delete');
++  const label = t(hasRefs ? 'group.replaceAndDelete' : 'ui.delete');
+   return (
+     <ConfirmDialog
+       title={t('group.removeTitle', {name})}
+@@ -137,14 +156,20 @@
+       confirmLabel={label}
+       onConfirm={() => void remove()}
+       isPending={pending}
+-      isDisabled={!ready || source.busy || !!write.busy || (refs.length > 0 && (!atomic || !offered))}
++      isDisabled={!ready || source.busy || !!write.busy || (hasRefs && (!atomic || !offered))}
+       error={problem}
+       scrollBody
+     >
+       <p className="rp-label">{t('group.removeHelp')}</p>
+-      {refs.length > 0 && (
++      <ErrorMessage error={runtime.error} />
++      {resourceRefs.map((r, i) => (
++        <p className="rp-label" key={i}>
++          {r.name} · {t('rr.references')}
++        </p>
++      ))}
++      {hasRefs && (
+         <>
+-          <p>{t('group.replacementSummary', {n: refs.length})}</p>
++          <p>{t('group.replacementSummary', {n: refs.length + resourceRefs.length})}</p>
+           <SearchSelect
+             label={t('group.replacementLabel')}
+             searchLabel={t('ui.filterOutbounds')}
+diff --git a/src/features/rules/RuleDialogs.tsx b/src/features/rules/RuleDialogs.tsx
+--- a/src/features/rules/RuleDialogs.tsx
++++ b/src/features/rules/RuleDialogs.tsx
+@@ -1,5 +1,6 @@
+ import {useId, type FormEvent} from 'react';
+ import {useT} from '../../i18n';
++import {useRulesRuntime} from '../shared/resources/common';
+ import {ConditionRow} from '../../ui/ConditionRow';
+ import {DaeCode} from '../../ui/DaeCode';
+ import {SearchSelect} from '../../ui/SearchSelect';
+@@ -9,6 +10,7 @@
+ 
+ export function RuleDialogs({view}: {view: DictionaryModel}) {
+   const t = useT();
++  const resources = useRulesRuntime();
+   const {form, setForm, draft, dialog} = view;
+   const {target} = view.copy;
+   const mustHelpId = useId();
+@@ -73,16 +75,26 @@
+             onChange={kind => view.setCondition(row.id, {...row, kind: kind as RuleConditionKind})}
+             items={row.draft.choices}
+           />
+-          <TextField
+-            isDisabled={view.busy}
+-            label={t('rule.values')}
+-            value={row.value}
+-            placeholder={row.draft.hint}
+-            description={row.draft.help ?? t('rule.valuesHelp')}
+-            error={row.draft.pickError}
+-            spellCheck={false}
+-            onChange={value => view.setCondition(row.id, {...row, value})}
+-          />
++          {row.kind === 'ruleset' || row.kind === 'qnameRuleset' ? (
++            <LabeledSelect
++              label={t('rr.providers')}
++              isDisabled={view.busy}
++              value={row.value}
++              onChange={value => view.setCondition(row.id, {...row, value})}
++              items={[{id: '', label: t('rr.choose')}, ...(resources.data?.document.providers ?? []).map(p => ({id: p.id, label: p.name}))]}
++            />
++          ) : (
++            <TextField
++              isDisabled={view.busy}
++              label={t('rule.values')}
++              value={row.value}
++              placeholder={row.draft.hint}
++              description={row.draft.help ?? t('rule.valuesHelp')}
++              error={row.draft.pickError}
++              spellCheck={false}
++              onChange={value => view.setCondition(row.id, {...row, value})}
++            />
++          )}
+         </ConditionRow>
+       ))}
+       <Toolbar>
+diff --git a/src/features/rules/Rules.tsx b/src/features/rules/Rules.tsx
+--- a/src/features/rules/Rules.tsx
++++ b/src/features/rules/Rules.tsx
+@@ -5,6 +5,9 @@
+ import {useTabShown} from '../../ui/useTabShown';
+ import {LoadBoundary} from '../../ui/LoadBoundary';
+ import {preloadable} from '../../ui/preloadable';
++import {ResourceManager} from '../shared/resources/ResourceManager';
++import {Geodata} from '../shared/resources/Geodata';
++import {ResourceTrace} from '../shared/resources/ResourceTrace';
+ import {RuleList} from './RuleList';
+ import {DnsRules} from './DnsRules';
+ import type {PageProps} from '../../shell/routes';
+@@ -22,14 +25,27 @@
+   const view = useRulesPage(props);
+   const form = useTraceForm(props.query);
+   const content = {
+-    list: <RuleList {...props} />,
++    list: (
++      <>
++        <RuleList {...props} />
++        <ResourceManager kind="bindings" />
++      </>
++    ),
++    providers: <ResourceManager kind="providers" />,
++    geo: <Geodata />,
+     dns: <DnsRules {...props} />,
+     trace: (
+-      <LoadBoundary>
+-        <Suspense fallback={<PageSkeleton panel shape={traceForm} />}>
+-          <trace.Component form={form} go={props.go} />
+-        </Suspense>
+-      </LoadBoundary>
++      <>
++        <ResourceTrace initialDomain={form.form.domain} />
++        <details className="rr-details">
++          <summary>{t('rr.advancedRoutingTrace')}</summary>
++          <LoadBoundary>
++            <Suspense fallback={<PageSkeleton panel shape={traceForm} />}>
++              <trace.Component form={form} go={props.go} />
++            </Suspense>
++          </LoadBoundary>
++        </details>
++      </>
+     )
+   };
+   if (view.loading) return <PageSkeleton />;
+diff --git a/src/features/rules/nav.ts b/src/features/rules/nav.ts
+--- a/src/features/rules/nav.ts
++++ b/src/features/rules/nav.ts
+@@ -3,13 +3,19 @@
+ import type {Key} from '../../i18n';
+ import type {SearchTarget} from '../../shell/routes';
+ 
+-export type RuleTab = 'list' | 'dns' | 'trace';
++export type RuleTab = 'list' | 'providers' | 'geo' | 'dns' | 'trace';
+ // The editable rule lists come first, routing and then DNS, then the trace that checks them.
+ export function rulesTabs(resources: Capabilities['resources'] | undefined): Array<{id: RuleTab; titleKey: Key}> {
+   const flows = offered(resources, 'flows', {whileLoading: true});
+   const rules = offered(resources, 'rules', {whileLoading: false});
+   return [
+     ...(flows || rules ? [{id: 'list' as const, titleKey: 'rule.listTitle' as const}] : []),
++    ...(rules
++      ? [
++          {id: 'providers' as const, titleKey: 'rr.providers' as const},
++          {id: 'geo' as const, titleKey: 'rr.geodata' as const}
++        ]
++      : []),
+     ...(offered(resources, 'dns_rules', {whileLoading: false}) ? [{id: 'dns' as const, titleKey: 'rule.dnsTitle' as const}] : []),
+     ...(offered(resources, 'routing_trace', {whileLoading: true}) ? [{id: 'trace' as const, titleKey: 'rule.trace' as const}] : [])
+   ];
+diff --git a/src/features/rules/useDnsRuleList.ts b/src/features/rules/useDnsRuleList.ts
+--- a/src/features/rules/useDnsRuleList.ts
++++ b/src/features/rules/useDnsRuleList.ts
+@@ -10,6 +10,7 @@
+ import {dnsListEnd, dnsRuleAnchor, dnsRuleTarget, type DnsRuleListId} from '../../dae/ruleText';
+ import {dnsDictionaryView} from './view';
+ import {offered} from '../../api/capabilities';
++import {useRulesRuntime} from '../shared/resources/common';
+ import {useRuleEditor} from './useRuleEditor';
+ import {parseRuleSeed, sectionSourceHref} from '../shared/link';
+ import {href, within} from '../../shell/route';
+@@ -20,6 +21,7 @@
+ export function useDnsRuleList({go, query}: PageProps, list: DnsRuleListId): DictionaryModel {
+   const t = useT();
+   const lang = useLang();
++  const runtime = useRulesRuntime();
+   const resources = useCapabilities().data?.resources;
+   const available = offered(resources, 'dns_rules', {whileLoading: false});
+   const rules = useDnsRules(available);
+@@ -33,7 +35,7 @@
+     rules.refetch();
+   };
+   const listed: DnsRoutingRule[] | undefined = rules.data?.[list];
+-  const table = useMemo(
++  const baseTable = useMemo(
+     () =>
+       dnsDictionaryView(
+         list,
+@@ -47,6 +49,13 @@
+       ),
+     [list, listed, rules.data?.generation_id, config.data, t, lang, engine.dnsRuleActions, engine.dnsErrorActions]
+   );
++  const table = {
++    ...baseTable,
++    outbounds: [
++      ...baseTable.outbounds,
++      ...(runtime.data?.document.pools ?? []).filter(p => !baseTable.outbounds.some(o => o.id === p.id)).map(p => ({id: p.id, label: p.name}))
++    ]
++  };
+   // A seed from the DNS log prefills a request rule; the response list leaves it alone.
+   const params = new URLSearchParams(query);
+   const seed = list === 'request' ? params.get('add') : null;
+diff --git a/src/features/rules/view.ts b/src/features/rules/view.ts
+--- a/src/features/rules/view.ts
++++ b/src/features/rules/view.ts
+@@ -41,6 +41,8 @@
+ import {recorderEmpty} from '../shared/recorder';
+ 
+ const kindHints: Record<RuleConditionKind, string> = {
++  ruleset: 'r_resource_id',
++  qnameRuleset: 'r_resource_id',
+   domainSuffix: 'example.com, example.org',
+   domain: 'www.example.com',
+   domainKeyword: 'tracker',
+diff --git a/src/features/settings/GeodataSettings.tsx b/src/features/settings/GeodataSettings.tsx
+--- a/src/features/settings/GeodataSettings.tsx
++++ b/src/features/settings/GeodataSettings.tsx
+@@ -22,6 +22,7 @@
+ } from '../../ui/ui';
+ import ChevronDown from '../../ui/icons/ChevronDown';
+ import {useGeodataSettings} from './useGeodataSettings';
++import {href} from '../../shell/route';
+ import {settingsCard} from './nav';
+ 
+ const card = settingsCard('geodata');
+@@ -29,11 +30,18 @@
+ const geodataRows = ['settings.geodataSource', 'settings.geodataRoute', 'settings.geodataVerifyChecksum', 'settings.geodataAutoUpdate'] as const;
+ 
+ // Files are always shown; source controls mount only where the backend lets them be configured.
+-export function GeodataSettingsCard() {
++export function GeodataSettingsCard({managedHere = false}: {managedHere?: boolean}) {
+   const t = useT();
+   const m = useGeodataSettings();
+   const urlFormId = useId();
+   if (!m.available) return null;
++  if (!managedHere)
++    return (
++      <Card title={t(card.titleKey)} titleId={card.headingId}>
++        <p className="rp-note">{m.status.text}</p>
++        <Link href={href('rules', {tab: 'geo'})}>{t('rr.manageGeodata')}</Link>
++      </Card>
++    );
+   return (
+     <Card level={2} title={t(card.titleKey)} titleId={card.headingId}>
+       {m.note && <span className="rp-label">{m.note}</span>}
+diff --git a/src/features/shared/resources/BuiltinProviders.tsx b/src/features/shared/resources/BuiltinProviders.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/features/shared/resources/BuiltinProviders.tsx
+@@ -0,0 +1,132 @@
++import {useRef, useState} from 'react';
++import {useT} from '../../../i18n';
++import {operation} from '../../../api/rulesRuntime';
++import {refetchAll} from '../../../store/resourceCore';
++import {presetInstalled, presetProvider, presetUrl, providerPresets, type ProviderPreset, type ProviderPresetSource} from '../../../dae/ruleProviderPresets';
++import {Badge, Button, Empty, ErrorMessage, ModalDialog, Toolbar} from '../../../ui/ui';
++import {Field, OutboundSelect, Select, type RuntimeModel} from './common';
++
++export function BuiltinProviders({model, close}: {model: RuntimeModel; close: () => void}) {
++  const t = useT();
++  const [search, setSearch] = useState('');
++  const [filter, setFilter] = useState('all');
++  const [source, setSource] = useState<ProviderPresetSource>('cdn');
++  const [outbound, setOutbound] = useState('direct');
++  const inflight = useRef(false);
++  const [error, setError] = useState<Error | null>(null);
++  const providers = model.data?.document.providers ?? [];
++  const query = search.trim().toLocaleLowerCase();
++  const visible = providerPresets.filter(
++    p => (filter === 'all' || p.group === filter) && `${t(p.label)} ${t(p.description)} ${p.category ?? ''}`.toLocaleLowerCase().includes(query)
++  );
++  const add = async (preset: ProviderPreset) => {
++    if (!model.data || model.busy || inflight.current || presetInstalled(preset, providers)) return;
++    inflight.current = true;
++    setError(null);
++    if (providers.length >= 64) {
++      setError(new Error(t('rr.builtinLimit')));
++      inflight.current = false;
++      return;
++    }
++    const provider = presetProvider(preset, t(preset.label), source, outbound);
++    const before = model.data;
++    if (before.document.providers.some(p => p.name === provider.name)) {
++      setError(new Error(t('rr.builtinNameTaken', {name: provider.name})));
++      inflight.current = false;
++      return;
++    }
++    try {
++      if (preset.content) await model.save({...before.document, providers: [...before.document.providers, provider]}, before.revision);
++      else await model.write(`builtin:${preset.id}`, signal => operation('/import', {revision: before.revision, provider}, signal));
++    } finally {
++      try {
++        await refetchAll();
++      } finally {
++        inflight.current = false;
++      }
++    }
++  };
++  return (
++    <ModalDialog
++      title={t('rr.builtin')}
++      isOpen
++      size="wide"
++      locked={model.busy}
++      scrollBody
++      onOpenChange={open => {
++        if (!open && !model.busy) close();
++      }}
++      footer={() => (
++        <Toolbar>
++          <span className="rp-note rp-grow">{t('rr.builtinUsage')}</span>
++          <Button isDisabled={model.busy} onPress={close}>
++            {t('ui.close')}
++          </Button>
++        </Toolbar>
++      )}
++    >
++      <div className="rr-list">
++        <p className="rp-note">{t('rr.builtinHelp')}</p>
++        <div className="rr-grid">
++          <Field label={t('rr.search')} value={search} onChange={setSearch} />
++          <Select
++            label={t('rr.builtinCategory')}
++            value={filter}
++            onChange={setFilter}
++            items={[
++              {id: 'all', label: t('rr.builtinAll')},
++              {id: 'local', label: t('rr.builtinLocal')},
++              {id: 'region', label: t('rr.builtinRegion')},
++              {id: 'service', label: t('rr.builtinService')}
++            ]}
++          />
++        </div>
++        <div className="rr-grid">
++          <Select
++            label={t('rr.builtinSource')}
++            value={source}
++            onChange={v => setSource(v as ProviderPresetSource)}
++            disabled={model.busy}
++            items={[
++              {id: 'cdn', label: t('rr.builtinCdn')},
++              {id: 'github', label: t('rr.builtinGithubSource')}
++            ]}
++          />
++          <OutboundSelect model={model} value={outbound} onChange={setOutbound} />
++        </div>
++        <p className="rp-note">{t('rr.builtinDownloadHelp')}</p>
++        <ErrorMessage error={error ?? model.actionError} />
++        <div className="rr-builtin-grid">
++          {visible.map(preset => {
++            const installed = presetInstalled(preset, providers);
++            return (
++              <section className="rr-builtin-item" key={preset.id}>
++                <div className="rp-cluster">
++                  <strong>{t(preset.label)}</strong>
++                  <span className="rp-grow" />
++                  <Badge>{t(preset.content ? 'rr.builtinOffline' : 'rr.builtinOnline')}</Badge>
++                </div>
++                <p className="rp-note">{t(preset.description)}</p>
++                <div className="rp-cluster rr-builtin-bottom">
++                  <span className="rp-note">{t(preset.behavior === 'domain' ? 'rr.builtinDomain' : 'rr.builtinIp')}</span>
++                  <span className="rp-grow" />
++                  <Button
++                    small
++                    isDisabled={installed || !model.data || model.busy}
++                    isPending={model.action === `builtin:${preset.id}`}
++                    label={t(installed ? 'rr.builtinInstalledLabel' : 'rr.builtinAddLabel', {name: t(preset.label)})}
++                    onPress={() => void add(preset)}
++                  >
++                    {t(installed ? 'rr.builtinInstalled' : 'rr.add')}
++                  </Button>
++                </div>
++                {!installed && preset.category && <p className="rp-note rr-builtin-source">{presetUrl(preset, source)}</p>}
++              </section>
++            );
++          })}
++        </div>
++        {!visible.length && <Empty>{t('rr.builtinNoMatch')}</Empty>}
++      </div>
++    </ModalDialog>
++  );
++}
+diff --git a/src/features/shared/resources/DnsWorkspace.tsx b/src/features/shared/resources/DnsWorkspace.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/features/shared/resources/DnsWorkspace.tsx
+@@ -0,0 +1,412 @@
++import {useState} from 'react';
++import {runtime, resourceId, type RulesDocument} from '../../../api/rulesRuntime';
++import {useT} from '../../../i18n';
++import {useDraftGuard} from '../../../shell/draft';
++import {useResource} from '../../../store/resource';
++import {useAction} from '../../../store/action';
++import {Button, Card, ErrorMessage, ModalDialog, Toolbar, Badge, Empty, Link} from '../../../ui/ui';
++import {href} from '../../../shell/route';
++import {ResourceManager} from './ResourceManager';
++import {Check, Field, Grid, lines, OutboundSelect, RuntimeHeader, useRulesRuntime} from './common';
++
++type DnsStatistics = {
++  cache: {entries: number; bytes: number; pending: number; hits: number; misses: number; coalesced: number; stale: number};
++  transport: {endpoints: {id: string; queries: number; failures: number; p50_ms: number | null; p95_ms: number | null; last_error: string | null}[]};
++};
++export function DnsUpstreams() {
++  return (
++    <div className="rr-list">
++      <ResourceManager kind="resolvers" />
++      <ResourceManager kind="pools" />
++      <BootstrapSettings />
++      <DnsLiveStats />
++    </div>
++  );
++}
++export function DnsPolicies() {
++  const t = useT();
++  const [preset, setPreset] = useState(false);
++  return (
++    <div className="rr-list">
++      <Toolbar>
++        <span className="rp-note rp-grow">{t('rr.policyPriority')}</span>
++        <Button onPress={() => setPreset(true)}>{t('rr.preset')}</Button>
++      </Toolbar>
++      <ResourceManager kind="policies" />
++      {preset && <PresetEditor close={() => setPreset(false)} />}
++    </div>
++  );
++}
++function PresetEditor({close}: {close: () => void}) {
++  const t = useT();
++  const model = useRulesRuntime();
++  const [outbound, setOutbound] = useState('direct');
++  const [routing, setRouting] = useState(false);
++  const [domestic, setDomestic] = useState('https://dns.alidns.com/dns-query');
++  const [foreign, setForeign] = useState('https://cloudflare-dns.com/dns-query');
++  const apply = async () => {
++    if (!model.data) return;
++    const old = model.data.document;
++    const cn = resourceId(),
++      remote = resourceId(),
++      localPool = resourceId(),
++      remotePool = resourceId();
++    const document: RulesDocument = {
++      ...old,
++      resolvers: [
++        ...old.resolvers,
++        {id: cn, name: t('rr.domestic'), url: domestic, outbound: 'direct', bootstrap: ['223.5.5.5'], tls_name: '', timeout_ms: 3000},
++        {id: remote, name: t('rr.foreign'), url: foreign, outbound, bootstrap: ['1.1.1.1', '2606:4700:4700::1111'], tls_name: '', timeout_ms: 5000}
++      ],
++      pools: [
++        ...old.pools,
++        {id: localPool, name: t('rr.domestic'), members: [cn], strategy: 'fallback'},
++        {id: remotePool, name: t('rr.foreign'), members: [remote], strategy: 'fallback'}
++      ],
++      policies: [
++        ...old.policies,
++        {
++          id: resourceId(),
++          name: t('rr.local'),
++          enabled: true,
++          condition: 'domain(suffix: local, suffix: lan, full: localhost)',
++          pool: localPool,
++          address_mode: 'real-ip'
++        },
++        {id: resourceId(), name: t('rr.domestic'), enabled: true, condition: 'domain(geosite: cn)', pool: localPool, address_mode: 'real-ip'},
++        {id: resourceId(), name: t('rr.foreign'), enabled: true, condition: 'domain(regex: ".*")', pool: remotePool, address_mode: 'fake-ip'}
++      ],
++      bindings: routing
++        ? [
++            ...old.bindings,
++            {id: resourceId(), name: t('rr.domestic'), enabled: true, condition: 'domain(geosite: cn)', outbound: 'direct'},
++            {id: resourceId(), name: t('rr.foreign'), enabled: true, condition: 'domain(regex: ".*")', outbound}
++          ]
++        : old.bindings
++    };
++    if (await model.save(document)) close();
++  };
++  return (
++    <ModalDialog
++      title={t('rr.preset')}
++      isOpen
++      scrollBody
++      onOpenChange={open => {
++        if (!open && !model.busy) close();
++      }}
++      footer={() => (
++        <Toolbar>
++          <Button isDisabled={model.busy} onPress={close}>
++            {t('ui.cancel')}
++          </Button>
++          <Button accent isPending={model.busy} isDisabled={!model.data || outbound === 'direct'} onPress={() => void apply()}>
++            {t('rr.save')}
++          </Button>
++        </Toolbar>
++      )}
++    >
++      <div className="rr-list">
++        <ErrorMessage error={model.actionError} />
++        <p className="rp-note">{t('rr.presetHint')}</p>
++        <Grid>
++          <Field label={t('rr.domestic')} value={domestic} onChange={setDomestic} />
++          <Field label={t('rr.foreign')} value={foreign} onChange={setForeign} />
++        </Grid>
++        <OutboundSelect model={model} value={outbound} onChange={setOutbound} />
++        <Check label={t('rr.presetRouting')} value={routing} onChange={setRouting} />
++        <ol>
++          <li>
++            {t('rr.local')} → {t('rr.domestic')} · {t('rr.real')}
++          </li>
++          <li>
++            {t('rr.geoCn')} → {t('rr.domestic')} · {t('rr.real')}
++          </li>
++          <li>
++            {t('rr.otherDomains')} → {t('rr.foreign')} · {t('rr.fakeIp')}
++          </li>
++        </ol>
++        <p className="rp-note">{t('rr.presetMissingGeo')}</p>
++      </div>
++    </ModalDialog>
++  );
++}
++function BootstrapSettings() {
++  const t = useT();
++  const model = useRulesRuntime();
++  const [draft, setDraft] = useState<{revision: string; text: string} | null>(null);
++  const dirty = !!draft && draft.text !== model.data?.document.bootstrap.join('\n');
++  const guard = useDraftGuard(dirty, () => setDraft(null), 'rr.bootstrap');
++  return (
++    <Card title={t('rr.bootstrap')}>
++      <div className="rr-list">
++        <ErrorMessage error={model.error ?? model.actionError} />
++        <Field
++          area
++          label={t('rr.bootstrap')}
++          value={draft?.text ?? model.data?.document.bootstrap.join('\n') ?? ''}
++          onChange={text => {
++            if (model.data) setDraft({revision: draft?.revision ?? model.data.revision, text});
++          }}
++          hint={t('rr.bootstrapIndependent')}
++        />
++        <Toolbar>
++          <Button
++            accent
++            isPending={model.busy}
++            isDisabled={!dirty || draft?.revision !== model.data?.revision}
++            onPress={async () => {
++              if (model.data && draft && (await model.save({...model.data.document, bootstrap: lines(draft.text)}, draft.revision))) {
++                guard.clear();
++                setDraft(null);
++              }
++            }}
++          >
++            {t('rr.save')}
++          </Button>
++          <Button isDisabled={model.busy || !dirty} onPress={() => setDraft(null)}>
++            {t('ui.cancel')}
++          </Button>
++        </Toolbar>
++      </div>
++    </Card>
++  );
++}
++export function DnsLiveStats() {
++  const t = useT();
++  const model = useRulesRuntime();
++  const stats = useResource({key: ['dnsWireStats'], every: 10000, fetch: signal => runtime<DnsStatistics>('GET', '/api/v1/dns/statistics', undefined, signal)});
++  const cache = stats.data?.cache;
++  return (
++    <Card title={t('rr.actualStats')}>
++      <div className="rr-list">
++        <ErrorMessage error={stats.error} onRetry={stats.refetch} />
++        {cache && (
++          <Toolbar>
++            <Badge>
++              {t('rr.hits')} {cache.hits}
++            </Badge>
++            <Badge>
++              {t('rr.misses')} {cache.misses}
++            </Badge>
++            <Badge>
++              {t('rr.coalesced')} {cache.coalesced}
++            </Badge>
++            <Badge>
++              {t('rr.cacheEntries')} {cache.entries}
++            </Badge>
++            <span className="rp-note">
++              {(cache.bytes / 1048576).toFixed(2)} {t('rr.mb')} · {t('rr.pending')} {cache.pending} · {t('rr.staleReplies')} {cache.stale}
++            </span>
++          </Toolbar>
++        )}
++        <div className="rr-scroll">
++          <table className="rr-table">
++            <thead>
++              <tr>
++                <th>{t('rr.resolvers')}</th>
++                <th>{t('rr.queries')}</th>
++                <th>{t('rr.failures')}</th>
++                <th>P50 / P95</th>
++              </tr>
++            </thead>
++            <tbody>
++              {stats.data?.transport.endpoints.map(row => (
++                <tr key={row.id}>
++                  <td>
++                    {model.data?.document.resolvers.find(r => r.id === row.id)?.name ?? row.id}
++                    {row.last_error && <p className="rp-note">{row.last_error}</p>}
++                  </td>
++                  <td>{row.queries}</td>
++                  <td>{row.failures}</td>
++                  <td>
++                    {row.p50_ms ?? '—'} / {row.p95_ms ?? '—'} {t('rr.ms')}
++                  </td>
++                </tr>
++              ))}
++            </tbody>
++          </table>
++        </div>
++        <p className="rp-note">{t('rr.statsScope')}</p>
++      </div>
++    </Card>
++  );
++}
++export function WireCache() {
++  const t = useT();
++  const model = useRulesRuntime();
++  const action = useAction<string>({shared: 'dns-cache'});
++  const entries = useResource({
++    key: ['dnsWireCache'],
++    every: 10000,
++    fetch: signal =>
++      runtime<{entries: {domain: string; pool: string; negative: boolean; ttl_seconds: number; hits: number; bytes: number}[]}>(
++        'GET',
++        '/api/v1/dns/wire-cache',
++        undefined,
++        signal
++      )
++  });
++  const [draft, setDraft] = useState<{revision: string; document: RulesDocument} | null>(null);
++  const options = draft?.document.cache ?? model.data?.document.cache;
++  const edit = (change: object) => {
++    if (model.data && options)
++      setDraft({revision: draft?.revision ?? model.data.revision, document: {...(draft?.document ?? model.data.document), cache: {...options, ...change}}});
++  };
++  const guard = useDraftGuard(!!draft, () => setDraft(null), 'rr.cacheOptions');
++  const clear = async (domain?: string) => {
++    const result = await action.run('clear', signal => runtime<{removed: number}>('DELETE', '/api/v1/dns/wire-cache', {domain: domain ?? null}, signal));
++    if (result) {
++      entries.refetch();
++    }
++  };
++  return (
++    <div className="rr-list">
++      <Card title={t('rr.cacheOptions')}>
++        <RuntimeHeader model={model} />
++        {options && (
++          <div className="rr-list">
++            <Grid>
++              <Field type="number" label={t('rr.capacity')} min={64} max={20000} value={options.capacity} onChange={v => edit({capacity: Number(v)})} />
++              <Field
++                type="number"
++                label={t('rr.maxMemory')}
++                min={1}
++                max={64}
++                value={options.max_bytes / 1048576}
++                onChange={v => edit({max_bytes: Number(v) * 1048576})}
++              />
++              <Field
++                type="number"
++                label={t('rr.staleSeconds')}
++                min={0}
++                max={300}
++                value={options.stale_seconds}
++                onChange={v => edit({stale_seconds: Number(v)})}
++              />
++            </Grid>
++            <Toolbar>
++              <Check label={t('rr.negativeCache')} value={options.negative} onChange={negative => edit({negative})} />
++              <Check label={t('rr.prefetch')} value={options.prefetch} onChange={prefetch => edit({prefetch})} />
++            </Toolbar>
++            <p className="rp-note">{t('rr.cacheHint')}</p>
++            <Toolbar>
++              <Button
++                accent
++                isPending={model.busy}
++                isDisabled={!draft || draft.revision !== model.data?.revision}
++                onPress={async () => {
++                  if (draft && (await model.save(draft.document, draft.revision))) {
++                    guard.clear();
++                    setDraft(null);
++                  }
++                }}
++              >
++                {t('rr.save')}
++              </Button>
++              <Button isDisabled={model.busy || !draft} onPress={() => setDraft(null)}>
++                {t('ui.cancel')}
++              </Button>
++            </Toolbar>
++          </div>
++        )}
++      </Card>
++      <Card title={t('rr.realCache')}>
++        <div className="rr-list">
++          <ErrorMessage error={entries.error ?? action.error} onRetry={entries.refetch} />
++          <Toolbar>
++            <span className="rp-note rp-grow">{t('rr.first100')}</span>
++            <Button isPending={!!action.busy} onPress={() => void clear()}>
++              {t('rr.clearRealCache')}
++            </Button>
++          </Toolbar>
++          <div className="rr-scroll">
++            <table className="rr-table">
++              <thead>
++                <tr>
++                  <th>{t('ui.domain')}</th>
++                  <th>{t('rr.pools')}</th>
++                  <th>{t('rr.kind')}</th>
++                  <th>{t('rr.ttl')}</th>
++                  <th>{t('ui.actions')}</th>
++                </tr>
++              </thead>
++              <tbody>
++                {entries.data?.entries.map((row, i) => (
++                  <tr key={`${row.domain}:${i}`}>
++                    <td>{row.domain}</td>
++                    <td>{model.data?.document.pools.find(p => p.id === row.pool)?.name ?? row.pool}</td>
++                    <td>{t(row.negative ? 'rr.negative' : 'rr.positive')}</td>
++                    <td>{row.ttl_seconds}s</td>
++                    <td>
++                      <Button small quiet isDisabled={!!action.busy} onPress={() => void clear(row.domain)}>
++                        {t('rr.remove')}
++                      </Button>
++                    </td>
++                  </tr>
++                ))}
++              </tbody>
++            </table>
++          </div>
++        </div>
++      </Card>
++      <FakeIpPolicySummary />
++      <DnsLiveStats />
++    </div>
++  );
++}
++export function FakeIpPolicySummary() {
++  const t = useT();
++  const model = useRulesRuntime();
++  const rows = model.data?.document.policies.filter(p => p.enabled && p.address_mode !== 'inherit') ?? [];
++  const action = useAction<string>({shared: 'dns-cache'});
++  const [confirm, setConfirm] = useState(false);
++  return (
++    <Card title={t('rr.fakeIpLink')}>
++      <div className="rr-list">
++        <ErrorMessage error={action.error} />
++        <p className="rp-note">{t('rr.fakeIpHint')}</p>
++        {rows.map(row => (
++          <div className="rr-item" key={row.id}>
++            <div className="rr-main">
++              <strong>{row.name}</strong>
++              <p className="rp-note">{row.condition}</p>
++            </div>
++            <Badge>{row.address_mode}</Badge>
++          </div>
++        ))}
++        {!rows.length && <Empty>{t('rr.noAddressPolicy')}</Empty>}
++        <Toolbar>
++          <Link href={href('dns', {tab: 'policies'})}>{t('rr.editPolicies')}</Link>
++          <Button isDisabled={!!action.busy} onPress={() => setConfirm(true)}>
++            {t('rr.clearMappings')}
++          </Button>
++        </Toolbar>
++        <p className="rp-note">{t('rr.mappingScope')}</p>
++      </div>
++      {confirm && (
++        <ModalDialog
++          title={t('rr.clearMappings')}
++          isOpen
++          onOpenChange={setConfirm}
++          footer={() => (
++            <Toolbar>
++              <Button onPress={() => setConfirm(false)}>{t('ui.cancel')}</Button>
++              <Button
++                accent
++                isPending={!!action.busy}
++                onPress={async () => {
++                  if (await action.run('fakeip', signal => runtime('POST', '/api/v1/dns/wire-cache/fakeip/flush', {}, signal))) setConfirm(false);
++                }}
++              >
++                {t('rr.clearMappings')}
++              </Button>
++            </Toolbar>
++          )}
++        >
++          <p>{t('rr.clearMappingsHint')}</p>
++          <ErrorMessage error={action.error} />
++        </ModalDialog>
++      )}
++    </Card>
++  );
++}
+diff --git a/src/features/shared/resources/Geodata.tsx b/src/features/shared/resources/Geodata.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/features/shared/resources/Geodata.tsx
+@@ -0,0 +1,157 @@
++import {useState} from 'react';
++import {useT} from '../../../i18n';
++import {runtime, resourceId} from '../../../api/rulesRuntime';
++import {useResource} from '../../../store/resource';
++import {Badge, Button, Card, Empty, ErrorMessage, ModalDialog, Toolbar} from '../../../ui/ui';
++import {GeodataSettingsCard} from '../../settings/GeodataSettings';
++import {Field, OutboundSelect, RuntimeHeader, Select, useRulesRuntime} from './common';
++
++export function Geodata() {
++  const t = useT();
++  const model = useRulesRuntime();
++  const [kind, setKind] = useState('geosite');
++  const [search, setSearch] = useState('');
++  const [query, setQuery] = useState('');
++  const [offset, setOffset] = useState(0);
++  const [selected, setSelected] = useState('');
++  const [outbound, setOutbound] = useState('direct');
++  const [pool, setPool] = useState('');
++  const [addressMode, setAddressMode] = useState('inherit');
++  const entries = useResource({
++    key: ['geoCategories', {kind, query, offset, revision: model.data?.revision}],
++    fetch: signal =>
++      runtime<{sha256: string; categories: string[]; total: number}>(
++        'GET',
++        `/api/v1/geodata/categories?kind=${kind}&q=${encodeURIComponent(query)}&offset=${offset}`,
++        undefined,
++        signal
++      )
++  });
++  const details = useResource(
++    {
++      key: ['geoDetails', {kind, selected, revision: model.data?.revision}],
++      fetch: signal =>
++        runtime<{count: number; samples: string[]; references: {name: string; scope: string}[]}>(
++          'GET',
++          `/api/v1/geodata/categories/detail?kind=${kind}&id=${encodeURIComponent(selected)}`,
++          undefined,
++          signal
++        )
++    },
++    {enabled: !!selected}
++  );
++  const condition = `${kind === 'geosite' ? 'domain(geosite' : 'dip(geoip'}: ${JSON.stringify(selected)})`;
++  const create = async (dns: boolean) => {
++    if (!model.data) return;
++    const row = {id: resourceId(), name: `${kind} · ${selected}`, enabled: true, condition};
++    const document = dns
++      ? {...model.data.document, policies: [...model.data.document.policies, {...row, pool, address_mode: addressMode}]}
++      : {...model.data.document, bindings: [...model.data.document.bindings, {...row, outbound}]};
++    if (await model.save(document)) setSelected('');
++  };
++  return (
++    <div className="rr-list">
++      <GeodataSettingsCard managedHere />
++      <Card title={t('rr.geodata')}>
++        <RuntimeHeader model={model} />
++        <Toolbar>
++          <Select
++            label={t('rr.kind')}
++            value={kind}
++            onChange={v => {
++              setKind(v);
++              setOffset(0);
++              setSelected('');
++            }}
++            items={[
++              {id: 'geosite', label: 'GeoSite'},
++              {id: 'geoip', label: 'GeoIP'}
++            ]}
++          />
++          <Field label={t('rr.search')} value={search} onChange={setSearch} />
++          <Button
++            onPress={() => {
++              setQuery(search);
++              setOffset(0);
++            }}
++          >
++            {t('rr.search')}
++          </Button>
++        </Toolbar>
++        <ErrorMessage error={entries.error} onRetry={entries.refetch} />
++        <Toolbar>
++          {entries.data?.categories.map(name => (
++            <Button key={name} small quiet onPress={() => setSelected(name)}>
++              {name}
++            </Button>
++          ))}
++        </Toolbar>
++        {entries.data?.categories.length === 0 && <Empty>{t('rr.empty')}</Empty>}
++        <Toolbar>
++          <Badge>{entries.data?.total ?? 0}</Badge>
++          <span className="rp-note rr-version" title={entries.data?.sha256}>
++            {entries.data?.sha256}
++          </span>
++          <span className="rp-grow" />
++          <Button isDisabled={offset === 0} onPress={() => setOffset(Math.max(0, offset - 100))}>
++            {t('rr.previous')}
++          </Button>
++          <Button isDisabled={(entries.data?.categories.length ?? 0) < 100} onPress={() => setOffset(offset + 100)}>
++            {t('rr.next')}
++          </Button>
++        </Toolbar>
++      </Card>
++      {!!selected && (
++        <ModalDialog
++          title={`${kind} · ${selected}`}
++          isOpen
++          scrollBody
++          onOpenChange={open => {
++            if (!open && !model.busy) setSelected('');
++          }}
++        >
++          <div className="rr-list">
++            <ErrorMessage error={details.error ?? model.actionError} />
++            <p className="rp-note">
++              {t('rr.cacheEntries')} · {details.data?.count ?? '—'}
++            </p>
++            <pre className="rr-entries">{details.data?.samples.join('\n')}</pre>
++            <p>{t('rr.references')}</p>
++            {details.data?.references.map((r, i) => (
++              <p className="rp-note" key={i}>
++                {r.name} · {r.scope}
++              </p>
++            ))}
++            <OutboundSelect model={model} value={outbound} onChange={setOutbound} />
++            <Button isPending={model.busy} onPress={() => void create(false)}>
++              {t('rr.createRouting')}
++            </Button>
++            {kind === 'geosite' && (
++              <>
++                <Select
++                  label={t('rr.pools')}
++                  value={pool}
++                  onChange={setPool}
++                  items={[{id: '', label: t('rr.choose')}, ...(model.data?.document.pools ?? []).map(p => ({id: p.id, label: p.name}))]}
++                />
++                <Select
++                  label={t('rr.addressMode')}
++                  value={addressMode}
++                  onChange={setAddressMode}
++                  items={[
++                    {id: 'inherit', label: t('rr.inherit')},
++                    {id: 'real-ip', label: t('rr.real')},
++                    {id: 'fake-ip', label: 'Fake-IP'}
++                  ]}
++                />
++                <Button isPending={model.busy} isDisabled={!pool} onPress={() => void create(true)}>
++                  {t('rr.createDns')}
++                </Button>
++              </>
++            )}
++          </div>
++        </ModalDialog>
++      )}
++    </div>
++  );
++}
+diff --git a/src/features/shared/resources/ResourceManager.tsx b/src/features/shared/resources/ResourceManager.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/features/shared/resources/ResourceManager.tsx
+@@ -0,0 +1,699 @@
++import {useRef, useState} from 'react';
++import {useT, type Key} from '../../../i18n';
++import {Button, Card, Empty, ErrorMessage, ModalDialog, Toolbar, Badge} from '../../../ui/ui';
++import {useAction} from '../../../store/action';
++import {refetchAll} from '../../../store/resourceCore';
++import {useDraftGuard} from '../../../shell/draft';
++import {DragHandle, FileInput} from '../../../ui/ResourceFields';
++import {useResource} from '../../../store/resource';
++import {
++  runtime,
++  operation,
++  newProvider,
++  resourceId,
++  sourceLabel,
++  type Binding,
++  type Policy,
++  type Pool,
++  type Reference,
++  type Resolver,
++  type ResourceKind,
++  type ResourceRow,
++  type RuleProvider,
++  type RulesStatus
++} from '../../../api/rulesRuntime';
++import {Check, Field, Grid, lines, OutboundSelect, RuntimeHeader, Select, useRulesRuntime, type RuntimeModel} from './common';
++import {BuiltinProviders} from './BuiltinProviders';
++
++const names: Record<ResourceKind, Key> = {
++  providers: 'rr.providers',
++  resolvers: 'rr.resolvers',
++  pools: 'rr.pools',
++  policies: 'rr.policies',
++  bindings: 'rr.bindings'
++};
++export function ResourceManager({kind, initialCondition}: {kind: ResourceKind; initialCondition?: string}) {
++  const t = useT();
++  const model = useRulesRuntime();
++  const refreshAction = useAction<'refresh'>({shared: 'rule-provider-download'});
++  const cancelAction = useAction<'cancel'>();
++  const [refreshingId, setRefreshingId] = useState('');
++  const [cancelledId, setCancelledId] = useState('');
++  const cancellation = useRef('');
++  const refresh = async (id: string) => {
++    setRefreshingId(id);
++    setCancelledId('');
++    cancellation.current = '';
++    await refreshAction.run('refresh', signal => operation('/refresh', {id}, signal));
++    if (cancellation.current === id) refreshAction.setError(null);
++    setRefreshingId('');
++    await refetchAll();
++  };
++  const cancel = async (id: string) => {
++    const result = await cancelAction.run('cancel', signal => runtime('POST', '/cancel', {id}, signal));
++    if (result) {
++      cancellation.current = id;
++      setCancelledId(id);
++      model.refetch();
++    }
++  };
++  const [editing, setEditing] = useState<ResourceRow | null>(null);
++  const [deleting, setDeleting] = useState<ResourceRow | null>(null);
++  const [preview, setPreview] = useState<RuleProvider | null>(null);
++  const [builtin, setBuiltin] = useState(false);
++  const [drop, setDrop] = useState('');
++  const drag = useRef('');
++  const rows = model.data?.document[kind] ?? [];
++  const add = () => {
++    const base = {id: resourceId(), name: '', enabled: true};
++    const condition = initialCondition ?? 'domain(suffix: example.com)';
++    const row =
++      kind === 'providers'
++        ? newProvider()
++        : kind === 'resolvers'
++          ? {...base, url: 'https://dns.alidns.com/dns-query', outbound: 'direct', bootstrap: ['223.5.5.5'], tls_name: '', timeout_ms: 3000}
++          : kind === 'pools'
++            ? {...base, members: [], strategy: 'fallback'}
++            : kind === 'policies'
++              ? {...base, condition, pool: model.data?.document.pools[0]?.id ?? '', address_mode: 'inherit'}
++              : {...base, condition, outbound: 'direct'};
++    setEditing(row);
++  };
++  const reorder = (id: string, before: string) => {
++    setDrop('');
++    drag.current = '';
++    if (!model.data || model.busy || id === before) return;
++    const changed = rows.filter(r => r.id !== id);
++    const row = rows.find(r => r.id === id);
++    if (!row) return;
++    const at = changed.findIndex(r => r.id === before);
++    changed.splice(at < 0 ? changed.length : at, 0, row);
++    void model.save({...model.data.document, [kind]: changed});
++  };
++  return (
++    <Card title={t(names[kind])}>
++      <RuntimeHeader model={model} />
++      <ErrorMessage error={refreshAction.error ?? cancelAction.error} />
++      <Toolbar>
++        <p className="rp-note rp-grow">
++          {t(kind === 'providers' ? 'rr.providerHelp' : kind === 'policies' ? 'rr.policyHelp' : kind === 'bindings' ? 'rr.bindingHelp' : 'rr.upstreamHelp')}
++        </p>
++        {kind === 'providers' && (
++          <Button isDisabled={!model.data || model.busy} onPress={() => setBuiltin(true)}>
++            {t('rr.builtin')}
++          </Button>
++        )}
++        <Button isDisabled={!model.data || model.busy} onPress={add}>
++          {t('rr.add')}
++        </Button>
++      </Toolbar>
++      <div className="rr-list">
++        {rows.map((row, index) => {
++          const provider = kind === 'providers' ? (row as RuleProvider) : null;
++          const resource = model.data?.resources.find(r => r.id === row.id);
++          const update = model.data?.updates[row.id];
++          const sortable = kind === 'policies' || kind === 'bindings';
++          return (
++            <div
++              className="rr-item"
++              key={row.id}
++              data-drop={drop === row.id}
++              onDragOver={e => {
++                if (sortable && drag.current) {
++                  e.preventDefault();
++                  setDrop(row.id);
++                }
++              }}
++              onDrop={e => {
++                e.preventDefault();
++                if (sortable) reorder(drag.current, row.id);
++              }}
++            >
++              {sortable && (
++                <DragHandle
++                  label={t('rr.reorder')}
++                  disabled={model.busy}
++                  onStart={e => {
++                    drag.current = row.id;
++                    e.dataTransfer.setData('text/plain', row.id);
++                  }}
++                  onEnd={() => {
++                    drag.current = '';
++                    setDrop('');
++                  }}
++                />
++              )}
++              <div className="rr-main">
++                <strong>{row.name}</strong>
++                <p className="rp-note">
++                  {provider
++                    ? sourceLabel(provider)
++                    : 'condition' in row
++                      ? row.condition
++                      : 'url' in row
++                        ? row.url
++                        : (row as Pool).members.map(id => model.data?.document.resolvers.find(r => r.id === id)?.name ?? id).join(' → ')}
++                </p>
++                {resource && (
++                  <p className="rp-note">
++                    {resource.format} · {resource.behavior} · {resource.count.toLocaleString()} · {resource.sha256.slice(0, 12)} · {t('rr.references')}{' '}
++                    {resource.ref_count}
++                  </p>
++                )}
++                {provider?.updated_at ? <p className="rp-note">{new Date(provider.updated_at * 1000).toLocaleString()}</p> : null}
++                {update && (
++                  <p role="status" className="rp-note">
++                    {t(
++                      update.state === 'applying'
++                        ? 'rr.applying'
++                        : update.state === 'running'
++                          ? 'rr.updating'
++                          : update.state === 'failed'
++                            ? 'rr.failed'
++                            : update.state === 'cancelled'
++                              ? 'rr.cancelled'
++                              : 'rr.current'
++                    )}
++                    {update.message ? ` · ${update.message}` : ''}
++                  </p>
++                )}
++                {'pool' in row && (
++                  <Badge>
++                    {model.data?.document.pools.find(p => p.id === row.pool)?.name ?? row.pool} · {row.address_mode}
++                  </Badge>
++                )}
++                {'outbound' in row && !provider && <Badge>{row.outbound === 'direct' ? t('rr.direct') : row.outbound}</Badge>}
++              </div>
++              <div className="rp-cluster">
++                {'enabled' in row && (
++                  <Check
++                    label={t('rr.enabled')}
++                    value={row.enabled}
++                    disabled={model.busy}
++                    onChange={enabled => {
++                      if (model.data) void model.save({...model.data.document, [kind]: rows.map(r => (r.id === row.id ? {...r, enabled} : r))});
++                    }}
++                  />
++                )}
++                {provider?.source === 'http' && (
++                  <Button small isDisabled={model.busy || !!refreshAction.busy} isPending={refreshingId === row.id} onPress={() => void refresh(row.id)}>
++                    {t('rr.update')}
++                  </Button>
++                )}
++                {(update?.state === 'running' || refreshingId === row.id) && (
++                  <Button small isPending={!!cancelAction.busy} isDisabled={cancelledId === row.id} onPress={() => void cancel(row.id)}>
++                    {t(cancelledId === row.id ? 'rr.cancelRequested' : 'ui.cancel')}
++                  </Button>
++                )}
++                {provider && (
++                  <Button small quiet onPress={() => setPreview(provider)}>
++                    {t('rr.entries')}
++                  </Button>
++                )}
++                {sortable && index > 0 && (
++                  <Button small quiet isDisabled={model.busy} onPress={() => reorder(row.id, rows[index - 1].id)}>
++                    {t('rr.moveUp')}
++                  </Button>
++                )}
++                <Button small isDisabled={model.busy} onPress={() => setEditing(structuredClone(row))}>
++                  {t('rr.edit')}
++                </Button>
++                <Button small quiet isDisabled={model.busy} onPress={() => setDeleting(row)}>
++                  {t('rr.remove')}
++                </Button>
++              </div>
++            </div>
++          );
++        })}
++      </div>
++      {!rows.length && <Empty>{t('rr.empty')}</Empty>}
++      {editing && <ResourceEditor key={editing.id} kind={kind} initial={editing} model={model} close={() => setEditing(null)} />}
++      {deleting && <RemoveResource kind={kind} row={deleting} model={model} close={() => setDeleting(null)} />}
++      {preview && <ProviderEntries provider={preview} close={() => setPreview(null)} />}
++      {builtin && <BuiltinProviders model={model} close={() => setBuiltin(false)} />}
++    </Card>
++  );
++}
++
++export function ConditionField({value, onChange, model, dns = false}: {value: string; onChange: (value: string) => void; model: RuntimeModel; dns?: boolean}) {
++  const t = useT();
++  const parsed = /^(?:domain|dip)\((full|suffix|geosite|geoip):\s*([^()]+)\)$/.exec(value);
++  const set = /^ruleset\(["']?([\w-]+)["']?\)$/.exec(value);
++  const [mode, setMode] = useState(set ? 'ruleset' : (parsed?.[1] ?? 'expression'));
++  const current = mode === 'ruleset' ? (set?.[1] ?? '') : mode === 'expression' ? value : (parsed?.[2].replace(/^['"]|['"]$/g, '') ?? '');
++  const write = (kind: string, text: string) =>
++    onChange(
++      kind === 'expression' ? text : kind === 'ruleset' ? `ruleset('${text}')` : `${kind === 'geoip' ? 'dip' : 'domain'}(${kind}: ${JSON.stringify(text)})`
++    );
++  const sets = model.data?.document.providers.filter(p => !dns || model.data?.resources.find(r => r.id === p.id)?.domain_only) ?? [];
++  return (
++    <Grid>
++      <Select
++        label={t('rr.match')}
++        value={mode}
++        onChange={m => {
++          setMode(m);
++          write(m, m === 'ruleset' ? (sets[0]?.id ?? '') : m === 'expression' ? value : '');
++        }}
++        items={[
++          {id: 'suffix', label: t('rr.suffix')},
++          {id: 'full', label: t('rr.full')},
++          {id: 'geosite', label: 'GeoSite'},
++          ...(!dns ? [{id: 'geoip', label: 'GeoIP'}] : []),
++          {id: 'ruleset', label: t('rr.providers')},
++          {id: 'expression', label: t('rr.expression')}
++        ]}
++      />
++      {mode === 'ruleset' ? (
++        <Select
++          label={t('rr.providers')}
++          value={current}
++          onChange={s => write(mode, s)}
++          items={[{id: '', label: t('rr.choose')}, ...sets.map(p => ({id: p.id, label: p.name}))]}
++        />
++      ) : (
++        <Field
++          label={t('rr.condition')}
++          value={current}
++          onChange={s => write(mode, s)}
++          placeholder={t(mode === 'expression' ? 'rr.expressionExample' : 'rr.domainExample')}
++          hint={mode === 'full' ? t('rr.fullHint') : mode === 'suffix' ? t('rr.suffixHint') : undefined}
++        />
++      )}
++    </Grid>
++  );
++}
++
++function ResourceEditor({kind, initial, model, close}: {kind: ResourceKind; initial: ResourceRow; model: RuntimeModel; close: () => void}) {
++  const t = useT();
++  const [row, setRow] = useState(initial);
++  const [base64, setBase64] = useState<string>();
++  const [fileName, setFileName] = useState('');
++  const [headers, setHeaders] = useState(
++    'headers' in initial
++      ? Object.entries(initial.headers)
++          .map(([k, v]) => `${k}: ${v}`)
++          .join('\n')
++      : ''
++  );
++  const [localError, setLocalError] = useState<Error | null>(null);
++  const [revision] = useState(model.data?.revision);
++  const original = model.data?.document[kind].find(r => r.id === initial.id);
++  const dirty =
++    !original ||
++    JSON.stringify(initial) !== JSON.stringify(row) ||
++    !!base64 ||
++    ('headers' in initial &&
++      headers !==
++        Object.entries(initial.headers)
++          .map(([k, v]) => `${k}: ${v}`)
++          .join('\n'));
++  const guard = useDraftGuard(dirty, close, names[kind]);
++  const stale = revision !== model.data?.revision;
++  const patch = (values: object) => setRow({...row, ...values});
++  const save = async () => {
++    if (!model.data || model.busy || stale || !row.name.trim()) return;
++    setLocalError(null);
++    let result: RulesStatus | undefined;
++    if (kind === 'providers') {
++      const provider = {...row} as RuleProvider;
++      try {
++        provider.headers = Object.fromEntries(
++          headers
++            .split(/\r?\n/)
++            .filter(Boolean)
++            .map(line => {
++              const colon = line.indexOf(':');
++              if (colon < 1) throw new Error(t('rr.headerError'));
++              return [line.slice(0, colon).trim(), line.slice(colon + 1).trim()];
++            })
++        );
++      } catch (e) {
++        setLocalError(e as Error);
++        return;
++      }
++      if (provider.source === 'file' && !base64 && !provider.accepted_sha256) {
++        setLocalError(new Error(t('rr.fileRequired')));
++        return;
++      }
++      const download = provider.source === 'http' && (!original || (original as RuleProvider).url !== provider.url || !provider.accepted_sha256);
++      if (download || base64)
++        result = await model.write('import', signal => operation('/import', {revision: revision, provider, ...(base64 ? {base64} : {})}, signal));
++      else result = await model.save({...model.data.document, providers: [...model.data.document.providers.filter(p => p.id !== row.id), provider]}, revision);
++    } else {
++      const rows = model.data.document[kind];
++      result = await model.save({...model.data.document, [kind]: original ? rows.map(r => (r.id === row.id ? row : r)) : [...rows, row]}, revision);
++    }
++    if (result) {
++      guard.clear();
++      close();
++    }
++  };
++  const provider = row as RuleProvider;
++  const resolver = row as Resolver;
++  const pool = row as Pool;
++  const policy = row as Policy;
++  const binding = row as Binding;
++  return (
++    <ModalDialog
++      title={`${t('rr.edit')} · ${t(names[kind])}`}
++      isOpen
++      scrollBody
++      onOpenChange={open => {
++        if (!open && !model.busy) {
++          guard.clear();
++          close();
++        }
++      }}
++      footer={() => (
++        <Toolbar>
++          <Button
++            isDisabled={model.busy}
++            onPress={() => {
++              guard.clear();
++              close();
++            }}
++          >
++            {t('ui.cancel')}
++          </Button>
++          <Button accent isPending={model.busy} isDisabled={!row.name.trim() || stale} onPress={() => void save()}>
++            {t('rr.save')}
++          </Button>
++        </Toolbar>
++      )}
++    >
++      <fieldset disabled={model.busy} className="rr-list rr-fields">
++        <ErrorMessage error={localError ?? model.actionError} />
++        {stale && <p role="alert">{t('rr.stale')}</p>}
++        <Field label={t('rr.name')} value={row.name} onChange={name => patch({name})} disabled={model.busy} />
++        {kind === 'providers' && (
++          <>
++            <Select
++              label={t('rr.source')}
++              value={provider.source}
++              onChange={source => patch({source})}
++              items={[
++                {id: 'http', label: t('rr.url')},
++                {id: 'file', label: t('rr.file')},
++                {id: 'inline', label: t('rr.content')}
++              ]}
++            />
++            {provider.source === 'http' && (
++              <Field label={t('rr.url')} value={provider.url} onChange={url => patch({url})} placeholder={t('rr.sourceExample')} />
++            )}
++            {provider.source === 'inline' && (
++              <Field area label={t('rr.content')} value={provider.content} onChange={content => patch({content})} placeholder={t('rr.contentExample')} />
++            )}
++            {provider.source === 'file' && (
++              <>
++                <FileInput
++                  label={t('rr.file')}
++                  disabled={model.busy}
++                  onFile={async file => {
++                    try {
++                      if (file.size > 16 * 1024 * 1024) throw new Error(t('rr.fileLimit'));
++                      const bytes = new Uint8Array(await file.arrayBuffer());
++                      let raw = '';
++                      for (let i = 0; i < bytes.length; i += 8192) raw += String.fromCharCode(...bytes.subarray(i, i + 8192));
++                      setBase64(btoa(raw));
++                      setFileName(file.name);
++                    } catch (error) {
++                      setLocalError(error instanceof Error ? error : new Error(String(error)));
++                    }
++                  }}
++                />
++                <span className="rp-note">{fileName}</span>
++              </>
++            )}
++            <details className="rr-details">
++              <summary>{t('rr.advanced')}</summary>
++              <div className="rr-list">
++                <Grid>
++                  <Select
++                    label={t('rr.format')}
++                    value={provider.format}
++                    onChange={format => patch({format})}
++                    items={['auto', 'yaml', 'text', 'mrs'].map(id => ({id, label: id}))}
++                  />
++                  <Select
++                    label={t('rr.behavior')}
++                    value={provider.behavior}
++                    onChange={behavior => patch({behavior})}
++                    items={['auto', 'domain', 'ipcidr', 'classical'].map(id => ({id, label: id}))}
++                  />
++                  <Field
++                    type="number"
++                    min={300}
++                    max={2592000}
++                    label={t('rr.interval')}
++                    value={provider.interval}
++                    onChange={v => patch({interval: Number(v)})}
++                  />
++                  <OutboundSelect model={model} value={provider.outbound} onChange={outbound => patch({outbound})} />
++                </Grid>
++                <Field label={t('rr.sha256')} value={provider.expected_sha256} onChange={expected_sha256 => patch({expected_sha256})} />
++                <Field area label={t('rr.headers')} value={headers} onChange={setHeaders} hint={t('rr.headersHint')} />
++              </div>
++            </details>
++          </>
++        )}
++        {kind === 'resolvers' && (
++          <>
++            <Field label={t('rr.endpoint')} value={resolver.url} onChange={url => patch({url})} hint={t('rr.endpointHint')} />
++            <OutboundSelect model={model} value={resolver.outbound} onChange={outbound => patch({outbound})} />
++            <details className="rr-details">
++              <summary>{t('rr.advanced')}</summary>
++              <div className="rr-list">
++                <Field
++                  label={t('rr.bootstrapIps')}
++                  value={resolver.bootstrap.join(', ')}
++                  onChange={v => patch({bootstrap: lines(v)})}
++                  hint={t('rr.bootstrapHint')}
++                />
++                <Grid>
++                  <Field label={t('rr.tlsName')} value={resolver.tls_name} onChange={tls_name => patch({tls_name})} />
++                  <Field
++                    type="number"
++                    min={250}
++                    max={15000}
++                    label={t('rr.timeout')}
++                    value={resolver.timeout_ms}
++                    onChange={v => patch({timeout_ms: Number(v)})}
++                  />
++                </Grid>
++              </div>
++            </details>
++          </>
++        )}
++        {kind === 'pools' && (
++          <>
++            <Select
++              label={t('rr.strategy')}
++              value={pool.strategy}
++              onChange={strategy => patch({strategy})}
++              items={[
++                {id: 'fallback', label: t('rr.fallback')},
++                {id: 'race', label: t('rr.race')}
++              ]}
++            />
++            <p className="rp-note">{t('rr.poolHint')}</p>
++            {(model.data?.document.resolvers ?? []).map(r => (
++              <Check
++                key={r.id}
++                label={`${r.name} · ${r.outbound}`}
++                value={pool.members.includes(r.id)}
++                onChange={yes => patch({members: yes ? [...pool.members, r.id] : pool.members.filter(id => id !== r.id)})}
++              />
++            ))}
++            {pool.members.map((id, index) => (
++              <Toolbar key={id}>
++                <span>
++                  {index + 1}. {model.data?.document.resolvers.find(r => r.id === id)?.name}
++                </span>
++                {index > 0 && (
++                  <Button
++                    small
++                    quiet
++                    onPress={() => {
++                      const members = [...pool.members];
++                      [members[index - 1], members[index]] = [members[index], members[index - 1]];
++                      patch({members});
++                    }}
++                  >
++                    {t('rr.moveUp')}
++                  </Button>
++                )}
++              </Toolbar>
++            ))}
++          </>
++        )}
++        {(kind === 'policies' || kind === 'bindings') && (
++          <ConditionField
++            key={initial.id}
++            value={kind === 'policies' ? policy.condition : binding.condition}
++            onChange={condition => patch({condition})}
++            model={model}
++            dns={kind === 'policies'}
++          />
++        )}
++        {kind === 'policies' && (
++          <Grid>
++            <Select
++              label={t('rr.pools')}
++              value={policy.pool}
++              onChange={pool => patch({pool})}
++              items={[
++                {id: '', label: t('rr.choose')},
++                ...(model.data?.document.pools ?? []).map(p => ({id: p.id, label: p.name})),
++                {id: 'refused', label: 'REFUSED'},
++                {id: 'nxdomain', label: 'NXDOMAIN'},
++                {id: 'reject', label: 'NOERROR (empty)'},
++                {id: 'servfail', label: 'SERVFAIL'}
++              ]}
++            />
++            <Select
++              label={t('rr.addressMode')}
++              value={policy.address_mode}
++              onChange={address_mode => patch({address_mode})}
++              items={[
++                {id: 'inherit', label: t('rr.inherit')},
++                {id: 'real-ip', label: t('rr.real')},
++                {id: 'fake-ip', label: 'Fake-IP'}
++              ]}
++            />
++          </Grid>
++        )}
++        {kind === 'bindings' && <OutboundSelect model={model} value={binding.outbound} onChange={outbound => patch({outbound})} />}
++        <p className="rp-note">{t('rr.transactionHint')}</p>
++      </fieldset>
++    </ModalDialog>
++  );
++}
++
++function RemoveResource({kind, row, model, close}: {kind: ResourceKind; row: ResourceRow; model: RuntimeModel; close: () => void}) {
++  const t = useT();
++  const resourceKind = kind === 'providers' ? 'provider' : kind === 'resolvers' ? 'resolver' : 'pool';
++  const managed = ['providers', 'resolvers', 'pools'].includes(kind);
++  const references = useResource(
++    {
++      key: ['ruleReferences', {kind: resourceKind, id: row.id, revision: model.data?.revision}],
++      fetch: signal => runtime<{references: Reference[]}>('GET', `/references?kind=${resourceKind}&id=${row.id}`, undefined, signal)
++    },
++    {enabled: managed}
++  );
++  const [replacement, setReplacement] = useState('');
++  const [removeReferences, setRemoveReferences] = useState(false);
++  const rows = (model.data?.document[kind] ?? []).filter(r => r.id !== row.id);
++  const remove = async () => {
++    if (!model.data) return;
++    const result = managed
++      ? await model.write('remove', signal =>
++          runtime<RulesStatus>(
++            'POST',
++            '/remove',
++            {revision: model.data!.revision, kind: resourceKind, id: row.id, replacement: replacement || null, remove_references: removeReferences},
++            signal
++          )
++        )
++      : await model.save({...model.data.document, [kind]: rows});
++    if (result) close();
++  };
++  const refs = references.data?.references ?? [];
++  return (
++    <ModalDialog
++      title={`${t('rr.remove')} ${row.name}`}
++      isOpen
++      onOpenChange={open => {
++        if (!open && !model.busy) close();
++      }}
++      footer={() => (
++        <Toolbar>
++          <Button isDisabled={model.busy} onPress={close}>
++            {t('ui.cancel')}
++          </Button>
++          <Button
++            accent
++            isPending={model.busy}
++            isDisabled={managed && (!references.data || !!references.error || (refs.length > 0 && !replacement && !removeReferences))}
++            onPress={() => void remove()}
++          >
++            {t('rr.removeApply')}
++          </Button>
++        </Toolbar>
++      )}
++    >
++      <div className="rr-list">
++        <ErrorMessage error={references.error ?? model.actionError} />
++        <p>
++          {t('rr.references')} · {refs.length}
++        </p>
++        {refs.map((r, i) => (
++          <div key={i} className="rp-note">
++            {r.name ?? r.expression ?? r.scope}
++            {r.source_id ? ` · ${r.source_id}:${r.line ?? ''}` : ''}
++          </div>
++        ))}
++        {managed && (
++          <>
++            <Select
++              label={t('rr.replaceWith')}
++              value={replacement}
++              onChange={setReplacement}
++              items={[{id: '', label: t('rr.choose')}, ...rows.map(r => ({id: r.id, label: r.name}))]}
++            />
++            <Check label={t('rr.removeReferences')} value={removeReferences} onChange={setRemoveReferences} />
++          </>
++        )}
++        <p className="rp-note">{t('rr.transactionHint')}</p>
++      </div>
++    </ModalDialog>
++  );
++}
++function ProviderEntries({provider, close}: {provider: RuleProvider; close: () => void}) {
++  const t = useT();
++  const [search, setSearch] = useState('');
++  const [query, setQuery] = useState('');
++  const [offset, setOffset] = useState(0);
++  const resource = useResource({
++    key: ['ruleEntries', {id: provider.id, offset, query}],
++    fetch: signal =>
++      runtime<{entries: string[]; total: number}>('GET', `/entries?id=${provider.id}&offset=${offset}&q=${encodeURIComponent(query)}`, undefined, signal)
++  });
++  return (
++    <ModalDialog
++      title={provider.name}
++      isOpen
++      scrollBody
++      onOpenChange={open => {
++        if (!open) close();
++      }}
++    >
++      <div className="rr-list">
++        <Toolbar>
++          <Field label={t('rr.search')} value={search} onChange={setSearch} />
++          <Button
++            onPress={() => {
++              setQuery(search);
++              setOffset(0);
++            }}
++          >
++            {t('rr.search')}
++          </Button>
++        </Toolbar>
++        <ErrorMessage error={resource.error} onRetry={resource.refetch} />
++        <pre className="rr-entries">{resource.data?.entries.join('\n')}</pre>
++        <Toolbar>
++          <span className="rp-note">
++            {offset} · {resource.data?.total ?? 0}
++          </span>
++          <Button isDisabled={offset === 0} onPress={() => setOffset(Math.max(0, offset - 100))}>
++            {t('rr.previous')}
++          </Button>
++          <Button isDisabled={(resource.data?.entries.length ?? 0) < 100} onPress={() => setOffset(offset + 100)}>
++            {t('rr.next')}
++          </Button>
++        </Toolbar>
++      </div>
++    </ModalDialog>
++  );
++}
+diff --git a/src/features/shared/resources/ResourceTrace.tsx b/src/features/shared/resources/ResourceTrace.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/features/shared/resources/ResourceTrace.tsx
+@@ -0,0 +1,182 @@
++import {ChainDiagram, type ProxyPathHop} from '../ProxyPath';
++import {useState} from 'react';
++import {useT} from '../../../i18n';
++import {runtime} from '../../../api/rulesRuntime';
++import {useAction} from '../../../store/action';
++import {Badge, Button, Card, ErrorMessage, Toolbar} from '../../../ui/ui';
++import {Check, Field, Grid, Select, useRulesRuntime} from './common';
++
++type TraceResult = {
++  dns_steps: {pool: string; response_action: string; endpoint: string | null}[];
++  generation_id: string;
++  resource_revision: string;
++  live: boolean;
++  domain: string;
++  cache_source: string;
++  endpoint?: string;
++  selected_dns: [string, string] | null;
++  route: {
++    evaluation: {
++      decision: string;
++      outbound: string | null;
++      dst_ip: string | null;
++      missing_inputs: string[];
++      'x-lemonvpn-chain'?: {hops: ProxyPathHop[]};
++      rules: {rule_id: string; expression: string; result: string; missing_inputs: string[]}[];
++    };
++  };
++  dns: {results: {type: string; status: string; error?: {message: string}; answers?: {name: string; type: string; data: string; ttl: number}[]}[]} | null;
++  dns_policies: {id: string; name: string; condition: string; matched: boolean; pool: string; address_mode: string}[];
++  resources: {id: string; sha256: string; known: boolean; matched: boolean; count: number}[];
++  fake_ip: {configured_mode: string; tun_active: boolean; excluded: boolean; ipv4_range: string; ipv6_range: string; mapping_allocated: boolean};
++};
++export function ResourceTrace({initialDomain = '', query = false}: {initialDomain?: string; query?: boolean}) {
++  const t = useT();
++  const model = useRulesRuntime();
++  const [domain, setDomain] = useState(initialDomain);
++  const [kind, setKind] = useState('A');
++  const [live, setLive] = useState(query);
++  const [network, setNetwork] = useState('tcp');
++  const [port, setPort] = useState('443');
++  const [ip, setIp] = useState('');
++  const [process, setProcess] = useState('');
++  const [result, setResult] = useState<TraceResult>();
++  const action = useAction<'trace'>();
++  const trace = async () => {
++    const value = await action.run('trace', signal =>
++      runtime<TraceResult>(
++        'POST',
++        '/api/v1/dns/trace',
++        {domain, type: kind, live, network, port: Number(port), ...(ip ? {destination_ip: ip} : {}), ...(process ? {process} : {})},
++        signal
++      )
++    );
++    if (value) setResult(value);
++  };
++  const outdated = !!result && !!model.data && result.generation_id !== model.data.generation_id;
++  const route = result?.route.evaluation;
++  return (
++    <div className="rr-list">
++      <Card title={t(query ? 'rr.dnsQuery' : 'rr.trace')}>
++        <div className="rr-list">
++          <ErrorMessage error={action.error} />
++          <Grid>
++            <Field label={t('ui.domain')} value={domain} onChange={setDomain} placeholder={t('rr.domainExample')} />
++            <Select
++              label={t('ui.type')}
++              value={kind}
++              onChange={setKind}
++              items={['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS', 'SOA'].map(id => ({id, label: id}))}
++            />
++          </Grid>
++          <Toolbar>
++            <Check label={t('rr.liveDns')} value={live} onChange={setLive} />
++            <Button accent isPending={!!action.busy} isDisabled={!domain.trim() || !Number(port) || Number(port) > 65535} onPress={() => void trace()}>
++              {t(query ? 'dns.query' : 'rr.analyze')}
++            </Button>
++          </Toolbar>
++          <p className="rp-note">{t(live ? 'rr.liveHint' : 'rr.offlineHint')}</p>
++          <details className="rr-details">
++            <summary>{t('rr.advanced')}</summary>
++            <Grid>
++              <Select label={t('rr.network')} value={network} onChange={setNetwork} items={['tcp', 'udp'].map(id => ({id, label: id.toUpperCase()}))} />
++              <Field type="number" label={t('rr.port')} value={port} min={1} max={65535} onChange={setPort} />
++              <Field label={t('ui.destinationIp')} value={ip} onChange={setIp} />
++              <Field label={t('ui.process')} value={process} onChange={setProcess} />
++            </Grid>
++          </details>
++        </div>
++      </Card>
++      {result && (
++        <Card title={result.domain}>
++          <div className="rr-list">
++            <Toolbar>
++              <Badge>{t(result.live ? 'rr.actualDns' : 'rr.simulated')}</Badge>
++              <span className="rp-note rr-version" title={result.generation_id}>
++                {result.generation_id}
++              </span>
++              {outdated && <Badge tone="warn">{t('rr.resultStale')}</Badge>}
++            </Toolbar>
++            <div className="rr-step">
++              <strong>1 · {t('rr.dnsSelection')}</strong>
++              <p>{model.data?.document.pools.find(p => p.id === result.selected_dns?.[0])?.name ?? result.selected_dns?.[0] ?? t('rr.legacyDefault')}</p>
++              <p className="rp-note">{result.selected_dns?.[1]}</p>
++              {result.endpoint && <p>{model.data?.document.resolvers.find(r => r.id === result.endpoint)?.name ?? result.endpoint}</p>}
++              {result.dns_steps?.map((step, i) => (
++                <p className="rp-note" key={i}>
++                  {model.data?.document.pools.find(p => p.id === step.pool)?.name ?? step.pool} → {step.response_action}
++                </p>
++              ))}
++              {result.dns_policies.map(row => (
++                <p className="rp-note" key={row.id}>
++                  {row.matched ? '✓' : '—'} {row.name} · {row.condition}
++                </p>
++              ))}
++            </div>
++            <div className="rr-step">
++              <strong>2 · {t('rr.cacheResult')}</strong>
++              <p>
++                {t(
++                  result.cache_source === 'cache'
++                    ? 'rr.fromCache'
++                    : result.cache_source === 'coalesced'
++                      ? 'rr.coalesced'
++                      : result.cache_source === 'stale'
++                        ? 'rr.staleReplies'
++                        : result.cache_source === 'not_queried'
++                          ? 'rr.notQueried'
++                          : 'rr.fromUpstream'
++                )}
++              </p>
++              {result.dns?.results.map((answer, i) => (
++                <div key={i}>
++                  <p>
++                    {answer.type} · {answer.status}
++                  </p>
++                  {answer.error && <p role="alert">{answer.error.message}</p>}
++                  {answer.answers?.map((row, j) => (
++                    <p key={j} className="rp-code">
++                      {row.data} · {row.type} · {t('rr.ttl')} {row.ttl}s
++                    </p>
++                  ))}
++                </div>
++              ))}
++            </div>
++            <div className="rr-step">
++              <strong>3 · {t('rr.fakeIp')}</strong>
++              <p>
++                {result.fake_ip.configured_mode} · {t(result.fake_ip.tun_active ? 'rr.tunActive' : 'rr.tunInactive')}
++              </p>
++              <p className="rp-note">{t('rr.traceNoMapping')}</p>
++            </div>
++            <div className="rr-step">
++              <strong>4 · {t('rr.routeSelection')}</strong>
++              <p>{route?.outbound === 'direct' ? t('rr.direct') : route?.outbound === 'block' ? t('rr.block') : (route?.outbound ?? t('rr.unknown'))}</p>
++              {route?.missing_inputs.length ? (
++                <p className="rp-note">
++                  {t('rr.missingInputs')} · {route.missing_inputs.join(', ')}
++                </p>
++              ) : null}
++              {route?.rules.map(rule => (
++                <p className="rp-note" key={rule.rule_id}>
++                  {rule.result === 'matched' ? '✓' : rule.result === 'indeterminate' ? '?' : '—'} {rule.expression}
++                </p>
++              ))}
++              <p className="rp-note">{t('rr.routeSimulated')}</p>
++              {!!route?.['x-lemonvpn-chain']?.hops.length && <ChainDiagram hops={route['x-lemonvpn-chain'].hops} target={result.domain} />}
++            </div>
++            <details className="rr-details">
++              <summary>{t('rr.resourceVersions')}</summary>
++              {result.resources.map(row => (
++                <p className="rp-note" key={row.id}>
++                  {row.known ? (row.matched ? '✓' : '—') : '?'} {model.data?.document.providers.find(p => p.id === row.id)?.name ?? row.id} · {row.count} ·{' '}
++                  {row.sha256}
++                </p>
++              ))}
++            </details>
++          </div>
++        </Card>
++      )}
++    </div>
++  );
++}
+diff --git a/src/features/shared/resources/common.tsx b/src/features/shared/resources/common.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/features/shared/resources/common.tsx
+@@ -0,0 +1,70 @@
++import {useTabShown} from '../../../ui/useTabShown';
++import {useT} from '../../../i18n';
++import {useResource} from '../../../store/resource';
++import {useAction} from '../../../store/action';
++import {refetchAll} from '../../../store/resourceCore';
++import {Button, ErrorMessage, Toolbar, Badge, toast} from '../../../ui/ui';
++import {runtime, type RulesDocument, type RulesStatus} from '../../../api/rulesRuntime';
++import {Select} from '../../../ui/ResourceFields';
++import './resources.css';
++
++export function useRulesRuntime(enabled = true) {
++  const t = useT();
++  const shown = useTabShown();
++  const resource = useResource(
++    {key: ['rulesRuntime'], every: 30000, fetch: signal => runtime<RulesStatus>('GET', '', undefined, signal)},
++    {enabled, paused: !shown}
++  );
++  const action = useAction<string>({shared: 'rules-runtime'});
++  const write = async (kind: string, task: (signal: AbortSignal) => Promise<RulesStatus>) => {
++    const result = await action.run(kind, async signal => {
++      const result = await task(signal);
++      await refetchAll();
++      return result;
++    });
++    if (result) {
++      toast('positive', t('rr.applied'));
++    }
++    return result;
++  };
++  const save = (document: RulesDocument, revision = resource.data?.revision) =>
++    write('save', signal => runtime<RulesStatus>('PUT', '', {revision, document}, signal));
++  return {...resource, busy: !!action.busy, action: action.busy, actionError: action.error, write, save};
++}
++export type RuntimeModel = ReturnType<typeof useRulesRuntime>;
++export function RuntimeHeader({model}: {model: RuntimeModel}) {
++  const t = useT();
++  return (
++    <>
++      <Toolbar>
++        <Badge>{t('rr.live')}</Badge>
++        <span className="rp-note rr-version" title={model.data?.generation_id}>
++          {model.data?.generation_id}
++        </span>
++        <span className="rp-grow" />
++        <Button small isDisabled={model.busy} onPress={model.refetch}>
++          {t('ui.refresh')}
++        </Button>
++      </Toolbar>
++      <ErrorMessage error={model.error ?? model.actionError ?? (model.data?.error ? new Error(model.data.error) : null)} onRetry={model.refetch} />
++    </>
++  );
++}
++export {Field, Select, Check, Grid} from '../../../ui/ResourceFields';
++export function OutboundSelect({model, value, onChange}: {model: RuntimeModel; value: string; onChange: (value: string) => void}) {
++  const t = useT();
++  return (
++    <Select
++      label={t('rr.outbound')}
++      value={value}
++      onChange={onChange}
++      disabled={model.busy}
++      items={(model.data?.outbounds ?? []).filter(o => o.id !== 'block').map(o => ({id: o.id, label: o.id === 'direct' ? t('rr.direct') : o.id}))}
++    />
++  );
++}
++export const lines = (text: string) =>
++  text
++    .split(/[\r\n,]+/)
++    .map(s => s.trim())
++    .filter(Boolean);
+diff --git a/src/features/shared/resources/resources.css b/src/features/shared/resources/resources.css
+new file mode 100644
+--- /dev/null
++++ b/src/features/shared/resources/resources.css
+@@ -0,0 +1,166 @@
++.rr-grid {
++  display: grid;
++  grid-template-columns: repeat(auto-fit, minmax(min(230px, 100%), 1fr));
++  gap: 16px;
++}
++.rr-field {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  min-width: 0;
++  color: var(--muted, inherit);
++}
++.rr-field input,
++.rr-field select,
++.rr-field textarea {
++  width: 100%;
++  min-width: 0;
++  box-sizing: border-box;
++  border: 1px solid color-mix(in srgb, currentcolor 22%, transparent);
++  border-radius: var(--rp-r-md);
++  background: transparent;
++  color: inherit;
++  padding: 9px 12px;
++  font: inherit;
++}
++.rr-field textarea {
++  min-height: 128px;
++  resize: vertical;
++}
++.rr-field input:focus-visible,
++.rr-field select:focus-visible,
++.rr-field textarea:focus-visible {
++  outline: 2px solid currentcolor;
++  outline-offset: 1px;
++}
++.rr-field option {
++  color: CanvasText;
++  background: Canvas;
++}
++.rr-check {
++  display: flex;
++  align-items: center;
++  gap: 9px;
++  padding-block: 6px;
++}
++.rr-check input {
++  width: 17px;
++  height: 17px;
++  accent-color: currentcolor;
++}
++.rr-list {
++  display: flex;
++  flex-direction: column;
++  gap: 12px;
++}
++.rr-item {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 12px;
++  border: 1px solid color-mix(in srgb, currentcolor 12%, transparent);
++  padding: 12px 14px;
++  border-radius: var(--rp-r-lg);
++  min-width: 0;
++}
++.rr-item[draggable='true'] {
++  cursor: grab;
++}
++.rr-item[data-drop='true'] {
++  border-top: 3px solid currentcolor;
++}
++.rr-main {
++  flex: 1 1 220px;
++  min-width: 0;
++}
++.rr-main strong,
++.rr-main code {
++  overflow-wrap: anywhere;
++}
++.rr-main p {
++  margin-block: 5px 0;
++}
++.rr-version {
++  max-width: 380px;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++.rr-entries {
++  white-space: pre-wrap;
++  overflow-wrap: anywhere;
++  max-height: 50vh;
++  overflow: auto;
++  user-select: text;
++}
++.rr-table {
++  width: 100%;
++  border-collapse: collapse;
++}
++.rr-table th,
++.rr-table td {
++  text-align: start;
++  border-bottom: 1px solid color-mix(in srgb, currentcolor 12%, transparent);
++  padding: 10px 8px;
++  overflow-wrap: anywhere;
++}
++.rr-step {
++  border-inline-start: 3px solid color-mix(in srgb, currentcolor 35%, transparent);
++  padding: 10px 16px;
++}
++.rr-step p {
++  margin-block: 4px;
++}
++.rr-details > summary {
++  cursor: pointer;
++  padding-block: 10px;
++}
++.rr-scroll {
++  overflow: auto;
++}
++
++.rr-grip {
++  border: 0;
++  padding: 8px;
++  background: transparent;
++  color: inherit;
++  cursor: grab;
++  font: inherit;
++  touch-action: none;
++}
++
++.rr-fields {
++  border: 0;
++  padding: 0;
++  margin: 0;
++  min-width: 0;
++}
++
++.rr-builtin-grid {
++  display: grid;
++  grid-template-columns: repeat(auto-fit, minmax(min(285px, 100%), 1fr));
++  gap: 12px;
++}
++
++.rr-builtin-item {
++  display: flex;
++  flex-direction: column;
++  gap: 10px;
++  min-width: 0;
++  padding: 14px;
++  border: 1px solid color-mix(in srgb, currentcolor 12%, transparent);
++  border-radius: var(--rp-r-lg);
++}
++
++.rr-builtin-item p {
++  margin: 0;
++}
++
++.rr-builtin-bottom {
++  margin-block-start: auto;
++}
++
++.rr-builtin-source {
++  overflow-wrap: anywhere;
++  font-size: 0.8em;
++}
+diff --git a/src/features/shared/rule.ts b/src/features/shared/rule.ts
+--- a/src/features/shared/rule.ts
++++ b/src/features/shared/rule.ts
+@@ -32,6 +32,8 @@
+ // What each condition kind is called in a picker.
+ type QuickRuleKind = RuleConditionKind | 'domainPort' | 'destinationEndpoint' | 'sourceEndpoint' | 'protocolPort';
+ export const ruleKindLabels: Record<QuickRuleKind, Key> = {
++  ruleset: 'rr.providers',
++  qnameRuleset: 'rr.providers',
+   domainSuffix: 'rule.kind.domainSuffix',
+   domain: 'rule.kind.domain',
+   domainKeyword: 'rule.kind.domainKeyword',
+diff --git a/src/i18n/locales/en.json b/src/i18n/locales/en.json
+--- a/src/i18n/locales/en.json
++++ b/src/i18n/locales/en.json
+@@ -1588,7 +1588,6 @@
+   "palette.arco": "Arco Design",
+   "palette.bytedance": "ByteDance",
+   "palette.catppuccin": "Catppuccin",
+-  "palette.chromiumOnly": "Chromium only",
+   "palette.dawnMain": "Dawn / Main",
+   "palette.dawnMoon": "Dawn / Moon",
+   "palette.defaultDark": "Default / Dark",
+@@ -1749,6 +1748,220 @@
+   "probe.submit": "Probe",
+   "probe.tcp": "TCP port (connectivity only)",
+   "probe.title": "Probe options",
++  "rr.actualDns": "Actual DNS query",
++  "rr.actualStats": "Actual DNS statistics",
++  "rr.add": "Add",
++  "rr.addressMode": "Address mode",
++  "rr.advanced": "Advanced",
++  "rr.advancedRoutingTrace": "Advanced routing trace",
++  "rr.analyze": "Analyze",
++  "rr.applied": "Saved and applied",
++  "rr.applying": "Applying",
++  "rr.behavior": "Behavior",
++  "rr.bindingHelp": "Applied after user rules and before fallback; outbound modes take priority.",
++  "rr.bindings": "Resource routing",
++  "rr.block": "block (reject connection)",
++  "rr.bootstrap": "Independent bootstrap DNS",
++  "rr.bootstrapHint": "Comma separated. Empty uses independent bootstrap DNS.",
++  "rr.bootstrapIndependent": "One DNS endpoint with an IP per line; resolves upstream and proxy hosts without policy recursion.",
++  "rr.bootstrapIps": "Bootstrap IPs",
++  "rr.builtin": "Built-in rule sets",
++  "rr.builtinAddLabel": "Add {name}",
++  "rr.builtinAds": "Advertising domains",
++  "rr.builtinAdsHint": "Ad and tracking domains; choose a blocking action separately.",
++  "rr.builtinAi": "AI services",
++  "rr.builtinAiHint": "Domains of non-China AI services.",
++  "rr.builtinAll": "All",
++  "rr.builtinApple": "Apple",
++  "rr.builtinAppleHint": "Apple product and service domains.",
++  "rr.builtinBilibili": "Bilibili",
++  "rr.builtinBilibiliHint": "Bilibili and media resource domains.",
++  "rr.builtinCategory": "Category",
++  "rr.builtinCdn": "MetaCubeX · CDN",
++  "rr.builtinCnDomains": "China domains",
++  "rr.builtinCnDomainsHint": "Domains of websites and services in China.",
++  "rr.builtinCnIp": "China IP ranges",
++  "rr.builtinCnIpHint": "IPv4/IPv6 networks in mainland China.",
++  "rr.builtinDomain": "Domains",
++  "rr.builtinDownloadHelp": "Source and outbound apply to new online lists only.",
++  "rr.builtinForeign": "Non-China domains",
++  "rr.builtinForeignHint": "The upstream geolocation-!cn domain category.",
++  "rr.builtinGithub": "GitHub",
++  "rr.builtinGithubHint": "Code hosting and related resource domains.",
++  "rr.builtinGithubSource": "MetaCubeX · GitHub",
++  "rr.builtinGoogle": "Google",
++  "rr.builtinGoogleHint": "Google and related service domains.",
++  "rr.builtinHelp": "Local lists work offline; online lists are kept on this device and updated daily.",
++  "rr.builtinInstalled": "Added",
++  "rr.builtinInstalledLabel": "{name} added",
++  "rr.builtinIp": "IP ranges",
++  "rr.builtinLimit": "The limit is 64 rule sets. Remove an unused set first.",
++  "rr.builtinLocal": "Local network",
++  "rr.builtinLocalDomains": "Local domains",
++  "rr.builtinLocalDomainsHint": "localhost, local, lan and home.arpa.",
++  "rr.builtinMicrosoft": "Microsoft",
++  "rr.builtinMicrosoftHint": "Microsoft product and service domains.",
++  "rr.builtinNameTaken": "A rule set named “{name}” already exists. Edit or rename it first.",
++  "rr.builtinNetflix": "Netflix",
++  "rr.builtinNetflixHint": "Netflix video and related service domains.",
++  "rr.builtinNoMatch": "No matching presets",
++  "rr.builtinOffline": "Offline",
++  "rr.builtinOnline": "Online updates",
++  "rr.builtinPrivateNetworks": "Private networks",
++  "rr.builtinPrivateNetworksHint": "Private, loopback and link-local IPv4/IPv6 ranges.",
++  "rr.builtinRegion": "Regions",
++  "rr.builtinService": "Services",
++  "rr.builtinSource": "Download source",
++  "rr.builtinSteam": "Steam",
++  "rr.builtinSteamHint": "Steam store, community and download domains.",
++  "rr.builtinTelegram": "Telegram domains",
++  "rr.builtinTelegramHint": "Telegram messaging and media domains.",
++  "rr.builtinTelegramIp": "Telegram IP ranges",
++  "rr.builtinTelegramIpHint": "Telegram service networks.",
++  "rr.builtinUsage": "After adding, use the rule set in routing rules or DNS policies.",
++  "rr.builtinYoutube": "YouTube",
++  "rr.builtinYoutubeHint": "Video, media and related service domains.",
++  "rr.cacheEntries": "Entries",
++  "rr.cacheHint": "Honors DNS TTL and coalesces queries. Prefetch and stale replies are off by default.",
++  "rr.cacheOptions": "Cache settings",
++  "rr.cacheResult": "Cache and answers",
++  "rr.cancelRequested": "Cancellation requested",
++  "rr.cancelled": "Cancelled",
++  "rr.capacity": "Maximum entries",
++  "rr.choose": "Choose",
++  "rr.clearMappings": "Clear Fake-IP mappings",
++  "rr.clearMappingsHint": "Clears kernel mappings. Devices may need to resolve existing Fake-IP addresses again.",
++  "rr.clearRealCache": "Clear real DNS cache",
++  "rr.coalesced": "Coalesced",
++  "rr.condition": "Match value",
++  "rr.content": "Paste content",
++  "rr.contentExample": "+.example.com",
++  "rr.createDns": "Create DNS policy",
++  "rr.createRouting": "Create routing binding",
++  "rr.current": "Updated",
++  "rr.direct": "direct (direct connection)",
++  "rr.dnsQuery": "DNS query and trace",
++  "rr.dnsSelection": "DNS selection",
++  "rr.domainExample": "example.com",
++  "rr.domestic": "Domestic DNS",
++  "rr.edit": "Edit",
++  "rr.editPolicies": "Manage DNS policies",
++  "rr.empty": "No entries",
++  "rr.enabled": "Enabled",
++  "rr.endpoint": "Endpoint",
++  "rr.endpointHint": "Supports udp://, tcp://, tls:// and https:// (DoH).",
++  "rr.entries": "View entries",
++  "rr.expression": "Expression",
++  "rr.expressionExample": "domain(suffix: example.com) && l4proto(tcp)",
++  "rr.failed": "Update failed; previous version retained",
++  "rr.failures": "Failures",
++  "rr.fakeIp": "Fake-IP",
++  "rr.fakeIpHint": "Shares policy matches. Exclusions come first, then the first explicit address policy. Allocation requires TUN.",
++  "rr.fakeIpLink": "Fake-IP policy integration",
++  "rr.fallback": "Ordered fallback",
++  "rr.file": "Import file",
++  "rr.fileLimit": "File must not exceed 16 MiB",
++  "rr.fileRequired": "Choose a rule file first",
++  "rr.first100": "Shows up to 100 entries. Deleting a domain removes all its record types.",
++  "rr.foreign": "Proxied DNS",
++  "rr.format": "Format",
++  "rr.fromCache": "From cache",
++  "rr.fromUpstream": "From upstream",
++  "rr.full": "Exact domain",
++  "rr.fullHint": "Matches only this exact domain.",
++  "rr.geoCn": "GeoSite cn",
++  "rr.geodata": "Geodata",
++  "rr.headerError": "Use one Name: value header per line",
++  "rr.headers": "Request headers",
++  "rr.headersHint": "One per line; visible only in this editor.",
++  "rr.hits": "Cache hits",
++  "rr.inherit": "Do not override address mode",
++  "rr.interval": "Update interval (seconds)",
++  "rr.kind": "Type",
++  "rr.legacyDefault": "Default upstream",
++  "rr.legacyUpstreams": "Legacy upstream configuration",
++  "rr.live": "Active",
++  "rr.liveDns": "Query live DNS",
++  "rr.liveHint": "Queries DNS without probing website connections.",
++  "rr.local": "Local domains",
++  "rr.manageGeodata": "Manage geodata",
++  "rr.mappingScope": "Kernel-owned mappings are separate from the real DNS cache. This kernel does not expose a complete mapping list.",
++  "rr.match": "Match by",
++  "rr.maxMemory": "Memory limit (MiB)",
++  "rr.mb": "MB",
++  "rr.misses": "Misses",
++  "rr.missingInputs": "Missing inputs",
++  "rr.moveUp": "Move up",
++  "rr.ms": "ms",
++  "rr.name": "Name",
++  "rr.negative": "Negative",
++  "rr.negativeCache": "Cache NXDOMAIN / empty answers",
++  "rr.network": "Transport",
++  "rr.next": "Next",
++  "rr.noAddressPolicy": "No address policies; existing Fake-IP settings apply.",
++  "rr.notQueried": "Not queried",
++  "rr.offlineHint": "Offline analysis; sends no network requests.",
++  "rr.otherDomains": "Other domains",
++  "rr.outbound": "Connection outbound",
++  "rr.pending": "In flight",
++  "rr.policies": "DNS policies",
++  "rr.policyHelp": "First matching policy selects the pool and address mode.",
++  "rr.policyPriority": "Custom DNS request rules precede these policies; the default upstream is last.",
++  "rr.poolHint": "Queries follow selection order. Race members must use the same outbound.",
++  "rr.pools": "Resolver pools",
++  "rr.port": "Destination port",
++  "rr.positive": "Positive",
++  "rr.prefetch": "Prefetch hot domains",
++  "rr.preset": "Set up regional DNS",
++  "rr.presetHint": "Review servers and proxy outbound, then apply the following policies together.",
++  "rr.presetMissingGeo": "Requires GeoSite cn. Missing data leaves the previous configuration unchanged. Existing rules are preserved.",
++  "rr.presetRouting": "Also create matching routing bindings",
++  "rr.previous": "Previous",
++  "rr.providerHelp": "Define matches once; reference them from routing, DNS and Fake-IP.",
++  "rr.providers": "Rule sets",
++  "rr.queries": "Queries",
++  "rr.race": "Race first two",
++  "rr.real": "Real IP",
++  "rr.realCache": "Real DNS cache",
++  "rr.recordCache": "Parsed answer index",
++  "rr.recordQuery": "Multi-type queries and rule creation",
++  "rr.references": "References",
++  "rr.remove": "Delete",
++  "rr.removeApply": "Delete and apply",
++  "rr.removeReferences": "Also remove referencing rules",
++  "rr.reorder": "Drag to reorder",
++  "rr.replaceWith": "Replace with",
++  "rr.resolvers": "DNS servers",
++  "rr.resourceVersions": "Resources and versions",
++  "rr.resultStale": "Configuration changed; result is outdated",
++  "rr.routeSelection": "Routing decision",
++  "rr.routeSimulated": "Routing is simulated; this does not establish a website connection.",
++  "rr.save": "Save and apply",
++  "rr.search": "Search",
++  "rr.sha256": "SHA256",
++  "rr.simulated": "Offline analysis",
++  "rr.source": "Source",
++  "rr.sourceExample": "https://example.com/rules.yaml",
++  "rr.stale": "Configuration changed. Close and reopen this editor.",
++  "rr.staleReplies": "Stale replies",
++  "rr.staleSeconds": "Serve stale after failure (seconds; 0 disables)",
++  "rr.statsScope": "Actual exchanges only. P50/P95 use the latest 256 successful requests; no automatic probes.",
++  "rr.strategy": "Strategy",
++  "rr.suffix": "Domain and subdomains",
++  "rr.suffixHint": "Includes this domain and its subdomains.",
++  "rr.timeout": "Timeout (milliseconds)",
++  "rr.tlsName": "TLS server name (optional)",
++  "rr.trace": "Routing, DNS and Fake-IP trace",
++  "rr.traceNoMapping": "Shows effective address policy; tracing does not allocate Fake-IP mappings.",
++  "rr.transactionHint": "Validated and applied together; failure keeps the previous configuration.",
++  "rr.ttl": "TTL",
++  "rr.tunActive": "TUN active",
++  "rr.tunInactive": "TUN inactive",
++  "rr.unknown": "Missing inputs; indeterminate",
++  "rr.update": "Update",
++  "rr.updating": "Updating",
++  "rr.upstreamHelp": "Reuse servers across pools. Encrypted connections always verify certificates.",
++  "rr.url": "Source URL",
+   "rule.add": "Add rule",
+   "rule.addApply": "Apply",
+   "rule.addCondition": "Add AND condition",
+diff --git a/src/i18n/locales/zh-CN.json b/src/i18n/locales/zh-CN.json
+--- a/src/i18n/locales/zh-CN.json
++++ b/src/i18n/locales/zh-CN.json
+@@ -1420,7 +1420,6 @@
+   "palette.arco": "Arco Design",
+   "palette.bytedance": "ByteDance",
+   "palette.catppuccin": "Catppuccin",
+-  "palette.chromiumOnly": "仅 Chromium",
+   "palette.dawnMain": "Dawn / Main",
+   "palette.dawnMoon": "Dawn / Moon",
+   "palette.defaultDark": "Default / Dark",
+@@ -1572,6 +1571,220 @@
+   "probe.submit": "探测",
+   "probe.tcp": "TCP 端口（仅连通性）",
+   "probe.title": "探测选项",
++  "rr.actualDns": "实际 DNS 查询",
++  "rr.actualStats": "实际查询统计",
++  "rr.add": "新增",
++  "rr.addressMode": "地址模式",
++  "rr.advanced": "高级设置",
++  "rr.advancedRoutingTrace": "更多路由追踪条件",
++  "rr.analyze": "开始分析",
++  "rr.applied": "已保存并热更新",
++  "rr.applying": "正在应用",
++  "rr.behavior": "匹配类型",
++  "rr.bindingHelp": "在用户路由规则之后、默认出站之前匹配；全局和直连模式优先。",
++  "rr.bindings": "分类分流",
++  "rr.block": "block（阻断）",
++  "rr.bootstrap": "独立引导 DNS",
++  "rr.bootstrapHint": "逗号分隔；留空时使用独立引导 DNS。",
++  "rr.bootstrapIndependent": "每行一个使用 IP 的 DNS 地址；用于解析上游与代理节点，避免循环依赖。",
++  "rr.bootstrapIps": "引导 IP",
++  "rr.builtin": "内置规则集",
++  "rr.builtinAddLabel": "添加 {name}",
++  "rr.builtinAds": "广告域名",
++  "rr.builtinAdsHint": "广告与追踪域名，需自行选择阻断动作。",
++  "rr.builtinAi": "AI 服务",
++  "rr.builtinAiHint": "国外 AI 服务域名。",
++  "rr.builtinAll": "全部",
++  "rr.builtinApple": "Apple",
++  "rr.builtinAppleHint": "Apple 产品与服务域名。",
++  "rr.builtinBilibili": "哔哩哔哩",
++  "rr.builtinBilibiliHint": "哔哩哔哩及媒体资源域名。",
++  "rr.builtinCategory": "分类",
++  "rr.builtinCdn": "MetaCubeX · CDN",
++  "rr.builtinCnDomains": "国内域名",
++  "rr.builtinCnDomainsHint": "国内网站及服务域名。",
++  "rr.builtinCnIp": "国内 IP",
++  "rr.builtinCnIpHint": "中国大陆 IPv4/IPv6 网段。",
++  "rr.builtinDomain": "域名规则",
++  "rr.builtinDownloadHelp": "来源和出站仅用于新增在线规则集；已有配置不变。",
++  "rr.builtinForeign": "国外域名",
++  "rr.builtinForeignHint": "上游维护的非国内域名分类。",
++  "rr.builtinGithub": "GitHub",
++  "rr.builtinGithubHint": "代码托管及相关资源域名。",
++  "rr.builtinGithubSource": "MetaCubeX · GitHub",
++  "rr.builtinGoogle": "Google",
++  "rr.builtinGoogleHint": "Google 及相关服务域名。",
++  "rr.builtinHelp": "本地规则可离线添加；在线规则下载后保存在本机，每天自动更新。",
++  "rr.builtinInstalled": "已添加",
++  "rr.builtinInstalledLabel": "已添加 {name}",
++  "rr.builtinIp": "IP 规则",
++  "rr.builtinLimit": "规则集已达 64 个上限，请先移除不需要的规则集。",
++  "rr.builtinLocal": "本地网络",
++  "rr.builtinLocalDomains": "本地域名",
++  "rr.builtinLocalDomainsHint": "localhost、local、lan 和 home.arpa。",
++  "rr.builtinMicrosoft": "Microsoft",
++  "rr.builtinMicrosoftHint": "微软产品与服务域名。",
++  "rr.builtinNameTaken": "已有同名规则集“{name}”，请先编辑或更名。",
++  "rr.builtinNetflix": "Netflix",
++  "rr.builtinNetflixHint": "Netflix 视频与相关服务域名。",
++  "rr.builtinNoMatch": "没有匹配的预设",
++  "rr.builtinOffline": "离线可用",
++  "rr.builtinOnline": "在线更新",
++  "rr.builtinPrivateNetworks": "局域网地址",
++  "rr.builtinPrivateNetworksHint": "IPv4/IPv6 私有、回环和链路本地地址。",
++  "rr.builtinRegion": "国内外",
++  "rr.builtinService": "常用服务",
++  "rr.builtinSource": "下载来源",
++  "rr.builtinSteam": "Steam",
++  "rr.builtinSteamHint": "Steam 商店、社区与下载域名。",
++  "rr.builtinTelegram": "Telegram 域名",
++  "rr.builtinTelegramHint": "Telegram 消息与媒体域名。",
++  "rr.builtinTelegramIp": "Telegram IP",
++  "rr.builtinTelegramIpHint": "Telegram 服务网段。",
++  "rr.builtinUsage": "添加后，在路由规则或 DNS 策略中引用。",
++  "rr.builtinYoutube": "YouTube",
++  "rr.builtinYoutubeHint": "视频、媒体与相关服务域名。",
++  "rr.cacheEntries": "条目数",
++  "rr.cacheHint": "遵循 DNS TTL；合并重复查询。预取与故障旧值默认关闭。",
++  "rr.cacheOptions": "缓存设置",
++  "rr.cacheResult": "缓存与应答",
++  "rr.cancelRequested": "正在取消",
++  "rr.cancelled": "已取消",
++  "rr.capacity": "最大条目数",
++  "rr.choose": "请选择",
++  "rr.clearMappings": "清理 Fake-IP 映射",
++  "rr.clearMappingsHint": "将清理内核中的映射；已有 Fake-IP 地址可能需要设备重新解析。",
++  "rr.clearRealCache": "清理真实 DNS 缓存",
++  "rr.coalesced": "合并查询",
++  "rr.condition": "匹配内容",
++  "rr.content": "粘贴内容",
++  "rr.contentExample": "+.example.com",
++  "rr.createDns": "创建 DNS 策略",
++  "rr.createRouting": "创建路由分流",
++  "rr.current": "已更新",
++  "rr.direct": "direct（直连）",
++  "rr.dnsQuery": "DNS 查询与追踪",
++  "rr.dnsSelection": "DNS 选择",
++  "rr.domainExample": "example.com",
++  "rr.domestic": "国内解析",
++  "rr.edit": "编辑",
++  "rr.editPolicies": "管理解析策略",
++  "rr.empty": "暂无内容",
++  "rr.enabled": "启用",
++  "rr.endpoint": "上游地址",
++  "rr.endpointHint": "支持 udp://、tcp://、tls:// 和 https://（DoH）。",
++  "rr.entries": "查看内容",
++  "rr.expression": "表达式",
++  "rr.expressionExample": "domain(suffix: example.com) && l4proto(tcp)",
++  "rr.failed": "更新失败，保留旧版本",
++  "rr.failures": "失败数",
++  "rr.fakeIp": "Fake-IP",
++  "rr.fakeIpHint": "共用策略分类；先匹配排除域名，再匹配首个显式地址策略。TUN 启用时分配 Fake-IP。",
++  "rr.fakeIpLink": "Fake-IP 分类联动",
++  "rr.fallback": "顺序主备",
++  "rr.file": "导入文件",
++  "rr.fileLimit": "文件不能超过 16 MiB",
++  "rr.fileRequired": "请先选择规则文件",
++  "rr.first100": "显示前 100 项；删除域名会清理该域名的全部类型。",
++  "rr.foreign": "代理域名解析",
++  "rr.format": "文件格式",
++  "rr.fromCache": "来自缓存",
++  "rr.fromUpstream": "来自上游",
++  "rr.full": "仅此域名",
++  "rr.fullHint": "仅匹配填写的域名。",
++  "rr.geoCn": "GeoSite cn",
++  "rr.geodata": "地理数据",
++  "rr.headerError": "请求头格式为 名称: 值",
++  "rr.headers": "请求头",
++  "rr.headersHint": "每行一个，仅在编辑时显示。",
++  "rr.hits": "缓存命中",
++  "rr.inherit": "不覆盖地址模式",
++  "rr.interval": "更新间隔（秒）",
++  "rr.kind": "类型",
++  "rr.legacyDefault": "默认上游",
++  "rr.legacyUpstreams": "已有配置中的上游",
++  "rr.live": "当前生效",
++  "rr.liveDns": "实时查询 DNS",
++  "rr.liveHint": "执行 DNS 查询，不发送网站连接探测。",
++  "rr.local": "局域网域名",
++  "rr.manageGeodata": "管理地理数据",
++  "rr.mappingScope": "映射由内核管理，与真实 DNS 缓存分别清理；当前内核不提供完整映射列表。",
++  "rr.match": "匹配依据",
++  "rr.maxMemory": "内存上限（MiB）",
++  "rr.mb": "MB",
++  "rr.misses": "未命中",
++  "rr.missingInputs": "缺少输入",
++  "rr.moveUp": "上移",
++  "rr.ms": "ms",
++  "rr.name": "名称",
++  "rr.negative": "负缓存",
++  "rr.negativeCache": "缓存 NXDOMAIN / 空应答",
++  "rr.network": "网络协议",
++  "rr.next": "下一页",
++  "rr.noAddressPolicy": "未设置分类地址模式，沿用现有设置。",
++  "rr.notQueried": "未查询",
++  "rr.offlineHint": "仅离线分析，不发送网络请求。",
++  "rr.otherDomains": "其余域名",
++  "rr.outbound": "连接出站",
++  "rr.pending": "进行中",
++  "rr.policies": "解析策略",
++  "rr.policyHelp": "从上到下匹配，命中后使用指定解析池和地址模式。",
++  "rr.policyPriority": "先匹配自定义 DNS 请求规则，再匹配解析策略，最后使用默认上游。",
++  "rr.poolHint": "按勾选顺序查询，可上移调整；竞速成员必须使用同一出站。",
++  "rr.pools": "解析池",
++  "rr.port": "目标端口",
++  "rr.positive": "正缓存",
++  "rr.prefetch": "预取热点域名",
++  "rr.preset": "配置国内外分流",
++  "rr.presetHint": "先确认上游和代理出站，再一次应用以下规则。",
++  "rr.presetMissingGeo": "需要已加载 GeoSite cn；缺失时会提示并保持原配置。不会自动更改已有规则。",
++  "rr.presetRouting": "同时建立对应路由分流",
++  "rr.previous": "上一页",
++  "rr.providerHelp": "资源定义匹配范围，路由、DNS 和 Fake-IP 共用引用。",
++  "rr.providers": "规则集",
++  "rr.queries": "查询数",
++  "rr.race": "前两个竞速",
++  "rr.real": "真实 IP",
++  "rr.realCache": "真实 DNS 缓存",
++  "rr.recordCache": "解析记录索引",
++  "rr.recordQuery": "多类型查询与新建规则",
++  "rr.references": "引用位置",
++  "rr.remove": "删除",
++  "rr.removeApply": "删除并热更新",
++  "rr.removeReferences": "同时移除关联规则",
++  "rr.reorder": "拖动排序",
++  "rr.replaceWith": "替换为",
++  "rr.resolvers": "DNS 服务器",
++  "rr.resourceVersions": "资源与版本",
++  "rr.resultStale": "配置已更新，结果已过期",
++  "rr.routeSelection": "路由判断",
++  "rr.routeSimulated": "路由为模拟判断，不代表网站已连接成功。",
++  "rr.save": "保存并应用",
++  "rr.search": "搜索",
++  "rr.sha256": "SHA256",
++  "rr.simulated": "离线分析",
++  "rr.source": "来源",
++  "rr.sourceExample": "https://example.com/rules.yaml",
++  "rr.stale": "配置已变更，请关闭并重新编辑。",
++  "rr.staleReplies": "故障旧值",
++  "rr.staleSeconds": "故障旧值保留（秒，0 关闭）",
++  "rr.statsScope": "来自实际上游查询；P50/P95 为最近 256 次成功耗时，不主动探测。",
++  "rr.strategy": "选择方式",
++  "rr.suffix": "域名及子域名",
++  "rr.suffixHint": "包含该域名及其子域名。",
++  "rr.timeout": "超时（毫秒）",
++  "rr.tlsName": "TLS 校验名（可选）",
++  "rr.trace": "规则、DNS 与 Fake-IP 追踪",
++  "rr.traceNoMapping": "显示有效地址策略，追踪不分配 Fake-IP 映射。",
++  "rr.transactionHint": "校验通过后统一生效；失败保留原配置。",
++  "rr.ttl": "TTL",
++  "rr.tunActive": "TUN 已启用",
++  "rr.tunInactive": "TUN 未启用",
++  "rr.unknown": "缺少条件，无法判定",
++  "rr.update": "更新",
++  "rr.updating": "更新中",
++  "rr.upstreamHelp": "服务器可复用到多个解析池；加密连接始终校验证书。",
++  "rr.url": "订阅地址",
+   "rule.add": "新建规则",
+   "rule.addApply": "应用",
+   "rule.addCondition": "添加 AND 条件",
+diff --git a/src/i18n/locales/zh-TW.json b/src/i18n/locales/zh-TW.json
+--- a/src/i18n/locales/zh-TW.json
++++ b/src/i18n/locales/zh-TW.json
+@@ -548,6 +548,12 @@
+   "desktop.tun": "TUN 模式",
+   "desktop.tunAddress": "虛擬網卡位址",
+   "desktop.tunUdpFull": "TCP / UDP · IPv4 / IPv6",
++  "desktop.windowClose": "关闭",
++  "desktop.windowControls": "窗口控制",
++  "desktop.windowError": "无法操作窗口",
++  "desktop.windowMaximize": "最大化",
++  "desktop.windowMinimize": "最小化",
++  "desktop.windowRestore": "还原",
+   "dns.addRequestRuleFor": "為 {domain} 新增 DNS 請求規則",
+   "dns.addRoutingRuleFor": "為 {domain} 新增路由規則",
+   "dns.addRuleFor": "為 {value} 新增規則",
+@@ -1414,7 +1420,6 @@
+   "palette.arco": "Arco Design",
+   "palette.bytedance": "ByteDance",
+   "palette.catppuccin": "Catppuccin",
+-  "palette.chromiumOnly": "僅 Chromium",
+   "palette.dawnMain": "Dawn / Main",
+   "palette.dawnMoon": "Dawn / Moon",
+   "palette.defaultDark": "Default / Dark",
+@@ -1513,6 +1518,7 @@
+   "policy.members": "{n} 個成員",
+   "policy.membersDown": "{n} 個成員，{down} 個無法使用",
+   "policy.network": "為 {name} 選擇網路",
++  "policy.networkHelp": "选择 {network} 新连接使用的节点。",
+   "policy.networkHotHelp": "立即切換 {network} 流量；此群組的現有連線會關閉並依新選擇重建。",
+   "policy.noProbe": "此群組無法使用「測試全部」",
+   "policy.noneSelected": "尚未選出成員",
+@@ -1523,6 +1529,7 @@
+   "policy.pickGroups": "群組",
+   "policy.pickMembers": "成員",
+   "policy.pickNodes": "節點",
++  "policy.pinToggleHelp": "再次点击已固定节点可解除固定。",
+   "policy.pinned": "{name} 已手動固定為 {member}，自動策略已暫停",
+   "policy.probeAll": "測試全部",
+   "policy.probeChanged": "可用：{healthy}，無法使用：{unavailable}，狀態未知：{unknown}，選擇：已變更",
+@@ -1540,6 +1547,7 @@
+   "policy.selectedKept": "{name} 已選擇 {member}，現有連線未中斷",
+   "policy.sort": "排序",
+   "policy.summary": "目前：{member}",
++  "policy.summaryNetwork": "当前 {network}：{member}",
+   "policy.toleranceHelp": "延遲至少降低此毫秒數才切換群組成員。留空使用預設值。",
+   "policy.toleranceInvalid": "請輸入 0 或正整數（毫秒）。",
+   "policy.unsetDefault": "未設定，使用引擎預設值",
+@@ -1563,6 +1571,220 @@
+   "probe.submit": "探測",
+   "probe.tcp": "TCP 連接埠（僅連通性）",
+   "probe.title": "探測選項",
++  "rr.actualDns": "实际 DNS 查询",
++  "rr.actualStats": "实际查询统计",
++  "rr.add": "新增",
++  "rr.addressMode": "地址模式",
++  "rr.advanced": "高级设置",
++  "rr.advancedRoutingTrace": "更多路由追踪条件",
++  "rr.analyze": "开始分析",
++  "rr.applied": "已保存并热更新",
++  "rr.applying": "正在应用",
++  "rr.behavior": "匹配类型",
++  "rr.bindingHelp": "在用户路由规则之后、默认出站之前匹配；全局和直连模式优先。",
++  "rr.bindings": "分类分流",
++  "rr.block": "block（阻断）",
++  "rr.bootstrap": "独立引导 DNS",
++  "rr.bootstrapHint": "逗号分隔；留空时使用独立引导 DNS。",
++  "rr.bootstrapIndependent": "每行一个使用 IP 的 DNS 地址；用于解析上游与代理节点，避免循环依赖。",
++  "rr.bootstrapIps": "引导 IP",
++  "rr.builtin": "內建規則集",
++  "rr.builtinAddLabel": "新增 {name}",
++  "rr.builtinAds": "廣告網域",
++  "rr.builtinAdsHint": "廣告與追蹤網域，需自行選擇阻斷動作。",
++  "rr.builtinAi": "AI 服務",
++  "rr.builtinAiHint": "國外 AI 服務網域。",
++  "rr.builtinAll": "全部",
++  "rr.builtinApple": "Apple",
++  "rr.builtinAppleHint": "Apple 產品與服務網域。",
++  "rr.builtinBilibili": "嗶哩嗶哩",
++  "rr.builtinBilibiliHint": "嗶哩嗶哩及媒體資源網域。",
++  "rr.builtinCategory": "分類",
++  "rr.builtinCdn": "MetaCubeX · CDN",
++  "rr.builtinCnDomains": "國內網域",
++  "rr.builtinCnDomainsHint": "國內網站及服務網域。",
++  "rr.builtinCnIp": "國內 IP",
++  "rr.builtinCnIpHint": "中國大陸 IPv4/IPv6 網段。",
++  "rr.builtinDomain": "網域規則",
++  "rr.builtinDownloadHelp": "來源和出站僅用於新增線上規則集；既有設定不變。",
++  "rr.builtinForeign": "國外網域",
++  "rr.builtinForeignHint": "上游維護的非國內網域分類。",
++  "rr.builtinGithub": "GitHub",
++  "rr.builtinGithubHint": "程式碼託管及相關資源網域。",
++  "rr.builtinGithubSource": "MetaCubeX · GitHub",
++  "rr.builtinGoogle": "Google",
++  "rr.builtinGoogleHint": "Google 及相關服務網域。",
++  "rr.builtinHelp": "本機規則可離線新增；線上規則下載後保存在本機，每天自動更新。",
++  "rr.builtinInstalled": "已新增",
++  "rr.builtinInstalledLabel": "已新增 {name}",
++  "rr.builtinIp": "IP 規則",
++  "rr.builtinLimit": "規則集已達 64 個上限，請先移除不需要的規則集。",
++  "rr.builtinLocal": "本機網路",
++  "rr.builtinLocalDomains": "本機網域",
++  "rr.builtinLocalDomainsHint": "localhost、local、lan 和 home.arpa。",
++  "rr.builtinMicrosoft": "Microsoft",
++  "rr.builtinMicrosoftHint": "微軟產品與服務網域。",
++  "rr.builtinNameTaken": "已有同名規則集「{name}」，請先編輯或重新命名。",
++  "rr.builtinNetflix": "Netflix",
++  "rr.builtinNetflixHint": "Netflix 影片及相關服務網域。",
++  "rr.builtinNoMatch": "沒有符合的預設",
++  "rr.builtinOffline": "離線可用",
++  "rr.builtinOnline": "線上更新",
++  "rr.builtinPrivateNetworks": "區域網路位址",
++  "rr.builtinPrivateNetworksHint": "IPv4/IPv6 私有、回送及鏈路本機位址。",
++  "rr.builtinRegion": "國內外",
++  "rr.builtinService": "常用服務",
++  "rr.builtinSource": "下載來源",
++  "rr.builtinSteam": "Steam",
++  "rr.builtinSteamHint": "Steam 商店、社群及下載網域。",
++  "rr.builtinTelegram": "Telegram 網域",
++  "rr.builtinTelegramHint": "Telegram 訊息與媒體網域。",
++  "rr.builtinTelegramIp": "Telegram IP",
++  "rr.builtinTelegramIpHint": "Telegram 服務網段。",
++  "rr.builtinUsage": "新增後，在路由規則或 DNS 策略中引用。",
++  "rr.builtinYoutube": "YouTube",
++  "rr.builtinYoutubeHint": "影片、媒體及相關服務網域。",
++  "rr.cacheEntries": "条目数",
++  "rr.cacheHint": "遵循 DNS TTL；合并重复查询。预取与故障旧值默认关闭。",
++  "rr.cacheOptions": "缓存设置",
++  "rr.cacheResult": "缓存与应答",
++  "rr.cancelRequested": "正在取消",
++  "rr.cancelled": "已取消",
++  "rr.capacity": "最大条目数",
++  "rr.choose": "请选择",
++  "rr.clearMappings": "清理 Fake-IP 映射",
++  "rr.clearMappingsHint": "将清理内核中的映射；已有 Fake-IP 地址可能需要设备重新解析。",
++  "rr.clearRealCache": "清理真实 DNS 缓存",
++  "rr.coalesced": "合并查询",
++  "rr.condition": "匹配内容",
++  "rr.content": "粘贴内容",
++  "rr.contentExample": "+.example.com",
++  "rr.createDns": "创建 DNS 策略",
++  "rr.createRouting": "创建路由分流",
++  "rr.current": "已更新",
++  "rr.direct": "direct（直连）",
++  "rr.dnsQuery": "DNS 查询与追踪",
++  "rr.dnsSelection": "DNS 选择",
++  "rr.domainExample": "example.com",
++  "rr.domestic": "国内解析",
++  "rr.edit": "编辑",
++  "rr.editPolicies": "管理解析策略",
++  "rr.empty": "暂无内容",
++  "rr.enabled": "启用",
++  "rr.endpoint": "上游地址",
++  "rr.endpointHint": "支持 udp://、tcp://、tls:// 和 https://（DoH）。",
++  "rr.entries": "查看内容",
++  "rr.expression": "表达式",
++  "rr.expressionExample": "domain(suffix: example.com) && l4proto(tcp)",
++  "rr.failed": "更新失败，保留旧版本",
++  "rr.failures": "失败数",
++  "rr.fakeIp": "Fake-IP",
++  "rr.fakeIpHint": "共用策略分类；先匹配排除域名，再匹配首个显式地址策略。TUN 启用时分配 Fake-IP。",
++  "rr.fakeIpLink": "Fake-IP 分类联动",
++  "rr.fallback": "顺序主备",
++  "rr.file": "导入文件",
++  "rr.fileLimit": "文件不能超过 16 MiB",
++  "rr.fileRequired": "请先选择规则文件",
++  "rr.first100": "显示前 100 项；删除域名会清理该域名的全部类型。",
++  "rr.foreign": "代理域名解析",
++  "rr.format": "文件格式",
++  "rr.fromCache": "来自缓存",
++  "rr.fromUpstream": "来自上游",
++  "rr.full": "仅此域名",
++  "rr.fullHint": "仅匹配填写的域名。",
++  "rr.geoCn": "GeoSite cn",
++  "rr.geodata": "地理数据",
++  "rr.headerError": "请求头格式为 名称: 值",
++  "rr.headers": "请求头",
++  "rr.headersHint": "每行一个，仅在编辑时显示。",
++  "rr.hits": "缓存命中",
++  "rr.inherit": "不覆盖地址模式",
++  "rr.interval": "更新间隔（秒）",
++  "rr.kind": "类型",
++  "rr.legacyDefault": "默认上游",
++  "rr.legacyUpstreams": "已有配置中的上游",
++  "rr.live": "当前生效",
++  "rr.liveDns": "实时查询 DNS",
++  "rr.liveHint": "执行 DNS 查询，不发送网站连接探测。",
++  "rr.local": "局域网域名",
++  "rr.manageGeodata": "管理地理数据",
++  "rr.mappingScope": "映射由内核管理，与真实 DNS 缓存分别清理；当前内核不提供完整映射列表。",
++  "rr.match": "匹配依据",
++  "rr.maxMemory": "内存上限（MiB）",
++  "rr.mb": "MB",
++  "rr.misses": "未命中",
++  "rr.missingInputs": "缺少输入",
++  "rr.moveUp": "上移",
++  "rr.ms": "ms",
++  "rr.name": "名称",
++  "rr.negative": "负缓存",
++  "rr.negativeCache": "缓存 NXDOMAIN / 空应答",
++  "rr.network": "网络协议",
++  "rr.next": "下一页",
++  "rr.noAddressPolicy": "未设置分类地址模式，沿用现有设置。",
++  "rr.notQueried": "未查询",
++  "rr.offlineHint": "仅离线分析，不发送网络请求。",
++  "rr.otherDomains": "其余域名",
++  "rr.outbound": "连接出站",
++  "rr.pending": "进行中",
++  "rr.policies": "解析策略",
++  "rr.policyHelp": "从上到下匹配，命中后使用指定解析池和地址模式。",
++  "rr.policyPriority": "先匹配自定义 DNS 请求规则，再匹配解析策略，最后使用默认上游。",
++  "rr.poolHint": "按勾选顺序查询，可上移调整；竞速成员必须使用同一出站。",
++  "rr.pools": "解析池",
++  "rr.port": "目标端口",
++  "rr.positive": "正缓存",
++  "rr.prefetch": "预取热点域名",
++  "rr.preset": "配置国内外分流",
++  "rr.presetHint": "先确认上游和代理出站，再一次应用以下规则。",
++  "rr.presetMissingGeo": "需要已加载 GeoSite cn；缺失时会提示并保持原配置。不会自动更改已有规则。",
++  "rr.presetRouting": "同时建立对应路由分流",
++  "rr.previous": "上一页",
++  "rr.providerHelp": "资源定义匹配范围，路由、DNS 和 Fake-IP 共用引用。",
++  "rr.providers": "规则集",
++  "rr.queries": "查询数",
++  "rr.race": "前两个竞速",
++  "rr.real": "真实 IP",
++  "rr.realCache": "真实 DNS 缓存",
++  "rr.recordCache": "解析记录索引",
++  "rr.recordQuery": "多类型查询与新建规则",
++  "rr.references": "引用位置",
++  "rr.remove": "删除",
++  "rr.removeApply": "删除并热更新",
++  "rr.removeReferences": "同时移除关联规则",
++  "rr.reorder": "拖动排序",
++  "rr.replaceWith": "替换为",
++  "rr.resolvers": "DNS 服务器",
++  "rr.resourceVersions": "资源与版本",
++  "rr.resultStale": "配置已更新，结果已过期",
++  "rr.routeSelection": "路由判断",
++  "rr.routeSimulated": "路由为模拟判断，不代表网站已连接成功。",
++  "rr.save": "保存并应用",
++  "rr.search": "搜索",
++  "rr.sha256": "SHA256",
++  "rr.simulated": "离线分析",
++  "rr.source": "来源",
++  "rr.sourceExample": "https://example.com/rules.yaml",
++  "rr.stale": "配置已变更，请关闭并重新编辑。",
++  "rr.staleReplies": "故障旧值",
++  "rr.staleSeconds": "故障旧值保留（秒，0 关闭）",
++  "rr.statsScope": "来自实际上游查询；P50/P95 为最近 256 次成功耗时，不主动探测。",
++  "rr.strategy": "选择方式",
++  "rr.suffix": "域名及子域名",
++  "rr.suffixHint": "包含该域名及其子域名。",
++  "rr.timeout": "超时（毫秒）",
++  "rr.tlsName": "TLS 校验名（可选）",
++  "rr.trace": "规则、DNS 与 Fake-IP 追踪",
++  "rr.traceNoMapping": "显示有效地址策略，追踪不分配 Fake-IP 映射。",
++  "rr.transactionHint": "校验通过后统一生效；失败保留原配置。",
++  "rr.ttl": "TTL",
++  "rr.tunActive": "TUN 已启用",
++  "rr.tunInactive": "TUN 未启用",
++  "rr.unknown": "缺少条件，无法判定",
++  "rr.update": "更新",
++  "rr.updating": "更新中",
++  "rr.upstreamHelp": "服务器可复用到多个解析池；加密连接始终校验证书。",
++  "rr.url": "订阅地址",
+   "rule.add": "新增規則",
+   "rule.addApply": "套用",
+   "rule.addCondition": "新增 AND 條件",
+@@ -1666,13 +1888,17 @@
+   "rule.ipOnly": "僅提供目的 IP 時，模擬依 IP 與連接埠判定。dial_mode 使用 domain 系列模式時，引擎會從實際 TLS 或 HTTP 流量嗅探網域，並重新評估規則。若要模擬此結果，請一併提供網域。",
+   "rule.keepsRoute": "現有連線維持目前的路由，重新連線後才套用變更。",
+   "rule.kind": "依據",
++  "rule.kind.destinationEndpoint": "目标 IP＋端口",
+   "rule.kind.domain": "僅此網域",
+   "rule.kind.domainKeyword": "網域關鍵字",
++  "rule.kind.domainPort": "域名＋目标端口",
+   "rule.kind.domainSuffix": "網域及子網域",
+   "rule.kind.dport": "目的連接埠",
+   "rule.kind.geoip": "geoip 地區",
+   "rule.kind.geosite": "geosite 分類",
+   "rule.kind.l4proto": "傳輸協定",
++  "rule.kind.protocolPort": "协议＋目标端口",
++  "rule.kind.sourceEndpoint": "来源 IP＋端口",
+   "rule.kind.sport": "來源連接埠",
+   "rule.likelyHelp": "前序規則因缺少輸入而無法判定；若均不符合，流量將使用所示的可能出站。請提供 {inputs} 並重新模擬，以確認結果。",
+   "rule.likelyOutbound": "可能出站",
+diff --git a/src/shell/palettes.ts b/src/shell/palettes.ts
+--- a/src/shell/palettes.ts
++++ b/src/shell/palettes.ts
+@@ -13,7 +13,7 @@
+   {id: 'catppuccin/mocha', group: 'palette.catppuccin', label: 'palette.mocha'},
+   {id: 'arco/arco', group: 'palette.bytedance', label: 'palette.arco'},
+   {id: 'semi/semi', group: 'palette.bytedance', label: 'palette.semi'},
+-  {id: 'glass/glass', group: 'palette.glassName', label: 'palette.liquid', desc: 'palette.chromiumOnly'},
++  {id: 'glass/glass', group: 'palette.glassName', label: 'palette.liquid'},
+   {id: 'glass/clear', group: 'palette.glassName', label: 'palette.glassName'},
+   {id: 'glass/frosted', group: 'palette.glassName', label: 'palette.frosted'},
+   {id: 'glass/tinted', group: 'palette.glassName', label: 'palette.tinted'},
+@@ -47,7 +47,7 @@
+ ] as const satisfies ReadonlyArray<{id: `${string}/${string}`; group: Key; label: Key; desc?: Key; words?: Rewording}>;
+ 
+ export type PaletteId = (typeof palettes)[number]['id'];
+-export const DEFAULT_PALETTE: PaletteId = 'rose-pine/moon';
++export const DEFAULT_PALETTE: PaletteId = 'qiangguo/qiangguo';
+ 
+ const ids: ReadonlySet<string> = new Set(palettes.map(palette => palette.id));
+ export function isPaletteId(value: string | null): value is PaletteId {
+diff --git a/src/shell/view.ts b/src/shell/view.ts
+--- a/src/shell/view.ts
++++ b/src/shell/view.ts
+@@ -238,7 +238,7 @@
+ export function paletteMenu(t: Translator): PaletteSection[] {
+   const sections: Array<PaletteSection & {group: string}> = [];
+   for (const palette of palettes) {
+-    const item = {id: palette.id, label: t(palette.label), desc: 'desc' in palette ? t(palette.desc) : undefined};
++    const item = {id: palette.id, label: t(palette.label)};
+     const last = sections.at(-1);
+     if (last?.group === palette.group) last.items.push(item);
+     else sections.push({group: palette.group, title: t(palette.group), plain: palette.group === 'palette.other', items: [item]});
+diff --git a/src/ui/ResourceFields.tsx b/src/ui/ResourceFields.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/ui/ResourceFields.tsx
+@@ -0,0 +1,121 @@
++import {useId, type DragEvent, type ReactNode} from 'react';
++export function Field({
++  label,
++  value,
++  onChange,
++  type = 'text',
++  area,
++  disabled,
++  hint,
++  placeholder,
++  min,
++  max
++}: {
++  label: string;
++  value: string | number;
++  onChange: (value: string) => void;
++  type?: string;
++  area?: boolean;
++  disabled?: boolean;
++  hint?: string;
++  placeholder?: string;
++  min?: number;
++  max?: number;
++}) {
++  const id = useId();
++  return (
++    <label className="rr-field" htmlFor={id}>
++      <span>{label}</span>
++      {area ? (
++        <textarea id={id} value={value} onChange={e => onChange(e.target.value)} disabled={disabled} spellCheck={false} placeholder={placeholder} />
++      ) : (
++        <input
++          id={id}
++          value={value}
++          type={type}
++          onChange={e => onChange(e.target.value)}
++          disabled={disabled}
++          placeholder={placeholder}
++          min={min}
++          max={max}
++          spellCheck={false}
++        />
++      )}{' '}
++      {hint && <span className="rp-note">{hint}</span>}
++    </label>
++  );
++}
++export function Select({
++  label,
++  value,
++  onChange,
++  items,
++  disabled
++}: {
++  label: string;
++  value: string;
++  onChange: (value: string) => void;
++  items: {id: string; label: string}[];
++  disabled?: boolean;
++}) {
++  const id = useId();
++  return (
++    <label className="rr-field" htmlFor={id}>
++      <span>{label}</span>
++      <select id={id} value={value} onChange={e => onChange(e.target.value)} disabled={disabled}>
++        {items.map(item => (
++          <option key={item.id} value={item.id}>
++            {item.label}
++          </option>
++        ))}
++      </select>
++    </label>
++  );
++}
++export function Check({label, value, onChange, disabled}: {label: string; value: boolean; onChange: (value: boolean) => void; disabled?: boolean}) {
++  return (
++    <label className="rr-check">
++      <input type="checkbox" checked={value} onChange={e => onChange(e.target.checked)} disabled={disabled} />
++      {label}
++    </label>
++  );
++}
++
++export function Grid({children}: {children: ReactNode}) {
++  return <div className="rr-grid">{children}</div>;
++}
++export function FileInput({label, disabled, onFile}: {label: string; disabled?: boolean; onFile: (file: File) => void}) {
++  const id = useId();
++  return (
++    <label className="rr-field" htmlFor={id}>
++      {label}
++      <input
++        id={id}
++        type="file"
++        accept=".mrs,.yaml,.yml,.txt,.list"
++        disabled={disabled}
++        onChange={e => {
++          const file = e.target.files?.[0];
++          if (file) onFile(file);
++        }}
++      />
++    </label>
++  );
++}
++export function DragHandle({
++  label,
++  disabled,
++  onStart,
++  onEnd
++}: {
++  label: string;
++  disabled?: boolean;
++  onStart: (e: DragEvent<HTMLButtonElement>) => void;
++  onEnd: () => void;
++}) {
++  return (
++    <button type="button" className="rr-grip" draggable={!disabled} disabled={disabled} aria-label={label} onDragStart={onStart} onDragEnd={onEnd}>
++      ⠿
++    </button>
++  );
++}

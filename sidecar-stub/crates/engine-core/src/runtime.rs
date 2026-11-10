@@ -82,9 +82,12 @@ impl Engine {
         config::start();
         STOPPING.store(false, Ordering::SeqCst);
         crate::compat::set_router_port(address.port());
+        crate::lan::start();
         let shutdown = Shutdown::default();
         let mut tasks = vec![
             providers::start(shutdown.clone()),
+            crate::rules_runtime::start(shutdown.clone()),
+            crate::geodata_updates::start(shutdown.clone()),
             state::start_recorder(shutdown.clone()),
             events::start(shutdown.clone()),
             crate::group_policy::start(shutdown.clone()),
@@ -94,6 +97,7 @@ impl Engine {
                     while !shutdown.wait(Duration::from_secs(2)) {
                         config::refresh();
                         crate::compat::refresh_network();
+                        crate::dns_transport::refresh_network();
                         crate::compat::refresh_tun_processes();
                     }
                 }
@@ -163,6 +167,7 @@ impl Engine {
         }
         STOPPING.store(true, Ordering::SeqCst);
         self.shutdown.cancel();
+        crate::lan::shutdown();
         crate::connections::close_all();
         let result = tun::disable();
         crate::compat::shutdown();

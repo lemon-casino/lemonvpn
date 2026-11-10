@@ -3,7 +3,7 @@
 //! Upstreams come from the `dns { upstream { ... } }` block of the accepted
 //! configuration. Queries the resolver makes for its own dials are recorded in a
 //! bounded log; diagnostic `/dns/query` calls are not, as the contract requires.
-//! Only positive answers are cached (`coverage.negative` is false).
+//! The shared wire cache serves positive/negative replies; the legacy answer index lists parsed positive records only.
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
@@ -20,17 +20,49 @@ const MAX_LOG: usize = 2048;
 const MAX_PAGE: usize = 500;
 const MAX_TYPES: usize = 8;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+thread_local!{static STEPS:std::cell::RefCell<Vec<serde_json::Value>>=const{std::cell::RefCell::new(Vec::new())};static CACHE_SOURCE:std::cell::RefCell<&'static str>=const{std::cell::RefCell::new("upstream")};}
+fn last_cache_hit()->bool{CACHE_SOURCE.with(|s|matches!(*s.borrow(),"cache"|"coalesced"|"stale"))}
+pub(crate) fn trace_steps()->Vec<serde_json::Value>{STEPS.with(|s|s.borrow().clone())}
+pub(crate) fn cache_source()->&'static str{CACHE_SOURCE.with(|s|*s.borrow())}
+fn routed_exchange(query:&[u8],name:&str,kind:Option<&str>,initial:Option<&str>,generation:&str,use_cache:bool)->io::Result<(Vec<u8>,Option<String>)>{
+    STEPS.with(|s|s.borrow_mut().clear());CACHE_SOURCE.with(|s|*s.borrow_mut()="error");
+    let selected=initial.map(str::to_owned).or_else(||config::upstreams().first().map(|p|p.name.clone())).ok_or_else(||invalid("没有配置 DNS 上游"))?;
+    let result=crate::dns_wire_cache::query(query,&selected,generation,use_cache,||{
+        let(wire,upstream)=routed_exchange_uncached(query,name,kind,Some(&selected),generation)?;
+        Ok(crate::dns_wire_cache::Packet{wire,upstream})
+    })?;
+    if config::generation()!=generation{return Err(invalid("DNS 查询期间配置已更新，请重试"))}
+    if result.prefetch{
+        let packet=query.to_vec();let request=packet.clone();let pool=selected.clone();let lookup=selected.clone();let generation=generation.to_owned();let version=generation.clone();let name=name.to_owned();let kind=kind.map(str::to_owned);
+        crate::dns_wire_cache::prefetch(packet,pool,generation,move||{let(wire,upstream)=routed_exchange_uncached(&request,&name,kind.as_deref(),Some(&lookup),&version)?;Ok(crate::dns_wire_cache::Packet{wire,upstream})});
+    }
+    CACHE_SOURCE.with(|s|*s.borrow_mut()=if reply_code(&selected).is_some(){"policy"}else{result.source});
+    Ok((result.wire,result.upstream))
+}
+pub(crate) fn bootstrap_resolve(host:&str)->io::Result<Vec<IpAddr>>{
+    let mut result=Vec::new();let mut last=invalid("节点/上游域名缺少可用的引导 DNS");
+    let roots=crate::rules_runtime::current().document.bootstrap.clone();
+    for kind in ["A","AAAA"]{
+        let query=encode_query(QUERY_ID.fetch_add(1,Ordering::Relaxed),host,if kind=="A"{1}else{28})?;
+        for (i,url) in roots.iter().enumerate(){
+            let resolver=crate::rules_runtime::model::Resolver{id:format!("bootstrap-{i}"),name:"引导解析".into(),url:url.clone(),..Default::default()};
+            let generation=crate::config::generation();let cache_key=format!("__bootstrap_{i}");
+            match crate::dns_wire_cache::query(&query,&cache_key,&generation,true,||crate::dns_transport::exchange(&resolver,&query).map(|wire|crate::dns_wire_cache::Packet{wire,upstream:Some(resolver.id.clone())})){Ok(reply)=>{let(_,answers)=parse_response(&reply.wire)?;result.extend(answers.into_iter().filter_map(|a|a.data.parse::<IpAddr>().ok()));break},Err(e)=>last=e}
+        }
+    }
+    if result.is_empty(){Err(last)}else{Ok(result)}
+}
 
 pub const RECORD_TYPES: &[&str] = &[
     "A", "AAAA", "CNAME", "NS", "PTR", "MX", "TXT", "SRV", "SOA", "CAA",
 ];
 
 #[derive(Clone, Debug)]
-struct Answer {
+pub(crate) struct Answer {
     name: String,
     kind: &'static str,
     ttl: u32,
-    data: String,
+    pub(crate) data: String,
 }
 
 #[derive(Clone, Debug)]
@@ -166,7 +198,7 @@ fn forward_wire(query: &[u8]) -> io::Result<Vec<u8>> {
     let routed = config::dns_route_for(&name, kind);
     let forced = routed.as_ref().map(|(upstream, _)| upstream.as_str());
     let started = Instant::now();
-    let (response, upstream) = routed_exchange(query, &name, kind, forced, &generation)?;
+    let (response, upstream) = routed_exchange(query, &name, kind, forced, &generation, true)?;
     if let Some(kind) = kind {
         if let Ok((status, answers)) = parse_response(&response) {
             record(
@@ -174,7 +206,7 @@ fn forward_wire(query: &[u8]) -> io::Result<Vec<u8>> {
                 &name,
                 kind,
                 &status,
-                false,
+                last_cache_hit(),
                 upstream.as_deref(),
                 started.elapsed().as_millis() as u64,
                 &answers,
@@ -195,7 +227,7 @@ fn forward_wire(query: &[u8]) -> io::Result<Vec<u8>> {
 
 /// Preserve the original wire reply (including unknown RRs/EDNS). A response
 /// may visit at most three distinct upstreams; loops fail closed with SERVFAIL.
-fn routed_exchange(
+fn routed_exchange_uncached(
     query: &[u8],
     name: &str,
     kind: Option<&str>,
@@ -230,6 +262,7 @@ fn routed_exchange(
             .filter_map(|answer| answer.data.parse().ok())
             .collect::<Vec<IpAddr>>();
         let next = config::dns_response_action(name, kind, &action, &addresses);
+        STEPS.with(|s|{let mut steps=s.borrow_mut();if steps.len()<3{steps.push(serde_json::json!({"pool":action,"response_action":next,"endpoint":crate::dns_transport::last_endpoint(),"addresses":addresses}));}});
         if next == "accept" {
             return Ok((reply, Some(action)));
         }
@@ -273,7 +306,11 @@ fn exchange_wire(upstream: &config::Upstream, query: &[u8]) -> io::Result<Vec<u8
     exchange_wire_native(upstream,query)
 }
 fn exchange_wire_native(upstream: &config::Upstream, query: &[u8]) -> io::Result<Vec<u8>> {
-    let reply = if upstream.protocol == "tcp" {
+    let reply = if upstream.protocol == "pool" {
+        crate::dns_transport::exchange_pool(&upstream.host,query)?
+    } else if matches!(upstream.protocol,"tls"|"https") {
+        crate::dns_transport::exchange(&crate::rules_runtime::model::Resolver{id:upstream.name.clone(),name:upstream.name.clone(),url:format!("{}://{}:{}",upstream.protocol,upstream.host,upstream.port),..Default::default()},query)?
+    } else if upstream.protocol == "tcp" {
         tcp_exchange(upstream, query)?
     } else {
         let udp = udp_exchange(upstream, query)?;
@@ -283,6 +320,10 @@ fn exchange_wire_native(upstream: &config::Upstream, query: &[u8]) -> io::Result
             udp
         }
     };
+    validate_wire(query,&reply)?;
+    Ok(reply)
+}
+pub(crate) fn validate_wire(query:&[u8],reply:&[u8])->io::Result<()> {
     if reply.len() < 12 || reply[..2] != query[..2] || reply[2] & 0x80 == 0 || reply[4..6] != [0, 1]
     {
         return Err(invalid("DNS 响应事务不匹配"));
@@ -292,7 +333,7 @@ fn exchange_wire_native(upstream: &config::Upstream, query: &[u8]) -> io::Result
     if question != returned || query.get(end..end + 4) != reply.get(after..after + 4) {
         return Err(invalid("DNS 响应问题不匹配"));
     }
-    Ok(reply)
+    Ok(())
 }
 
 /// Resolves a name for a direct dial. A and then AAAA are queried; the first
@@ -301,6 +342,7 @@ pub fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
     if let Ok(address) = host.parse::<IpAddr>() {
         return Ok(vec![address]);
     }
+    if crate::dns_transport::bootstrapping(){return bootstrap_resolve(host);}
     if !available() {
         return (host, 0)
             .to_socket_addrs()
@@ -389,25 +431,12 @@ fn lookup(
         .map(str::to_owned)
         .or_else(|| upstreams.first().map(|upstream| upstream.name.clone()))
         .ok_or_else(|| invalid("没有配置 DNS 上游"))?;
-    if use_cache {
-        if let Some(hit) = cache_get_for(&name, kind, Some(&selected)) {
-            return Ok(Lookup {
-                status: hit.status,
-                answers: hit.answers,
-                cached: true,
-                entry_id: Some(hit.id),
-                upstream: hit.upstream,
-                route,
-                elapsed_ms: 0,
-            });
-        }
-    }
 
     let started = Instant::now();
     let code = type_code(kind).ok_or_else(|| invalid("未知 DNS 类型"))?;
     let query = encode_query(QUERY_ID.fetch_add(1, Ordering::Relaxed), &name, code)?;
     let (response, final_upstream) =
-        routed_exchange(&query, &name, Some(kind), Some(&selected), &generation)?;
+        routed_exchange(&query, &name, Some(kind), Some(&selected), &generation, use_cache)?;
     let (status, answers) = parse_response(&response)?;
     let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
@@ -427,7 +456,7 @@ fn lookup(
     Ok(Lookup {
         status,
         answers,
-        cached: false,
+        cached: last_cache_hit(),
         entry_id,
         upstream: final_upstream,
         route,
@@ -951,6 +980,8 @@ pub fn delete_name(query: &str) -> Result<String, (u16, &'static str, String)> {
 }
 
 pub fn flush() -> String {
+    crate::dns_wire_cache::flush();
+    crate::dns_transport::flush();
     let mut resolver = store();
     let deleted = resolver.cache.len();
     resolver.cache.clear();
@@ -1073,7 +1104,7 @@ fn type_name(code: u16) -> Option<&'static str> {
     })
 }
 
-fn encode_query(id: u16, domain: &str, kind: u16) -> io::Result<Vec<u8>> {
+pub(crate) fn encode_query(id: u16, domain: &str, kind: u16) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(32 + domain.len());
     bytes.extend_from_slice(&id.to_be_bytes());
     bytes.extend_from_slice(&[0x01, 0x00]);
@@ -1094,7 +1125,7 @@ fn encode_query(id: u16, domain: &str, kind: u16) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn parse_response(bytes: &[u8]) -> io::Result<(String, Vec<Answer>)> {
+pub(crate) fn parse_response(bytes: &[u8]) -> io::Result<(String, Vec<Answer>)> {
     if bytes.len() < 12 {
         return Err(invalid("DNS 响应太短"));
     }
@@ -1171,7 +1202,7 @@ fn skip_name(bytes: &[u8], mut offset: usize) -> io::Result<usize> {
     }
 }
 
-fn read_name(bytes: &[u8], offset: usize) -> io::Result<(String, usize)> {
+pub(crate) fn read_name(bytes: &[u8], offset: usize) -> io::Result<(String, usize)> {
     let mut labels = Vec::new();
     let mut position = offset;
     let mut next = None;

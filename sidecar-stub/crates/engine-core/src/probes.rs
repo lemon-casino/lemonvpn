@@ -27,11 +27,11 @@ const MAX_OPERATIONS: usize = 64;
 const MAX_SAMPLES: usize = 10;
 const MAX_MEMBERS_PER_JOB: usize = 16;
 const MAX_RESULTS_PER_JOB: usize = 64;
-/// A stable, cache-friendly endpoint for the HTTP probe. The first response
-/// byte is all the probe needs, so any reachable site proves the node path.
-const HTTP_HOST: &str = "www.baidu.com";
-const HTTP_PORT: u16 = 80;
-const HTTP_PATH: &str = "/";
+// Verify a complete proxy path, including TLS and the expected HTTP status.
+// A port accepting TCP or a gateway returning an error is not usable proxy RTT.
+const HTTP_HOST: &str = "www.gstatic.com";
+const HTTP_PORT: u16 = 443;
+const HTTP_PATH: &str = "/generate_204";
 const DNS_NAME: &str = "example.com";
 
 pub struct Accepted {
@@ -245,6 +245,7 @@ fn start_node(
         outcome.state,
         outcome.latency,
         &outcome.error,
+        version,
     );
     let row = row_json(
         &node_id,
@@ -334,6 +335,7 @@ fn start_group(
                 outcome.state,
                 outcome.latency,
                 &outcome.error,
+                version,
             );
             rows.push(row_json(
                 &member_id,
@@ -404,7 +406,7 @@ fn probe(node: &config::Node, kind: &str, version: &'static str) -> Outcome {
         _ => probe_tcp(node, version),
     };
     // A failure of just one address family does not prove the entire node unavailable.
-    if kind != "dns" && (version == "any" || outcome.state == "healthy") {
+    if kind == "http" && (version == "any" || outcome.state == "healthy") {
         crate::group_policy::probe_result(node, "tcp", outcome.state == "healthy", outcome.latency);
     }
     outcome
@@ -420,6 +422,7 @@ pub(crate) fn check_policy_node(node: &config::Node) {
         outcome.state,
         outcome.latency,
         &outcome.error,
+        "any",
     );
     if crate::compat::available() && !crate::runtime::stopping() {
         let outcome = udp::probe(node, "any");
@@ -484,17 +487,22 @@ fn probe_http(node: &config::Node, version: &'static str) -> Outcome {
         let family = if ip.is_ipv4() { "ipv4" } else { "ipv6" };
         let started = Instant::now();
         let attempt = outbound::connect_via(node, &ip.to_string(), HTTP_HOST, HTTP_PORT)
-        .and_then(|mut stream| {
+        .and_then(|stream| {
             stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
             stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
+            let server_name = rustls::pki_types::ServerName::try_from(HTTP_HOST)
+                .map_err(|_| io::Error::other("代理探测主机名无效"))?;
+            let connection = rustls::ClientConnection::new(crate::fetch::tls_config().clone(), server_name)
+                .map_err(|_| io::Error::other("代理探测 TLS 初始化失败"))?;
+            let mut stream = rustls::StreamOwned::new(connection, stream);
             let request = format!(
                 "GET {HTTP_PATH} HTTP/1.1\r\nHost: {HTTP_HOST}\r\nUser-Agent: lemonvpn-probe\r\nConnection: close\r\n\r\n"
             );
             stream.write_all(request.as_bytes())?;
             stream.flush()?;
-            let mut first = [0u8; 1];
-            stream.read_exact(&mut first)?;
-            Ok(())
+            let mut status = [0u8; 13];
+            stream.read_exact(&mut status)?;
+            validate_http_probe_status(&status)
         });
         match attempt {
             Ok(()) => {
@@ -519,6 +527,14 @@ fn probe_http(node: &config::Node, version: &'static str) -> Outcome {
     }
 
     last.unwrap_or_else(|| unresolved(version, "data", "节点没有可用地址".to_owned()))
+}
+
+fn validate_http_probe_status(status: &[u8]) -> io::Result<()> {
+    if status == b"HTTP/1.1 204 " || status == b"HTTP/1.0 204 " {
+        Ok(())
+    } else {
+        Err(io::Error::other("代理 HTTPS 探测未返回预期的 204 响应"))
+    }
 }
 
 fn probe_dns(node: &config::Node, version: &'static str) -> Outcome {
@@ -696,7 +712,16 @@ fn record_health(
     status: &'static str,
     latency: Option<u32>,
     error: &Option<String>,
+    requested_version: &str,
 ) {
+    if requested_version == "any" {
+        // An automatic probe tries every eligible family until one succeeds.
+        // Its completed result supersedes old rows from the other family;
+        // retaining an old IPv4 success can hide a new all-family failure.
+        store().health.retain(|health| {
+            health.node_id != node_id || health.transport != "tcp" || health.kind != kind || health.ip_version == ip_version
+        });
+    }
     record_network_health(
         node_id, "tcp", kind, ip_version, warmth, status, latency, error,
     );
@@ -905,6 +930,38 @@ mod tests {
     use super::{array, dns_query, field, has_key, members_spec, object, Members};
 
     #[test]
+    fn proxy_probe_requires_the_expected_http_status() {
+        for prefix in [b"HTTP/1.1 204 ".as_slice(), b"HTTP/1.0 204 "] {
+            assert!(super::validate_http_probe_status(prefix).is_ok());
+        }
+        for prefix in [b"HTTP/1.1 403 ".as_slice(), b"HTTP/1.1 401 ", b"HTTP/1.1 302 ", b"HTTP/1.1 200 ", b"HTTP/1.1 502 ", b"H", b"arbitrary-data"] {
+            assert!(super::validate_http_probe_status(prefix).is_err());
+        }
+    }
+
+    #[test]
+    fn completed_any_family_failure_replaces_old_success() {
+        let id = "node-expiry-any-family-regression";
+        super::record_health(id, "http", "ipv4", "warm", "healthy", Some(23), &None, "ipv4");
+        super::record_health(id, "http", "ipv6", "warm", "unavailable", None, &Some("probe_failed".to_owned()), "any");
+        let health: serde_json::Value = serde_json::from_str(&super::health_json(id)).unwrap();
+        assert_eq!(health.as_array().unwrap().len(), 1);
+        assert_eq!(health[0]["state"], "unavailable");
+        assert!(health[0]["latency_ms"].is_null());
+    }
+
+    #[test]
+    fn explicit_family_probe_preserves_other_family_observations() {
+        let id = "node-expiry-explicit-family-regression";
+        super::record_health(id, "http", "ipv4", "warm", "healthy", Some(23), &None, "ipv4");
+        super::record_health(id, "http", "ipv6", "warm", "unavailable", None, &Some("probe_failed".to_owned()), "ipv6");
+        let health: serde_json::Value = serde_json::from_str(&super::health_json(id)).unwrap();
+        assert_eq!(health.as_array().unwrap().len(), 2);
+        assert_eq!(health[0]["state"], "healthy");
+        assert_eq!(health[1]["state"], "unavailable");
+    }
+
+    #[test]
     fn reads_the_node_target_object() {
         let body = r#"{"target":{"type":"node","node_id":"node-lan"},"kind":"tcp_connect","transport":["tcp"],"ip_version":"any","warmth":"warm"}"#;
         let target = object(body, "target").unwrap();
@@ -920,7 +977,7 @@ mod tests {
     fn finds_a_nested_target_without_matching_outer_braces() {
         let body = r#"{"extra":{"a":1},"target":{"type":"node","node_id":"node-a"}}"#;
         let target = object(body, "target").unwrap();
-        assert_eq!(target, r#""type":"node","node_id":"node-a""#);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&target).unwrap(), serde_json::json!({"type":"node","node_id":"node-a"}));
     }
 
     #[test]

@@ -28,7 +28,22 @@ const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 
-pub fn handle(mut client: TcpStream) -> io::Result<()> {
+pub fn handle(client: TcpStream) -> io::Result<()> {
+    handle_inner(client, false, None, None)
+}
+pub(crate) fn handle_lan(
+    client: TcpStream,
+    auth: Option<&crate::lan::Credentials>,
+    stop: &std::sync::atomic::AtomicBool,
+) -> io::Result<()> {
+    handle_inner(client, true, auth, Some(stop))
+}
+fn handle_inner(
+    mut client: TcpStream,
+    lan: bool,
+    auth: Option<&crate::lan::Credentials>,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> io::Result<()> {
     // A suspended datapath refuses new tunnels before the greeting; the API
     // stays reachable so resume can still arrive on the same listener.
     if crate::control::suspended() {
@@ -44,7 +59,13 @@ pub fn handle(mut client: TcpStream) -> io::Result<()> {
     proxy::read_handshake(&mut client, &mut methods)?;
     let mut bridged = false;
     let mut process = None;
-    if methods.contains(&2) && !crate::compat::router_password().is_empty() {
+    if lan && auth.is_some() && !methods.contains(&2) {
+        client.write_all(&[VERSION, METHOD_NONE_ACCEPTABLE])?;
+        return Ok(());
+    }
+    if (lan && auth.is_some())
+        || (!lan && methods.contains(&2) && !crate::compat::router_password().is_empty())
+    {
         client.write_all(&[VERSION, 2])?;
         let mut head = [0; 2];
         proxy::read_handshake(&mut client, &mut head)?;
@@ -57,14 +78,20 @@ pub fn handle(mut client: TcpStream) -> io::Result<()> {
         proxy::read_handshake(&mut client, &mut length)?;
         let mut password = vec![0; length[0] as usize];
         proxy::read_handshake(&mut client, &mut password)?;
-        if crate::compat::bridge_process(&username).is_none()
-            || password != crate::compat::router_password().as_bytes()
-        {
+        let accepted = if lan {
+            auth.is_some_and(|auth| auth.matches(&username, &password))
+        } else {
+            crate::compat::bridge_process(&username).is_some()
+                && password == crate::compat::router_password().as_bytes()
+        };
+        if !accepted {
             client.write_all(&[1, 1])?;
             return Ok(());
         }
-        bridged = true;
-        process = crate::compat::bridge_process(&username).flatten();
+        bridged = !lan;
+        if !lan {
+            process = crate::compat::bridge_process(&username).flatten();
+        }
         client.write_all(&[1, 0])?;
     } else if !methods.contains(&METHOD_NO_AUTH) {
         client.write_all(&[VERSION, METHOD_NONE_ACCEPTABLE])?;
@@ -96,6 +123,11 @@ pub fn handle(mut client: TcpStream) -> io::Result<()> {
     let port = u16::from_be_bytes(port_bytes);
 
     if request[1] == 3 {
+        // LAN sharing currently exposes TCP only; never advertise a loopback
+        // UDP relay address to a remote device or bypass the target ACL.
+        if lan {
+            return reply(&mut client, REP_COMMAND_NOT_SUPPORTED);
+        }
         return udp_associate(client, process, bridged);
     }
 
@@ -111,7 +143,7 @@ pub fn handle(mut client: TcpStream) -> io::Result<()> {
     }
     let flow = peer.map(|peer| flows::begin(peer, &host, port, domain, domain_source, &decision));
 
-    match proxy::connect(&decision, &host, port) {
+    match proxy::connect_inbound(&decision, &host, port, lan) {
         Ok(upstream) => {
             logs::info(
                 "engine::tunnel",
@@ -119,7 +151,7 @@ pub fn handle(mut client: TcpStream) -> io::Result<()> {
                 Some(logs::fields(&[("via", "socks5")])),
             );
             reply(&mut client, REP_SUCCEEDED)?;
-            proxy::tunnel(client, upstream, flow, &decision, (&host, port))
+            proxy::tunnel(client, upstream, flow, &decision, (&host, port), stop)
         }
         Err(err) => {
             if let Some(flow) = flow {

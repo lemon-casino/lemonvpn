@@ -10,6 +10,7 @@
       }
     },
     "resources": {
+      "binaries/rules-dns.LICENSE.txt": "rules-dns.LICENSE.txt",
       "binaries/lemonvpn-kernel.exe": "lemonvpn-kernel.exe",
       "binaries/geoip.dat": "geoip.dat",
       "binaries/geosite.dat": "geosite.dat",

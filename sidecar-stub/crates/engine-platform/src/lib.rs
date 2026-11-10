@@ -13,6 +13,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 mod memory;
+pub mod lan;
+pub mod dns_artifact;
 #[cfg(windows)]
 mod windows;
 #[cfg(target_os = "macos")]

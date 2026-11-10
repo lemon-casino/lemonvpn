@@ -1,0 +1,468 @@
+diff --git a/src/api/api.ts b/src/api/api.ts
+--- a/src/api/api.ts
++++ b/src/api/api.ts
+@@ -86,6 +86,8 @@
+   udp?: string;
+   recovering?: string | null;
+ };
++export type LanSettings = {enabled: boolean; bind_address: string; port: number; authentication: {username: string; password: string} | null};
++export type LanStatus = {settings: LanSettings; revision: string; active: boolean; error: string | null; addresses: Array<{interface: string; address: string}>; address_error: string | null};
+ export type DnsSettings = {mode: 'fake-ip' | 'redir-host'; ipv4_range: string; ipv6_range: string; filters: string[]; store_fake_ip: boolean};
+ export type DnsSettingsStatus = {settings: DnsSettings; revision: string; tun_enabled: boolean};
+ export type DesktopStatus = {
+@@ -116,6 +118,8 @@
+   tun(signal?: AbortSignal): Promise<TunStatus>;
+   setTun(enabled: boolean, signal?: AbortSignal): Promise<TunStatus>;
+   desktopStatus?(signal?: AbortSignal): Promise<DesktopStatus>;
++  lanSettings?(signal?: AbortSignal): Promise<LanStatus>;
++  setLanSettings?(revision: string, settings: LanSettings, signal?: AbortSignal): Promise<LanStatus>;
+   dnsSettings?(signal?: AbortSignal): Promise<DnsSettingsStatus>;
+   setDnsSettings?(revision: string, settings: DnsSettings, signal?: AbortSignal): Promise<DnsSettingsStatus>;
+   nodes(query?: NodeQuery, signal?: AbortSignal): Promise<NodeList>;
+diff --git a/src/api/client.ts b/src/api/client.ts
+--- a/src/api/client.ts
++++ b/src/api/client.ts
+@@ -1,4 +1,4 @@
+-import type {RuleScope, RuleDefaults, RuleManagementResult, GroupRemovalRequest, GroupRemovalResult, DnsSettings, DnsSettingsStatus} from './api';
++import type {RuleScope, RuleDefaults, RuleManagementResult, GroupRemovalRequest, GroupRemovalResult, DnsSettings, DnsSettingsStatus, LanSettings, LanStatus} from './api';
+ import type {Provider} from './model';
+ import createClient, {type Middleware} from 'openapi-fetch';
+ import type {components, paths as StandardPaths} from './types';
+@@ -199,6 +199,10 @@
+     GET(path: '/api/v1/tun', init?: {signal?: AbortSignal}): Promise<{data?: TunStatus; response: Response}>;
+     GET(path: '/api/v1/desktop/status', init?: {signal?: AbortSignal}): Promise<{data?: DesktopStatus; response: Response}>;
+     POST(path: string, init: {body: {enabled: boolean}; signal?: AbortSignal}): Promise<{data?: TunStatus; response: Response}>;
++  };
++  const lanSettingsClient = client as unknown as {
++    GET(path: '/api/v1/lan/settings', init?: {signal?: AbortSignal}): Promise<{data?: LanStatus; response: Response}>;
++    PUT(path: '/api/v1/lan/settings', init: {body: {revision: string; settings: LanSettings}; signal?: AbortSignal}): Promise<{data?: LanStatus; response: Response}>;
+   };
+   const dnsSettingsClient = client as unknown as {
+     GET(path: '/api/v1/dns/settings', init?: {signal?: AbortSignal}): Promise<{data?: DnsSettingsStatus; response: Response}>;
+@@ -367,6 +371,8 @@
+     runtimeMemory: async signal => read(await client.GET('/api/v1/runtime/memory', {signal})),
+     tun: async signal => data(await tunClient.GET('/api/v1/tun', {signal})),
+     desktopStatus: async signal => data(await tunClient.GET('/api/v1/desktop/status', {signal})),
++    lanSettings: async signal => data(await lanSettingsClient.GET('/api/v1/lan/settings', {signal})),
++    setLanSettings: (revision, settings, signal) => lanSettingsClient.PUT('/api/v1/lan/settings', {body: {revision, settings}, signal}).then(data),
+     dnsSettings: async signal => data(await dnsSettingsClient.GET('/api/v1/dns/settings', {signal})),
+     setDnsSettings: (revision, settings, signal) => writesConfig(dnsSettingsClient.PUT('/api/v1/dns/settings', {body: {revision, settings}, signal}).then(data)),
+     setTun: async (enabled, signal) => data(await tunClient.POST('/api/v1/tun/set', {body: {enabled}, signal})),
+diff --git a/src/api/invalidation.ts b/src/api/invalidation.ts
+--- a/src/api/invalidation.ts
++++ b/src/api/invalidation.ts
+@@ -23,6 +23,7 @@
+   | 'desktopProxy'
+   | 'dnsCache'
+   | 'dnsSettings'
++  | 'lanSettings'
+   | 'dnsLog'
+   | 'runtimeSettings'
+   | 'configRevisions'
+@@ -48,6 +49,7 @@
+       'runtimeMemory',
+       'desktopStatus',
+       'dnsSettings',
++      'lanSettings',
+       'tun',
+       'runtimeSettings',
+       'groups',
+diff --git a/src/features/settings/LanSettings.tsx b/src/features/settings/LanSettings.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/features/settings/LanSettings.tsx
+@@ -0,0 +1,174 @@
++import {useState} from 'react';
++import {getApi} from '../../api';
++import type {LanSettings, LanStatus} from '../../api/api';
++import {useCapabilities} from '../../store';
++import {lanAvailable} from '../../store/desktop';
++import {useResource} from '../../store/resource';
++import {useAction} from '../../store/action';
++import {useDraftGuard} from '../../shell/draft';
++import {useT} from '../../i18n';
++import {copyText} from '../shared/copy';
++import {Badge, Button, Card, Empty, ErrorMessage, Form, InlineAlert, LabeledSelect, Switch, TextField, Toolbar, toast} from '../../ui/ui';
++import '../../ui/styles/lan-settings.css';
++
++type Draft = {revision: string; settings: LanSettings; port: string};
++const validCredential = (value: string) => /^[\x21-\x7e]{1,128}$/.test(value);
++export function LanSettingsCard() {
++  const t = useT();
++  const api = getApi();
++  const capabilities = useCapabilities();
++  const enabled = lanAvailable(capabilities.data?.resources) && !!api.lanSettings;
++  const resource = useResource({key: ['lanSettings'], every: 10000, fetch: signal => api.lanSettings!(signal)}, {enabled});
++  const action = useAction<'save'>({shared: 'lan-settings'});
++  const [draft, setDraft] = useState<Draft | null>(null);
++  const [written, setWritten] = useState<LanStatus | null>(null);
++  const [lastRead, setLastRead] = useState(resource.data);
++  if (lastRead !== resource.data) {
++    setLastRead(resource.data);
++    setWritten(null);
++  }
++  const [showPassword, setShowPassword] = useState(false);
++  const data = written ?? resource.data;
++  const settings = draft?.settings ?? data?.settings;
++  const endpoints = data?.addresses.filter(entry => data.settings.bind_address === '0.0.0.0' || entry.address === data.settings.bind_address) ?? [];
++  const port = draft?.port ?? String(settings?.port ?? 18081);
++  const dirty = !!draft && !!data && (JSON.stringify(draft.settings) !== JSON.stringify(data.settings) || port !== String(data.settings.port));
++  const stale = !!draft && !!data && draft.revision !== data.revision;
++  const guard = useDraftGuard(dirty, () => setDraft(null), 'lan.title');
++  const busy = !!action.busy;
++  const edit = (change: Partial<LanSettings>, nextPort?: string) => {
++    if (!settings || !data) return;
++    setDraft({revision: draft?.revision ?? data.revision, settings: {...settings, ...change}, port: nextPort ?? port});
++  };
++  const portError = !/^\d+$/.test(port) || Number(port) < 1024 || Number(port) > 65535;
++  const auth = settings?.authentication;
++  const authError = !!auth && (!validCredential(auth.username) || auth.username.includes(':') || !validCredential(auth.password));
++  const save = async () => {
++    if (!settings || !data || !api.setLanSettings || busy || stale || portError || authError) return;
++    const result = await action.run('save', signal => api.setLanSettings!(draft?.revision ?? data.revision, {...settings, port: Number(port)}, signal));
++    if (result) {
++      setWritten(result);
++      setDraft(null);
++      guard.clear();
++      resource.refetch();
++      toast('positive', t(result.active ? 'lan.applied' : 'lan.disabled'));
++    }
++  };
++  const copy = async (text: string) => {
++    const copied = await copyText(text);
++    toast(copied ? 'positive' : 'negative', t(copied ? 'lan.copied' : 'lan.copyFailed'));
++  };
++  if (!enabled) return null;
++  const choices = [
++    {id: '0.0.0.0', label: t('lan.allInterfaces')},
++    ...(data?.addresses ?? []).map(entry => ({id: entry.address, label: `${entry.address} · ${entry.interface}`}))
++  ];
++  if (settings && !choices.some(choice => choice.id === settings.bind_address)) choices.push({id: settings.bind_address, label: settings.bind_address});
++  return (
++    <Card level={2} title={t('lan.title')} titleId="settings-lan" note={t('lan.scope')}>
++      <ErrorMessage error={resource.error ?? action.error} onRetry={resource.refetch} />
++      {!settings || !data ? (
++        <Empty>{t('ui.loading')}</Empty>
++      ) : (
++        <Form
++          className="rp-lan-form"
++          onSubmit={event => {
++            event.preventDefault();
++            void save();
++          }}
++        >
++          <Toolbar>
++            <Switch isSelected={settings.enabled} isDisabled={busy} onChange={enabled => edit({enabled})}>
++              {t('lan.enable')}
++            </Switch>
++            <Badge>{t(data.active ? 'lan.active' : 'lan.inactive')}</Badge>
++          </Toolbar>
++          <div className="rp-lan-grid">
++            <LabeledSelect
++              label={t('lan.bind')}
++              value={settings.bind_address}
++              items={choices}
++              onChange={bind_address => edit({bind_address})}
++              isDisabled={busy}
++            />
++            <TextField
++              label={t('lan.port')}
++              value={port}
++              onChange={value => edit({}, value)}
++              error={portError ? t('lan.portError') : undefined}
++              isDisabled={busy}
++            />
++          </div>
++          <Switch
++            isSelected={!!auth}
++            isDisabled={busy}
++            onChange={selected => edit({authentication: selected ? {username: '', password: ''} : null})}
++            description={t('lan.authHelp')}
++          >
++            {t('lan.authentication')}
++          </Switch>
++          {auth && (
++            <div className="rp-lan-grid">
++              <TextField
++                label={t('lan.username')}
++                value={auth.username}
++                autoComplete="off"
++                onChange={username => edit({authentication: {...auth, username}})}
++                isDisabled={busy}
++              />
++              <TextField
++                label={t('lan.password')}
++                value={auth.password}
++                autoComplete="new-password"
++                type={showPassword ? 'text' : 'password'}
++                reveal={{shown: showPassword, label: t('lan.reveal'), onToggle: () => setShowPassword(value => !value)}}
++                onChange={password => edit({authentication: {...auth, password}})}
++                isDisabled={busy}
++              />
++            </div>
++          )}
++          {authError && <p className="rp-note">{t('lan.authError')}</p>}
++          {data.error && <InlineAlert tone="negative">{data.error}</InlineAlert>}
++          {stale && <InlineAlert>{t('lan.conflict')}</InlineAlert>}
++          <Toolbar>
++            <Button accent type="submit" isPending={busy} isDisabled={(!dirty && !(settings.enabled && !data.active)) || stale || portError || authError}>
++              {t('lan.apply')}
++            </Button>
++            <Button
++              isDisabled={busy}
++              onPress={() => {
++                setDraft(null);
++                guard.clear();
++                resource.refetch();
++              }}
++            >
++              {t('lan.reload')}
++            </Button>
++          </Toolbar>
++          {data.active && (
++            <section className="rp-lan-addresses" aria-label={t('lan.devices')}>
++              <strong>{t('lan.devices')}</strong>
++              <p className="rp-note">{t('lan.deviceHelp')}</p>
++              {endpoints.map(entry => (
++                <div key={entry.address} className="rp-lan-address">
++                  <div className="rp-lan-endpoint">
++                    <strong>
++                      {entry.address}:{data.settings.port}
++                    </strong>
++                    <span className="rp-note">{entry.interface}</span>
++                  </div>
++                  <Button onPress={() => void copy(`http://${entry.address}:${data.settings.port}`)}>{t('lan.copyHttp')}</Button>
++                  <Button onPress={() => void copy(`socks5://${entry.address}:${data.settings.port}`)}>{t('lan.copySocks')}</Button>
++                </div>
++              ))}
++              {!endpoints.length && <Empty>{t('lan.noAddress')}</Empty>}
++              {data.address_error && <InlineAlert>{data.address_error}</InlineAlert>}
++              <p className="rp-note">{t(data.settings.authentication ? 'lan.credentialsNeeded' : 'lan.noAuthentication')}</p>
++            </section>
++          )}
++          <p className="rp-note">{t('lan.firewall')}</p>
++        </Form>
++      )}
++    </Card>
++  );
++}
+diff --git a/src/features/settings/Settings.tsx b/src/features/settings/Settings.tsx
+--- a/src/features/settings/Settings.tsx
++++ b/src/features/settings/Settings.tsx
+@@ -26,6 +26,7 @@
+ import {RuntimeSettingsCard} from './RuntimeSettings';
+ import {TunSettingsCard} from './TunSettings';
+ import {DesktopSettingsCard} from './DesktopSettings';
++import {LanSettingsCard} from './LanSettings';
+ import {GeodataSettingsCard} from './GeodataSettings';
+ import {ProbeSettingsCard} from './ProbeSettings';
+ import {useCopyDiagnostics, useDiagnostics} from '../shared/useCopyDiagnostics';
+@@ -206,6 +207,7 @@
+       </Card>
+     ),
+     desktop: <DesktopSettingsCard />,
++    lan: <LanSettingsCard />,
+     runtime: <RuntimeSettingsCard />,
+     tun: <TunSettingsCard />,
+     geodata: <GeodataSettingsCard />,
+diff --git a/src/features/settings/nav.ts b/src/features/settings/nav.ts
+--- a/src/features/settings/nav.ts
++++ b/src/features/settings/nav.ts
+@@ -3,14 +3,16 @@
+ import {pickTab} from '../../shell/route';
+ import {tunAvailable} from './tun';
+ import {hasDesktop} from '../../desktop';
++import {lanAvailable} from '../../store/desktop';
+ 
+ // The page's cards in order. The page renders them in this order and search lists the same
+ // cards, so both take their titles from here; `?card=` scrolls to the card's heading, id `settings-{id}`.
+-export type SettingsCardId = 'backend' | 'desktop' | 'runtime' | 'tun' | 'geodata' | 'appearance' | 'probes' | 'about';
++export type SettingsCardId = 'backend' | 'desktop' | 'lan' | 'runtime' | 'tun' | 'geodata' | 'appearance' | 'probes' | 'about';
+ // `aliases` are other words people search for a card by; every language's title matches already.
+ export const settingsCards: ReadonlyArray<{id: SettingsCardId; titleKey: Key; aliases?: readonly string[]}> = [
+   {id: 'backend', titleKey: 'settings.backend'},
+   {id: 'desktop', titleKey: 'desktop.integration', aliases: ['windows', 'autostart']},
++  {id: 'lan', titleKey: 'lan.title', aliases: ['lan', '局域网', 'sharing', 'http', 'socks5']},
+   {id: 'runtime', titleKey: 'settings.runtime'},
+   {id: 'tun', titleKey: 'settings.tun', aliases: ['tun', 'tunnel', 'service', 'wintun']},
+   {id: 'geodata', titleKey: 'settings.geodata', aliases: ['geodata', 'geoip', 'geosite']},
+@@ -22,7 +24,7 @@
+ // TUN exists only where the engine reports the extension, so other backends never see the card.
+ export const settingsCardList = (resources: Capabilities['resources'] | undefined, desktop = hasDesktop) =>
+   settingsCards.filter(
+-    card => (desktop || card.id !== 'desktop') && (!desktop || card.id !== 'backend') && (card.id !== 'geodata' || resources?.geodata.available) && (card.id !== 'tun' || tunAvailable(resources))
++    card => (desktop || card.id !== 'desktop') && (card.id !== 'lan' || lanAvailable(resources)) && (!desktop || card.id !== 'backend') && (card.id !== 'geodata' || resources?.geodata.available) && (card.id !== 'tun' || tunAvailable(resources))
+   );
+ 
+ // The page's tabs: Appearance holds its own card, General every other one. A `?card=` link opens its card's tab, so
+diff --git a/src/i18n/locales/en.json b/src/i18n/locales/en.json
+--- a/src/i18n/locales/en.json
++++ b/src/i18n/locales/en.json
+@@ -1037,6 +1037,36 @@
+   "hub.traffic": "Monitor",
+   "ip.lookupNote": "Opens the site you pick in a new tab and sends it this address.",
+   "ip.lookupTitle": "Look up {ip}",
++  "lan.active": "Sharing",
++  "lan.allInterfaces": "All LAN interfaces (IPv4)",
++  "lan.applied": "LAN sharing applied",
++  "lan.apply": "Save and apply",
++  "lan.authError": "Use 1–128 visible ASCII characters; no colon in the username.",
++  "lan.authHelp": "Use HTTP Basic or SOCKS5 username/password authentication.",
++  "lan.authentication": "Require authentication",
++  "lan.bind": "Listen address",
++  "lan.conflict": "Settings changed elsewhere. Reload before applying.",
++  "lan.copied": "Address copied",
++  "lan.copyFailed": "Could not copy address",
++  "lan.copyHttp": "Copy HTTP address",
++  "lan.copySocks": "Copy SOCKS5 address",
++  "lan.credentialsNeeded": "Enter the configured username and password on the device. Copied addresses exclude credentials.",
++  "lan.deviceHelp": "Use manual proxy settings on the device: enter the server address and port below. Uses the current rules and outbound; HTTP/HTTPS and SOCKS5 TCP are supported.",
++  "lan.devices": "Connect another device",
++  "lan.disabled": "LAN sharing disabled",
++  "lan.enable": "Allow LAN connections",
++  "lan.firewall": "Keep LemonVPN running. Allow the shared TCP port through your firewall; client isolation on Wi-Fi must be off. Only private IPv4 clients and public destinations are supported; this does not provide a gateway or UDP relay.",
++  "lan.inactive": "Off",
++  "lan.noAddress": "No private IPv4 address found. Connect to Wi-Fi or Ethernet, then reload.",
++  "lan.noAuthentication": "No authentication. Only trusted devices should join this LAN.",
++  "lan.password": "Password",
++  "lan.port": "HTTP / SOCKS5 port",
++  "lan.portError": "Use a port from 1024 to 65535.",
++  "lan.reload": "Reload settings",
++  "lan.reveal": "Show or hide password",
++  "lan.scope": "Share this computer’s proxy with devices on the same network.",
++  "lan.title": "LAN sharing",
++  "lan.username": "Username",
+   "lifecycle.degraded": "Degraded",
+   "lifecycle.draining": "Draining",
+   "lifecycle.failed": "Failed",
+diff --git a/src/i18n/locales/zh-CN.json b/src/i18n/locales/zh-CN.json
+--- a/src/i18n/locales/zh-CN.json
++++ b/src/i18n/locales/zh-CN.json
+@@ -920,6 +920,36 @@
+   "hub.traffic": "观测",
+   "ip.lookupNote": "所选网站会在新标签页打开，此地址会发送给该网站。",
+   "ip.lookupTitle": "查询 {ip}",
++  "lan.active": "共享中",
++  "lan.allInterfaces": "所有局域网网卡（IPv4）",
++  "lan.applied": "局域网共享已应用",
++  "lan.apply": "保存并应用",
++  "lan.authError": "使用 1～128 位可见英文字符，用户名不能含冒号。",
++  "lan.authHelp": "支持 HTTP Basic 和 SOCKS5 用户名密码认证。",
++  "lan.authentication": "要求用户名和密码",
++  "lan.bind": "监听地址",
++  "lan.conflict": "设置已变更，请重新加载后应用。",
++  "lan.copied": "地址已复制",
++  "lan.copyFailed": "地址复制失败",
++  "lan.copyHttp": "复制 HTTP 地址",
++  "lan.copySocks": "复制 SOCKS5 地址",
++  "lan.credentialsNeeded": "设备需填写上方用户名和密码，复制地址不包含密码。",
++  "lan.deviceHelp": "设备选择手动代理，填写下方服务器地址和端口。沿用当前规则和出站，支持 HTTP/HTTPS、SOCKS5 TCP。",
++  "lan.devices": "其他设备连接",
++  "lan.disabled": "局域网共享已关闭",
++  "lan.enable": "允许局域网连接",
++  "lan.firewall": "需保持 LemonVPN 运行，防火墙放行共享 TCP 端口，并关闭 Wi-Fi 客户端隔离。仅接收私网 IPv4 设备、代理公网目标；不提供网关或 UDP 转发。",
++  "lan.inactive": "未共享",
++  "lan.noAddress": "未找到局域网 IPv4 地址，请连接 Wi-Fi 或网线后刷新。",
++  "lan.noAuthentication": "未启用认证，请仅在可信局域网中使用。",
++  "lan.password": "密码",
++  "lan.port": "HTTP / SOCKS5 端口",
++  "lan.portError": "端口须为 1024～65535。",
++  "lan.reload": "重新加载",
++  "lan.reveal": "显示或隐藏密码",
++  "lan.scope": "让同一局域网的设备使用本机代理。",
++  "lan.title": "局域网共享",
++  "lan.username": "用户名",
+   "lifecycle.degraded": "降级",
+   "lifecycle.draining": "排空中",
+   "lifecycle.failed": "失败",
+diff --git a/src/i18n/locales/zh-TW.json b/src/i18n/locales/zh-TW.json
+--- a/src/i18n/locales/zh-TW.json
++++ b/src/i18n/locales/zh-TW.json
+@@ -914,6 +914,36 @@
+   "hub.traffic": "觀測",
+   "ip.lookupNote": "所選網站會在新分頁開啟，這個位址會送給該網站。",
+   "ip.lookupTitle": "查詢 {ip}",
++  "lan.active": "分享中",
++  "lan.allInterfaces": "所有區域網路介面（IPv4）",
++  "lan.applied": "區域網路分享已套用",
++  "lan.apply": "儲存並套用",
++  "lan.authError": "使用 1～128 位可見英文字元，使用者名稱不能含冒號。",
++  "lan.authHelp": "支援 HTTP Basic 與 SOCKS5 使用者名稱密碼驗證。",
++  "lan.authentication": "要求使用者名稱與密碼",
++  "lan.bind": "監聽位址",
++  "lan.conflict": "設定已變更，請重新載入後套用。",
++  "lan.copied": "位址已複製",
++  "lan.copyFailed": "位址複製失敗",
++  "lan.copyHttp": "複製 HTTP 位址",
++  "lan.copySocks": "複製 SOCKS5 位址",
++  "lan.credentialsNeeded": "裝置需填寫上方使用者名稱與密碼，複製位址不包含密碼。",
++  "lan.deviceHelp": "裝置選擇手動代理，填寫下方伺服器位址與連接埠。沿用目前規則與出站，支援 HTTP/HTTPS、SOCKS5 TCP。",
++  "lan.devices": "其他裝置連線",
++  "lan.disabled": "區域網路分享已關閉",
++  "lan.enable": "允許區域網路連線",
++  "lan.firewall": "需保持 LemonVPN 執行、防火牆允許分享的 TCP 連接埠，並關閉 Wi-Fi 用戶端隔離。僅接受私網 IPv4 裝置、代理公網目標；不提供閘道或 UDP 轉送。",
++  "lan.inactive": "未分享",
++  "lan.noAddress": "找不到區域網路 IPv4 位址，請連接 Wi-Fi 或網路線後重新載入。",
++  "lan.noAuthentication": "未啟用驗證，請僅在可信任的區域網路中使用。",
++  "lan.password": "密碼",
++  "lan.port": "HTTP / SOCKS5 連接埠",
++  "lan.portError": "連接埠須為 1024～65535。",
++  "lan.reload": "重新載入",
++  "lan.reveal": "顯示或隱藏密碼",
++  "lan.scope": "讓同一區域網路的裝置使用本機代理。",
++  "lan.title": "區域網路分享",
++  "lan.username": "使用者名稱",
+   "lifecycle.degraded": "降級",
+   "lifecycle.draining": "排空中",
+   "lifecycle.failed": "失敗",
+diff --git a/src/store/desktop.ts b/src/store/desktop.ts
+--- a/src/store/desktop.ts
++++ b/src/store/desktop.ts
+@@ -33,6 +33,10 @@
+   return tunCapability(resources)?.available === true;
+ }
+ 
++export function lanAvailable(resources: unknown): boolean {
++  return hasDesktop && (resources as Record<string, {available?: boolean}> | undefined)?.['x-lan-sharing']?.available === true;
++}
++
+ export function dnsSettingsAvailable(resources: unknown): boolean {
+   return hasDesktop && (resources as Record<string, {available?: boolean}> | undefined)?.['x-dns-settings']?.available === true;
+ }
+diff --git a/src/ui/styles/lan-settings.css b/src/ui/styles/lan-settings.css
+new file mode 100644
+--- /dev/null
++++ b/src/ui/styles/lan-settings.css
+@@ -0,0 +1,32 @@
++.rp-lan-form,
++.rp-lan-addresses {
++  display: grid;
++  gap: var(--rp-space-4);
++  min-inline-size: 0;
++}
++.rp-lan-grid {
++  display: grid;
++  grid-template-columns: repeat(2, minmax(0, 1fr));
++  align-items: start;
++  gap: var(--rp-space-4);
++}
++.rp-lan-grid > * {
++  min-inline-size: 0;
++}
++.rp-lan-address {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: var(--rp-space-3);
++}
++.rp-lan-endpoint {
++  display: grid;
++  flex: 1 1 12rem;
++  min-inline-size: 0;
++  overflow-wrap: anywhere;
++}
++@media (max-width: 699px) {
++  .rp-lan-grid {
++    grid-template-columns: minmax(0, 1fr);
++  }
++}

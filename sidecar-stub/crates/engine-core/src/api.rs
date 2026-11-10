@@ -46,6 +46,80 @@ pub fn handle(
     };
 
     match (method, path) {
+        ("GET", "/api/v1/rules/runtime") | ("GET", "/api/v1/rule-providers") => {
+            return http::respond_with(&mut client,200,&crate::rules_runtime::status().to_string(),&format!("{CACHE_HEADERS}{cors}"));
+        }
+        ("PUT", "/api/v1/rules/runtime") => {
+            return match crate::rules_runtime::update(&body){Ok(value)=>http::respond_with(&mut client,200,&value.to_string(),&format!("{CACHE_HEADERS}{cors}")),Err((status,code,message))=>error(&mut client,status,code,&message,cors)};
+        }
+        ("POST", "/api/v1/rules/runtime/import") => {
+            let permit=match crate::rules_runtime::import_permit(){Ok(p)=>p,Err(e)=>return error(&mut client,429,"busy",&e,cors)};
+            let operation=probes::create_operation("rule_provider_import");let worker=operation.clone();
+            std::thread::spawn(move||{let _permit=permit;match crate::rules_runtime::import(&body){Ok(value)=>probes::finish_operation(&worker,value.to_string()),Err(e)=>probes::fail_operation(&worker,"rule_provider_import_failed",&e)}});
+            let accepted=probes::accepted(operation,"rule_provider_import");
+            return http::respond_with(&mut client,202,&accepted.body,&format!("{CACHE_HEADERS}{cors}Location: {}\r\n",accepted.location));
+        }
+        ("GET", "/api/v1/rules/runtime/entries") => {
+            let id=param(query,"id").unwrap_or("");let offset=number(query,"offset").ok().flatten().unwrap_or(0).min(1_000_000) as usize;
+            let search=url::form_urlencoded::parse(query.as_bytes()).find(|(k,_)|k=="q").map(|(_,v)|v.into_owned()).unwrap_or_default();
+            return match crate::rules_runtime::entries(id,offset,&search){Ok(value)=>http::respond_with(&mut client,200,&value.to_string(),&format!("{CACHE_HEADERS}{cors}")),Err(e)=>error(&mut client,404,"resource_not_found",&e,cors)};
+        }
+        ("POST", "/api/v1/rules/runtime/refresh") => {
+            let request:serde_json::Value=serde_json::from_str(&body).unwrap_or_default();
+            return match crate::rules_runtime::refresh_async(request["id"].as_str().unwrap_or("")){Ok(value)=>http::respond_with(&mut client,202,&value.to_string(),&format!("{CACHE_HEADERS}{cors}")),Err(e)=>error(&mut client,409,"rule_provider_refresh_failed",&e,cors)};
+        }
+        ("POST", "/api/v1/rules/runtime/cancel") => {
+            let request:serde_json::Value=serde_json::from_str(&body).unwrap_or_default();
+            return match crate::rules_runtime::cancel_refresh(request["id"].as_str().unwrap_or("")){Ok(value)=>http::respond_with(&mut client,200,&value.to_string(),&format!("{CACHE_HEADERS}{cors}")),Err(e)=>error(&mut client,409,"cancel_failed",&e,cors)};
+        }
+        ("GET", "/api/v1/rules/runtime/references") => {
+            let value=crate::rules_runtime::removal::references(param(query,"kind").unwrap_or("provider"),param(query,"id").unwrap_or(""));
+            return http::respond_with(&mut client,200,&value.to_string(),&format!("{CACHE_HEADERS}{cors}"));
+        }
+        ("POST", "/api/v1/rules/runtime/remove") => {
+            return match crate::rules_runtime::removal::remove(&body){Ok(value)=>http::respond_with(&mut client,200,&value.to_string(),&format!("{CACHE_HEADERS}{cors}")),Err(e)=>error(&mut client,409,"resource_remove_failed",&e,cors)};
+        }
+        ("GET", "/api/v1/geodata/categories") => {
+            let search=url::form_urlencoded::parse(query.as_bytes()).find(|(k,_)|k=="q").map(|(_,v)|v.into_owned()).unwrap_or_default();
+            return match crate::geodata::categories(param(query,"kind").unwrap_or("geosite"),&search,number(query,"offset").ok().flatten().unwrap_or(0).min(10000) as usize){Ok(value)=>http::respond_with(&mut client,200,&value.to_string(),&format!("{CACHE_HEADERS}{cors}")),Err(e)=>error(&mut client,422,"geodata_unavailable",&e,cors)};
+        }
+        ("POST", "/api/v1/dns/trace") => {
+            return match crate::rules_runtime::trace::run(&body){Ok(value)=>http::respond_with(&mut client,200,&value.to_string(),&format!("{CACHE_HEADERS}{cors}")),Err(e)=>error(&mut client,422,"dns_trace_failed",&e,cors)};
+        }
+        ("GET", "/api/v1/dns/statistics") => {
+            let value=serde_json::json!({"cache":crate::dns_wire_cache::statistics(),"transport":crate::dns_transport::statistics()});
+            return http::respond_with(&mut client,200,&value.to_string(),&format!("{CACHE_HEADERS}{cors}"));
+        }
+        ("DELETE", "/api/v1/dns/wire-cache") => {
+            let request:serde_json::Value=serde_json::from_str(&body).unwrap_or_default();
+            let removed=if let Some(name)=request["domain"].as_str(){crate::dns_wire_cache::remove_name(name)}else{let count=crate::dns_wire_cache::statistics()["entries"].as_u64().unwrap_or(0) as usize;crate::dns::flush();count};
+            return http::respond_with(&mut client,200,&serde_json::json!({"removed":removed}).to_string(),&format!("{CACHE_HEADERS}{cors}"));
+        }
+        ("POST", "/api/v1/dns/wire-cache/fakeip/flush") => {
+            return match crate::compat::flush_fake_ip(){Ok(())=>http::respond_with(&mut client,200,"{\"ok\":true}",&format!("{CACHE_HEADERS}{cors}")),Err(e)=>error(&mut client,503,"fakeip_flush_failed",&e.to_string(),cors)};
+        }
+        ("GET", "/api/v1/geodata/categories/detail") => {
+            let id=url::form_urlencoded::parse(query.as_bytes()).find(|(k,_)|k=="id").map(|(_,v)|v.into_owned()).unwrap_or_default();
+            return match crate::geodata::category_detail(param(query,"kind").unwrap_or("geosite"),&id){Ok(value)=>http::respond_with(&mut client,200,&value.to_string(),&format!("{CACHE_HEADERS}{cors}")),Err(e)=>error(&mut client,422,"geodata_unavailable",&e,cors)};
+        }
+        ("GET", "/api/v1/dns/wire-cache") => {
+            return http::respond_with(&mut client,200,&crate::dns_wire_cache::entries("").to_string(),&format!("{CACHE_HEADERS}{cors}"));
+        }
+        ("GET", "/api/v1/runtime/apply") => {
+            return http::respond_with(&mut client,200,&crate::rules_runtime::apply_status().to_string(),&format!("{CACHE_HEADERS}{cors}"));
+        }
+        ("GET", "/api/v1/lan/settings") => {
+            return match crate::lan::status_json() {
+                Ok(body) => http::respond_with(&mut client, 200, &body, &format!("{CACHE_HEADERS}{cors}")),
+                Err(e) => error(&mut client, 500, "lan_settings_read_failed", &e.to_string(), cors),
+            };
+        }
+        ("PUT", "/api/v1/lan/settings") => {
+            return match crate::lan::update(&body) {
+                Ok(body) => http::respond_with(&mut client, 200, &body, &format!("{CACHE_HEADERS}{cors}")),
+                Err((status, code, message)) => error(&mut client, status, code, &message, cors),
+            };
+        }
         ("GET", "/api/v1/dns/settings") => {
             return match crate::dns_settings::status_json() {
                 Ok(body) => http::respond_with(&mut client,200,&body,&format!("{CACHE_HEADERS}{cors}")),
@@ -684,7 +758,7 @@ fn version() -> String {
 
 fn capabilities() -> String {
     format!(
-        r#"{{"observed_at":"{observed}","profiles":["base"],"limits":{{"max_request_target_bytes":8192,"max_header_bytes":16384,"max_json_body_bytes":1048576}},"resources":{{"runtime":{{"available":true}},"traffic_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"desktop":{{"available":true}},"datapath":{{"available":true,"kinds":["userspace"],"details":[]}},"connections":{{"available":true,"can_close":true,"max_bulk_close":1000}},"config":{{"available":true,"writable":true,"create":true,"max_bytes":{max_bytes},"max_sources":4}},"config_validate":{{"available":true,"modes":["syntax","full"],"max_bytes":{max_bytes},"max_sources":4}},"runtime_memory":{{"available":true,"metrics":["process.rss_bytes"]}},"runtime_outbounds":{{"available":true}},"memory_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"rules":{{"available":true,"max_rules":{max_bytes}}},"flows":{{"available":true,"recording":"{flow_recording}","scopes":["userspace_tcp","userspace_udp"],"max_flows":{max_flows},"max_steps_per_flow":1,"retention_seconds":{retention},"snapshot_ttl_seconds":30,"max_page_size":1000}},"nodes":{{"available":true,"can_manage":true}},"x-rule-management":{{"available":true,"reset":true,"reorder":true}},"x-hot-apply":{hot_apply},"x-dns-settings":{{"available":true,"hot_apply":true,"version":1}},"x-proxy-chain":{{"available":true,"max_hops":8,"front_groups":true,"exit_groups":true,"traffic_activity":true,"preview":true,"network_preview":false}},"x-node-management":{{"subscription_delete":true,"persistent_delete":true}},"x-group-management":{{"delete":true,"replace_references":true,"atomic":true}},"x-node-membership":{{"available":true,"atomic":true,"batch":true,"max_batch_nodes":256}},{tun},{providers},"groups":{{"available":true,"config_patch":true,"selection":true,"max_patch_operations":16}},{dns},{probes},"routing_trace":{{"available":true,"resolve_modes":["none","live"]}},"runtime_settings":{{"available":true,"fields":["record_flows","record_logs","record_dns_log","log.level","dns_log.max_records","flows.max_flows","flows.retention_seconds"]}},"geodata":{{"available":true,"assets":["geoip","geosite"],"can_update":true,"configurable_sources":true,"max_urls":4}},"dns_rules":{{"available":true,"max_rules":64}},"reload":{{"available":true}},"suspend":{{"available":true}},"resume":{{"available":true}},"events":{events},"logs":{logs}}}}}"#,
+        r#"{{"observed_at":"{observed}","profiles":["base"],"limits":{{"max_request_target_bytes":8192,"max_header_bytes":16384,"max_json_body_bytes":1048576}},"resources":{{"runtime":{{"available":true}},"traffic_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"desktop":{{"available":true}},"datapath":{{"available":true,"kinds":["userspace"],"details":[]}},"connections":{{"available":true,"can_close":true,"max_bulk_close":1000}},"config":{{"available":true,"writable":true,"create":true,"max_bytes":{max_bytes},"max_sources":4}},"config_validate":{{"available":true,"modes":["syntax","full"],"max_bytes":{max_bytes},"max_sources":4}},"runtime_memory":{{"available":true,"metrics":["process.rss_bytes"]}},"runtime_outbounds":{{"available":true}},"memory_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"rules":{{"available":true,"max_rules":{max_bytes}}},"flows":{{"available":true,"recording":"{flow_recording}","scopes":["userspace_tcp","userspace_udp"],"max_flows":{max_flows},"max_steps_per_flow":1,"retention_seconds":{retention},"snapshot_ttl_seconds":30,"max_page_size":1000}},"nodes":{{"available":true,"can_manage":true}},"x-rule-management":{{"available":true,"reset":true,"reorder":true}},"x-hot-apply":{hot_apply},"x-lan-sharing":{{"available":true,"hot_apply":true,"protocols":["http","socks5"],"tcp_only":true,"private_ipv4_only":true}},"x-dns-settings":{{"available":true,"hot_apply":true,"version":2}},"x-rules-runtime":{{"available":true,"version":1,"max_json_body_bytes":33554432,"formats":["yaml","text","mrs"],"dns_protocols":["udp","tcp","tls","https"],"atomic":true,"fakeip_projection":true}},"x-proxy-chain":{{"available":true,"max_hops":8,"front_groups":true,"exit_groups":true,"traffic_activity":true,"preview":true,"network_preview":false}},"x-node-management":{{"subscription_delete":true,"persistent_delete":true}},"x-group-management":{{"delete":true,"replace_references":true,"atomic":true}},"x-node-membership":{{"available":true,"atomic":true,"batch":true,"max_batch_nodes":256}},{tun},{providers},"groups":{{"available":true,"config_patch":true,"selection":true,"max_patch_operations":16}},{dns},{probes},"routing_trace":{{"available":true,"resolve_modes":["none","live"]}},"runtime_settings":{{"available":true,"fields":["record_flows","record_logs","record_dns_log","log.level","dns_log.max_records","flows.max_flows","flows.retention_seconds","geodata"]}},"geodata":{{"available":true,"assets":["geoip","geosite"],"can_update":true,"configurable_sources":true,"max_urls":4,"checksum":"sha256sum","interval_hours":{{"min":1,"max":168,"default":24}},"lifecycle":{{"file_values":"start","overrides_persist":true}}}},"dns_rules":{{"available":true,"max_rules":64}},"reload":{{"available":true}},"suspend":{{"available":true}},"resume":{{"available":true}},"events":{events},"logs":{logs}}}}}"#,
         hot_apply = crate::compat::hot_apply_json(),
         observed = state::iso8601(SystemTime::now()),
         window = state::WINDOW_SECONDS,
@@ -771,8 +845,10 @@ fn read_body(client: &mut TcpStream, headers: &str) -> Result<String, String> {
             value.trim().parse::<usize>().ok()
         })
         .unwrap_or(0);
-    if length > 1024 * 1024 {
-        return Err("请求体超过 1 MiB".to_owned());
+    let target=headers.split_whitespace().nth(1).unwrap_or("").split('?').next().unwrap_or("");
+    let limit=if matches!(target,"/api/v1/rules/runtime"|"/api/v1/rules/runtime/import"){32*1024*1024}else{1024*1024};
+    if length > limit {
+        return Err(format!("请求体超过 {} MiB",limit/(1024*1024)));
     }
     if length == 0 {
         return Ok(String::new());

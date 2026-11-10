@@ -1,31 +1,23 @@
 //! Control-plane writes the dashboard drives: asynchronous operations
 //! (reload, suspend, resume), runtime setting overrides, group selection and
 //! config patches, routing trace simulation, DNS request rules and geodata
-//! assets. Every write the UI offers lands here, and the state it keeps is
-//! process-local: a restart returns to what the configuration file says.
+//! assets. Recorder overrides are process-local; Geo asset settings persist.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::thread;
 use std::time::SystemTime;
 
 use crate::config;
 use crate::connections;
-use crate::fetch;
 use crate::http;
 use crate::json;
 use crate::probes;
-use crate::sha256;
 use crate::state;
 
 const HEADERS: &str = "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n";
-const GEO_MAX_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_GEOIP: &str = "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat";
-const DEFAULT_GEOSITE: &str =
-    "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat";
 
 fn ok(client: &mut TcpStream, cors: &str, status: u16, body: &str) -> io::Result<()> {
     http::respond_with(client, status, body, &format!("{HEADERS}{cors}"))
@@ -68,13 +60,6 @@ fn quoted(value: &Option<String>) -> String {
         .as_deref()
         .map(|value| format!("\"{}\"", json::escape(value)))
         .unwrap_or_else(|| "null".to_owned())
-}
-
-fn quoted_at(value: Option<SystemTime>) -> String {
-    value.map_or_else(
-        || "null".to_owned(),
-        |at| format!("\"{}\"", state::iso8601(at)),
-    )
 }
 
 // ---------- suspend / resume ----------
@@ -171,7 +156,7 @@ pub fn settings_json() -> String {
     let flows_mode = mode("record_flows");
     let logs_mode = mode("record_logs");
     let dns_mode = mode("record_dns_log");
-    format!(
+    let text = format!(
         r#"{{"observed_at":"{observed}","source":"{source}","recording":{{"flows":{{"allowed":true,"mode":"{flows_mode}","active":{flows_active}}},"logs":{{"allowed":true,"mode":"{logs_mode}","active":{logs_active}}},"dns_log":{{"allowed":true,"mode":"{dns_mode}","active":{dns_active}}},"events":{{"active":true}}}},"log":{{"level":"{level}","buffered_records":{buffered}}},"dns_log":{{"max_records":{dns_max}}},"flows":{{"max_flows":{flows_max},"retention_seconds":{retention}}}}}"#,
         observed = state::iso8601(SystemTime::now()),
         flows_active = flows_active,
@@ -185,7 +170,11 @@ pub fn settings_json() -> String {
         dns_max = number("dns_log.max_records", 2048),
         flows_max = number("flows.max_flows", crate::flows::MAX_FLOWS as u64),
         retention = number("flows.retention_seconds", crate::flows::RETENTION.as_secs()),
-    )
+    );
+    drop(overrides);
+    let mut value: serde_json::Value = serde_json::from_str(&text).expect("runtime settings JSON");
+    value["geodata"] = crate::geodata_updates::settings_json();
+    value.to_string()
 }
 
 fn json_number(body: &str, key: &str) -> Option<u64> {
@@ -231,6 +220,7 @@ pub fn patch_settings(client: &mut TcpStream, cors: &str, body: &str) -> io::Res
                 | "retention_seconds"
                 | "dns_log.max_records"
                 | "flows.max_flows"
+                | "geodata"
         ) {
             return fail(
                 client,
@@ -295,6 +285,11 @@ pub fn patch_settings(client: &mut TcpStream, cors: &str, body: &str) -> io::Res
                 );
             };
             next.insert(format!("{section}.{key}"), value.to_string());
+        }
+    }
+    if let Some(value) = request.get("geodata") {
+        if let Err(message) = crate::geodata_updates::patch(value) {
+            return fail(client, cors, 422, "invalid_geodata_settings", &message);
         }
     }
     settings().extend(next);
@@ -441,6 +436,8 @@ pub fn select(client: &mut TcpStream, cors: &str, id: &str, body: &str) -> io::R
     if !in_group {
         return fail(client, cors, 422, "unsupported_value", "成员不在该组内");
     }
+    crate::dns::flush();
+    crate::compat::queue_hot_apply();
     let source = if selector { "runtime" } else { "override" };
     crate::events::runtime_changed();
     crate::logs::info(
@@ -503,6 +500,8 @@ pub fn clear_selection(
     let Some(interrupted) = interrupted else {
         return fail(client, cors, 404, "resource_not_found", "没有这个组");
     };
+    crate::dns::flush();
+    crate::compat::queue_hot_apply();
     crate::events::runtime_changed();
     crate::logs::info(
         "engine::groups",
@@ -896,236 +895,27 @@ pub fn dns_rules_json() -> String {
 
 // ---------- geodata ----------
 
-struct GeoState {
-    geosite_urls: Vec<String>,
-    geoip_urls: Vec<String>,
-    auto_enabled: bool,
-    interval_hours: u32,
-    overridden: bool,
-    last_checked: Option<SystemTime>,
-    last_updated: Option<SystemTime>,
-    last_error: Option<(String, String)>,
-}
-
-static GEO: OnceLock<Mutex<GeoState>> = OnceLock::new();
-
-fn geo() -> MutexGuard<'static, GeoState> {
-    GEO.get_or_init(|| {
-        Mutex::new(GeoState {
-            geosite_urls: vec![DEFAULT_GEOSITE.to_owned()],
-            geoip_urls: vec![DEFAULT_GEOIP.to_owned()],
-            auto_enabled: true,
-            interval_hours: 24,
-            overridden: false,
-            last_checked: None,
-            last_updated: None,
-            last_error: None,
-        })
-    })
-    .lock()
-    .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn asset(kind: &str, file: &str) -> Option<String> {
-    let path = crate::geodata::asset_path(kind).ok()?;
-    let _ = file;
-    let metadata = std::fs::metadata(&path).ok()?;
-    let bytes = std::fs::read(&path).ok()?;
-    let modified = metadata
-        .modified()
-        .ok()
-        .map(|at| format!("\"{}\"", state::iso8601(at)))
-        .unwrap_or_else(|| "null".to_owned());
-    Some(format!(
-        r#"{{"kind":"{kind}","sha256":"{sha}","size_bytes":"{size}","modified_at":{modified},"source_redacted":null}}"#,
-        sha = sha256::hex(&bytes),
-        size = metadata.len(),
-    ))
-}
-
 pub fn geodata_json() -> String {
-    let state = geo();
-    let assets = [asset("geoip", "geoip.dat"), asset("geosite", "geosite.dat")]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(",");
-    let error = state.last_error.as_ref().map(|(code, message)| {
-        format!(
-            r#"{{"code":"{code}","message":"{}"}}"#,
-            json::escape(message)
-        )
-    });
-    format!(
-        r#"{{"observed_at":"{observed}","assets":[{assets}],"last_checked_at":{checked},"last_updated_at":{updated},"last_error":{error}}}"#,
-        observed = state::iso8601(SystemTime::now()),
-        checked = quoted_at(state.last_checked),
-        updated = quoted_at(state.last_updated),
-        error = error.unwrap_or_else(|| "null".to_owned()),
-    )
+    crate::geodata_updates::status().to_string()
 }
-
 pub fn geodata_settings_json() -> String {
-    let state = geo();
-    let urls = |list: &[String]| {
-        list.iter()
-            .map(|url| format!("\"{}\"", json::escape(url)))
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let source = if state.overridden {
-        "override"
-    } else {
-        "default"
-    };
-    format!(
-        r#"{{"source":"{source}","geosite":{{"urls":[{geosite}]}},"geoip":{{"urls":[{geoip}]}},"auto_update":{{"enabled":{auto},"interval_hours":{interval}}},"download":{{"route":"direct","group_id":null}}}}"#,
-        geosite = urls(&state.geosite_urls),
-        geoip = urls(&state.geoip_urls),
-        auto = state.auto_enabled,
-        interval = state.interval_hours,
-    )
+    crate::geodata_updates::settings_json().to_string()
 }
-
 pub fn patch_geodata(client: &mut TcpStream, cors: &str, body: &str) -> io::Result<()> {
-    let mut state = geo();
-    for (key, slot) in [("geosite", 0usize), ("geoip", 1usize)] {
-        let Some(section) = section_of(body, key) else {
-            continue;
-        };
-        let Some(urls_json) = section_of(&section, "urls") else {
-            continue;
-        };
-        let mut urls = Vec::new();
-        let mut rest = urls_json.as_str();
-        while let Some(start) = rest.find('"') {
-            let Some(end) = rest[start + 1..].find('"') else {
-                break;
-            };
-            urls.push(rest[start + 1..start + 1 + end].to_owned());
-            rest = &rest[start + 1 + end + 1..];
-        }
-        if urls.is_empty() || urls.len() > 4 {
-            return fail(
-                client,
-                cors,
-                400,
-                "invalid_request",
-                "每个资产最多 4 个下载地址",
-            );
-        }
-        for url in &urls {
-            if !url.starts_with("https://") && !url.starts_with("http://") {
-                return fail(
-                    client,
-                    cors,
-                    400,
-                    "invalid_request",
-                    "下载地址必须是 HTTP(S) URL",
-                );
-            }
-        }
-        if slot == 0 {
-            state.geosite_urls = urls;
-        } else {
-            state.geoip_urls = urls;
-        }
-        state.overridden = true;
+    let value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return fail(client, cors, 400, "invalid_request", "设置必须为有效 JSON"),
+    };
+    match crate::geodata_updates::patch(&value) {
+        Ok(()) => ok(client, cors, 200, &geodata_settings_json()),
+        Err(message) => fail(client, cors, 422, "invalid_geodata_settings", &message),
     }
-    if body.contains("\"auto_update\"") {
-        if let Some(enabled) = json::field(body, "enabled") {
-            state.auto_enabled = enabled == "true" || enabled == "on";
-        }
-        if let Some(hours) = json_number(body, "interval_hours") {
-            if !(1..=168).contains(&hours) {
-                return fail(
-                    client,
-                    cors,
-                    400,
-                    "invalid_request",
-                    "interval_hours 在 1..168 之外",
-                );
-            }
-            state.interval_hours = hours as u32;
-        }
-    }
-    drop(state);
-    ok(client, cors, 200, &geodata_settings_json())
 }
-
-/// Extracts a nested JSON object's text for one top-level key.
-fn section_of(body: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{key}\":{{");
-    let start = body.find(&pattern)? + pattern.len() - 1;
-    let mut depth = 0usize;
-    for (offset, ch) in body[start..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(body[start..=start + offset].to_owned());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 pub fn start_geodata_update(client: &mut TcpStream, cors: &str) -> io::Result<()> {
-    let id = probes::create_operation("geodata_update");
-    let worker_id = id.clone();
-    thread::spawn(move || {
-        let targets: [(&str, &str, Vec<String>); 2] = {
-            let state = geo();
-            [
-                ("geoip", "geoip.dat", state.geoip_urls.clone()),
-                ("geosite", "geosite.dat", state.geosite_urls.clone()),
-            ]
-        };
-        let mut failures: Vec<String> = Vec::new();
-        let mut assets = Vec::new();
-        for (kind, _file, urls) in targets {
-            let mut stored = false;
-            for url in &urls {
-                match fetch::get(url, "lemonvpn-geodata", GEO_MAX_BYTES) {
-                    Ok(response) if response.status == 200 && !response.body.is_empty() => {
-                        if let Err(message) = crate::geodata::validate_asset(kind, &response.body) {
-                            failures.push(format!("{kind}: {message}"));
-                            continue;
-                        }
-                        assets.push((kind.to_owned(), response.body));
-                        stored = true;
-                        break;
-                    }
-                    Ok(response) => failures.push(format!("{kind}: HTTP {}", response.status)),
-                    Err(message) => failures.push(format!("{kind}: {message}")),
-                }
-            }
-            let mut state = geo();
-            state.last_checked = Some(SystemTime::now());
-            if !stored {
-                let message = failures.join("; ");
-                state.last_error = Some(("geodata_update_failed".to_owned(), message.clone()));
-                drop(state);
-                probes::fail_operation(&worker_id, "geodata_update_failed", &message);
-                return;
-            }
-        }
-        if let Err(message) = config::replace_geodata(&assets) {
-            geo().last_error = Some(("geodata_update_failed".to_owned(), message.clone()));
-            probes::fail_operation(&worker_id, "geodata_update_failed", &message);
-            return;
-        }
-        {
-            let mut state = geo();
-            state.last_updated = Some(SystemTime::now());
-            state.last_error = None;
-        }
-        probes::finish_operation(&worker_id, geodata_json());
-    });
-    accepted_reply(client, cors, probes::accepted(id, "geodata_update"))
+    match crate::geodata_updates::begin() {
+        Ok(accepted) => accepted_reply(client, cors, accepted),
+        Err(message) => fail(client, cors, 409, "geodata_update_unavailable", &message),
+    }
 }
 
 // ---------- configuration source creation ----------

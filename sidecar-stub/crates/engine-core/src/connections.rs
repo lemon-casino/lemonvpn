@@ -65,6 +65,22 @@ pub(crate) fn configuration_changed() -> usize {
     retire(entries.into_values())
 }
 
+pub(crate) struct Recheck {
+    pub host:String,pub port:u16,pub source:Option<SocketAddr>,pub network:&'static str,
+    pub route:Option<Route>,
+}
+/// Bump the dial epoch while holding the registry, then release it before
+/// resolving policies: decision construction also reads the registry epoch.
+pub(crate) fn configuration_changed_selective(keep:impl Fn(&Recheck)->bool)->usize{
+    let candidates={let mut registry=open();registry.configuration=registry.configuration.wrapping_add(1);registry.selections.clear();
+        registry.entries.iter().map(|(id,entry)|{
+            let(host,port)=crate::proxy::parse_authority(&entry.dst,443).unwrap_or((entry.dst.clone(),0));
+            (*id,Recheck{host,port,source:entry.src.parse().ok(),network:entry.network,route:entry.route.clone()})
+        }).collect::<Vec<_>>()};
+    let remove=candidates.into_iter().filter_map(|(id,input)|(!keep(&input)).then_some(id)).collect::<Vec<_>>();
+    let entries={let mut registry=open();remove.into_iter().filter_map(|id|registry.entries.remove(&id)).collect::<Vec<_>>()};retire(entries)
+}
+
 /// Only the selected group's requested transport is invalidated. An unrelated
 /// group, and UDP when selecting TCP (or vice versa), retain their tunnels.
 pub(crate) fn selection_changed(group: &str, network: &str) -> usize {
@@ -285,6 +301,32 @@ pub fn close(id: &str) -> bool {
 pub(crate) fn close_all() {
     let entries = std::mem::take(&mut open().entries);
     retire(entries.into_values());
+}
+
+/// Retire exactly this accepted socket, including its outbound socket. The
+/// local endpoint distinguishes LAN sessions from the loopback proxy even if
+/// a client reuses a source port across two different listeners.
+pub(crate) fn close_inbound(socket: &TcpStream) {
+    let (Ok(local), Ok(peer)) = (socket.local_addr(), socket.peer_addr()) else {
+        return;
+    };
+    let mut registry = open();
+    let keys: Vec<_> = registry
+        .entries
+        .iter()
+        .filter(|(_, entry)| {
+            entry.sockets.first().is_some_and(|inbound| {
+                inbound.local_addr().ok() == Some(local) && inbound.peer_addr().ok() == Some(peer)
+            })
+        })
+        .map(|(key, _)| *key)
+        .collect();
+    let entries: Vec<_> = keys
+        .into_iter()
+        .filter_map(|key| registry.entries.remove(&key))
+        .collect();
+    drop(registry);
+    retire(entries);
 }
 
 impl Drop for Live {

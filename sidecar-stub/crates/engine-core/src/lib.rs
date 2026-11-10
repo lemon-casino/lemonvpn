@@ -6,29 +6,35 @@
 //! There is currently one configuration and platform backend per process.
 
 mod api;
-mod compat;
 mod base64;
+mod compat;
 mod config;
 mod connections;
 mod control;
 mod crypto;
 mod dns;
 mod dns_settings;
+mod dns_transport;
+mod dns_wire_cache;
+mod domain_regex;
 mod events;
 mod fetch;
 mod flows;
 mod geodata;
-mod group_policy;
+mod geodata_updates;
 mod group_filter;
+mod group_policy;
 mod http;
 mod hysteria2;
 mod json;
+mod lan;
 mod logs;
 mod outbound;
 mod outbounds;
 mod probes;
 mod providers;
 mod proxy;
+mod rules_runtime;
 mod runtime;
 mod sha256;
 mod shadowsocks;

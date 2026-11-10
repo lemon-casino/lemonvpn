@@ -15,6 +15,31 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(any(windows,target_os="macos",target_os="linux"))]
+fn broker_payload(mut value:Value)->io::Result<Value>{
+    let started=std::time::Instant::now();
+    if let Some(settings)=value.get("dns_settings"){
+        let bytes=serde_json::to_vec(settings)?;
+        if bytes.len()>64*1024{
+            use sha2::{Digest,Sha256};
+            let status=broker::request(&json!({"action":"status"}))?;
+            if status["dns_settings_version"].as_u64().unwrap_or(0)<2{return Err(io::Error::other("TUN 服务需更新后才能应用规则集/Fake-IP 联动"));}
+            let id=format!("{:x}",Sha256::digest(&bytes));
+            broker::request(&json!({"action":"dns_artifact_begin","id":id,"size":bytes.len()}))?;
+            for (i,chunk) in bytes.chunks(24*1024).enumerate(){
+                if started.elapsed()>Duration::from_secs(30){return Err(io::Error::new(io::ErrorKind::TimedOut,"DNS 域名产物传输超时"))}
+                let hex=chunk.iter().map(|b|format!("{b:02x}")).collect::<String>();
+                broker::request(&json!({"action":"dns_artifact_part","id":id,"offset":i*24*1024,"hex":hex}))?;
+            }
+            broker::request(&json!({"action":"dns_artifact_commit","id":id}))?;
+            value.as_object_mut().unwrap().remove("dns_settings");value["dns_settings_artifact"]=json!(id);
+        }
+    }
+    broker::request(&value)
+}
+#[cfg(any(windows,target_os="macos",target_os="linux"))]
+fn send_dns_settings(settings:&DnsSettings)->io::Result<Value>{broker_payload(json!({"action":"dns_settings","dns_settings":settings}))}
+
 pub fn configuration(router_port: u16, dns_port: u16, password: &str) -> io::Result<Value> {
     if router_port < 1024
         || password.len() != 64
@@ -162,11 +187,11 @@ impl TunBridge {
         {
             if broker::installed() {
                 let status = broker::request(&json!({"action":"status"}))?;
-                if status.get("dns_settings_version").and_then(Value::as_u64)!=Some(1) {
+                if status.get("dns_settings_version").and_then(Value::as_u64).unwrap_or(0)<dns_settings.version() {
                     return Err(io::Error::other("请先在 TUN 模式中更新服务，以支持 DNS 设置热更新"));
                 }
-                broker::request(
-                    &json!({"action":"start","router_port":router_port,"dns_port":dns_port,"password":password,"process_names":process_names,"dns_settings":dns_settings}),
+                broker_payload(
+                    json!({"action":"start","router_port":router_port,"dns_port":dns_port,"password":password,"process_names":process_names,"dns_settings":dns_settings}),
                 )?;
                 return Ok(Self {
                     owner: Owner::Service,
@@ -218,8 +243,9 @@ impl TunBridge {
             Owner::Local(process) => crate::dns_settings::hot_apply(process,&self.config,&next)?,
             #[cfg(any(windows, target_os="macos", target_os="linux"))]
             Owner::Service => {
-                let response = broker::request(&json!({"action":"dns_settings","dns_settings":settings}))
+                let response = send_dns_settings(&settings)
                     .map_err(|error|io::Error::other(format!("DNS 热更新失败，请在 TUN 模式中确认服务已更新：{error}")))?;
+                if settings.version()>=2 && response["dns_settings_sha256"].as_str()!=Some(crate::dns_artifact::settings_digest(&settings)?.as_str()){return Err(io::Error::other("TUN 服务未确认相同的规则资源摘要，请更新服务后重试"));}
                 if response.get("enabled").and_then(Value::as_bool)!=Some(true) {
                     return Err(io::Error::other("TUN 服务当前未运行，DNS 热更新未完成；请先恢复 TUN 服务"));
                 }
@@ -249,6 +275,10 @@ impl TunBridge {
         Ok(())
     }
     /// Fixed operation only: never expose an arbitrary privileged controller request.
+    pub fn flush_fake_ip(&self)->io::Result<()>{match &self.owner{
+        Owner::Local(process)=>process.request("POST","/cache/fakeip/flush",None).map(|_|()),
+        #[cfg(any(windows,target_os="macos",target_os="linux"))]
+        Owner::Service=>broker::request(&json!({"action":"flush_fakeip"})).map(|_|()).map_err(|e|io::Error::other(format!("Fake-IP 清理失败，请在 TUN 模式更新旧服务：{e}")))}}
     pub fn flush_dns(&self) -> io::Result<()> {
         match &self.owner {
             Owner::Local(process) => process
@@ -287,7 +317,7 @@ impl TunBridge {
                     let mut request=self.start_request.clone();
                     request["process_names"]=json!(self.process_names);
                     return {
-                        self.recovery=broker::request(&request).err().map(|e|e.to_string());
+                        self.recovery=broker_payload(request).err().map(|e|e.to_string());
                         self.cached=self.recovery.is_none();
                         self.checked=Instant::now();
                         self.cached

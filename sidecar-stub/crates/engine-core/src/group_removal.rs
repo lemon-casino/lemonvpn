@@ -7,6 +7,7 @@ fn conflict(message: &str) -> SourceWriteError {
 }
 
 pub(crate) fn remove_group(body: &str) -> Result<String, SourceWriteError> {
+    let _serial=crate::rules_runtime::APPLY.lock().unwrap_or_else(|p|p.into_inner());
     let value: serde_json::Value = serde_json::from_str(body)
         .map_err(|_| write_error(400, "invalid_request", "请求不是 JSON"))?;
     let object = value
@@ -38,7 +39,8 @@ pub(crate) fn remove_group(body: &str) -> Result<String, SourceWriteError> {
         ),
     };
     refresh();
-    let mut config = current();
+    let resources=crate::rules_runtime::retarget_outbound(name,replacement).map_err(|e|write_error(422,"resource_reference",e))?;
+    let config = current();
     if config.generation != generation {
         return Err(conflict("配置、订阅或出站已变更，请刷新删除弹框后重试"));
     }
@@ -138,12 +140,9 @@ pub(crate) fn remove_group(body: &str) -> Result<String, SourceWriteError> {
         .into_iter()
         .map(|node| node.name)
         .collect::<Vec<_>>();
-    let mut next = build_with_sources(
-        sources[0].1.clone(),
-        None,
-        &crate::providers::nodes(&inline),
-        &overlay,
-    );
+    let next = crate::rules_runtime::with_candidate(resources.clone(),||build_with_sources(
+        sources[0].1.clone(), None, &crate::providers::nodes(&inline), &overlay,
+    ));
     let errors = next
         .diagnostics
         .iter()
@@ -229,55 +228,8 @@ pub(crate) fn remove_group(body: &str) -> Result<String, SourceWriteError> {
         }
     }
     // Commit every affected source before publishing a single runtime snapshot.
-    let changed = sources
-        .iter()
-        .zip(&originals)
-        .filter(|(new, old)| new.1 != old.1)
-        .collect::<Vec<_>>();
-    let mut written: Vec<usize> = Vec::new();
-    for (index, ((path, text), (_, old))) in changed.iter().enumerate() {
-        let target = data_dir().join(path);
-        let result = if fs::read_to_string(&target).ok().as_deref() != Some(old) {
-            Err(std::io::Error::other("配置文件已被其他程序修改"))
-        } else {
-            crate::storage::write_atomic(&target, text.as_bytes())
-        };
-        if let Err(error) = result {
-            let mut message = format!("替换并删除保存失败：{error}");
-            for index in written.into_iter().rev() {
-                let ((path, new), (_, old)) = changed[index];
-                let target = data_dir().join(path);
-                if fs::read_to_string(&target).ok().as_deref() != Some(new) {
-                    message.push_str("；检测到外部修改，未覆盖");
-                    continue;
-                }
-                if let Err(error) = crate::storage::write_atomic(&target, old.as_bytes()) {
-                    message.push_str(&format!("；恢复失败：{error}"));
-                }
-            }
-            return Err(write_error(500, "source_write_failed", message));
-        }
-        written.push(index);
-    }
-    next.modified = fs::metadata(config_path())
-        .ok()
-        .and_then(|meta| meta.modified().ok());
-    let before = config.generation.clone();
-    let generation = next.generation.clone();
-    // Clear pins that no longer belong to the rewritten filter's roster.
-    for old in &config.groups {
-        if let Some(new) = next.groups.iter().find(|g| g.name == old.name) {
-            for member in old
-                .members
-                .iter()
-                .filter(|member| !new.members.contains(member))
-            {
-                crate::control::forget_member(&[old.name.clone()], member);
-            }
-        }
-    }
-    publish(&mut config, next);
-    drop(config);
-    crate::events::generation_changed(&before, &generation);
-    Ok(serde_json::json!({"generation_id":generation,"deleted":1,"replacement":replacement,"changed_sources":changed.len()}).to_string())
+    let changed=sources.iter().zip(&originals).filter(|(a,b)|a.1!=b.1).map(|(a,_)|a.clone()).collect::<HashMap<_,_>>();
+    let expected=config.generation.clone();let count=changed.len();drop(config);
+    let generation=apply_resources_checked(resources,&changed,Some(&expected)).map_err(|e|write_error(422,"resource_apply_failed",e))?;
+    Ok(serde_json::json!({"generation_id":generation,"deleted":1,"replacement":replacement,"changed_sources":count}).to_string())
 }

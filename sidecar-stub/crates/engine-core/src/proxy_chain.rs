@@ -68,6 +68,7 @@ impl SelectionWatch {
         self.choices = next;
         drop(config);
         if changed {
+            crate::dns::flush();crate::compat::queue_hot_apply();
             crate::events::runtime_changed();
         }
     }

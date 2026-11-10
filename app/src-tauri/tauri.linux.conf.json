@@ -3,6 +3,7 @@
   "bundle": {
     "targets": ["deb", "appimage"],
     "resources": {
+      "binaries/rules-dns.LICENSE.txt": "rules-dns.LICENSE.txt",
       "binaries/lemonvpn-kernel": "lemonvpn-kernel",
       "binaries/lemonvpn-service": "lemonvpn-service",
       "binaries/geoip.dat": "geoip.dat",

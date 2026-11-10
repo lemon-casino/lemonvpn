@@ -85,6 +85,7 @@ pub(crate) fn apply_dns_settings(settings: &crate::platform::dns_settings::DnsSe
     }
     Ok(())
 }
+pub(crate) fn flush_tun_dns()->io::Result<()>{for slot in [&BACKEND,&BACKEND_V6]{if let Some(backend)=slot.lock().unwrap().as_ref(){backend.process.request("POST","/cache/dns/flush",None)?;}}if let Some(bridge)=TUN.lock().unwrap().as_ref(){bridge.flush_dns()?;}Ok(())}
 
 fn base_config(
     entries: &BTreeMap<String, (Value, u16)>,
@@ -142,7 +143,7 @@ fn listener(node: Option<&config::Node>, address: Option<&str>) -> io::Result<u1
     }
     // Render outside the backend lock; parsing config/providers must never invert locks.
     let selected = match node {
-        Some(node) if managed::egress_families().is_some() => Some(endpoint_addresses(address.unwrap_or(&node.host))?.into_iter().next().ok_or_else(||io::Error::other("节点没有可用地址"))?),
+        Some(node) => Some(endpoint_addresses(address.unwrap_or(&node.host))?.into_iter().next().ok_or_else(||io::Error::other("节点没有可用地址"))?),
         _ => address.map(str::to_owned),
     };
     let rendered = node.map(|node| render_node(node, selected.as_deref())).transpose()?;
@@ -263,7 +264,7 @@ fn control(
 }
 
 fn endpoint_addresses(host: &str) -> io::Result<Vec<String>> {
-    let addresses = crate::dns::resolve(host)?;
+    let addresses = if let Ok(ip)=host.parse(){vec![ip]}else{crate::dns::bootstrap_resolve(host)?};
     let families = managed::egress_families();
     let result: Vec<_> = addresses.into_iter().filter(|ip|ip.is_loopback() || families.map_or(true,|f|f[usize::from(ip.is_ipv6())]))
         .map(|ip|ip.to_string()).collect();
@@ -300,6 +301,7 @@ fn chain_listener_at(nodes: &[config::Node], network: &str, endpoint:Option<&str
         return Err(io::Error::new(io::ErrorKind::Unsupported, error));
     }
     let mut proxies: Vec<_> = nodes.iter().map(|node|render_node(node,None)).collect::<io::Result<_>>()?;
+    for(proxy,node)in proxies.iter_mut().zip(nodes){proxy["server"]=endpoint_addresses(&node.host)?[0].clone().into();}
     if managed::egress_families().is_some() {
         proxies[0]["server"] = endpoint.map(str::to_owned).map(Ok).unwrap_or_else(||endpoint_addresses(&nodes[0].host).map(|a|a[0].clone()))?.into();
     }
@@ -638,7 +640,7 @@ pub(crate) fn refresh_network() {
 
 pub(crate) fn enable_tun() -> io::Result<()> {
     // Read preferences before the bridge mutex: settings writes take settings -> TUN.
-    let dns_settings = crate::dns_settings::current()?;
+    let dns_settings = crate::dns_settings::effective().map_err(io::Error::other)?;
     if !crate::platform::current().tun_supported() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -689,6 +691,13 @@ pub(crate) fn shutdown() {
     let _ = disable_tun();
     BACKEND.lock().unwrap().take();
     BACKEND_V6.lock().unwrap().take();
+}
+
+pub(crate) fn stream_transport(node: &config::Node) -> String {
+    render_node(node, None)
+        .ok()
+        .and_then(|proxy| proxy.get("network").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| "tcp".to_owned())
 }
 
 fn render_node(node: &config::Node, address: Option<&str>) -> io::Result<Value> {
@@ -955,4 +964,11 @@ fn transport(
         _ => {}
     }
     Ok(())
+}
+
+pub(crate) fn flush_fake_ip()->io::Result<()>{let tun=TUN.lock().unwrap();let bridge=tun.as_ref().ok_or_else(||io::Error::other("TUN 未启用，未清理映射"))?;bridge.flush_fake_ip()}
+
+pub(crate) fn apply_process_names(names:Vec<String>)->io::Result<()>{
+    {let mut previous=PROCESS_NAMES.lock().unwrap();if previous.len()+names.len()>1024{previous.clear()}for name in &names{if !previous.contains(name){previous.push(name.clone());}}}
+    if let Some(bridge)=TUN.lock().unwrap().as_mut(){bridge.update_processes(names)?;}Ok(())
 }

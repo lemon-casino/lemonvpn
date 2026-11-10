@@ -1,5 +1,7 @@
 # LemonVPN
 
+局域网共享：在「设置 → 通用 → 局域网共享」启用独立的 HTTP / SOCKS5 TCP 端口，可选择监听网卡、设置用户名密码，并复制连接地址。默认关闭、端口 `18081`，沿用当前规则与出站；设置保存后即时启停，无需重连本机代理。管理 API 保持回环监听。设备连接方式和边界见 [局域网共享](docs/lan-sharing.zh.md)。
+
 推送版本 tag 后自动构建并发布：Windows、macOS、Linux 各 x64/ARM64，共六种原生构建；安装包不签名，全部成功后自动公开 GitHub Release，并附带 SHA256 校验。使用方式与架构补齐见 [Tag 自动发布](docs/tag-release.zh.md)。
 
 Windows 0.1.31：已重新构建未签名的 x64 NSIS 安装包，包含 TUN 托盘入口、状态同步及最新桌面适配。构建未运行测试或安装程序，当前运行进程与已安装文件保持不变。产物与 SHA256 见 [构建记录](docs/windows-0.1.31.zh.md)。
@@ -202,3 +204,7 @@ $env:LEMONVPN_OPEN_LOGS='1'; $env:LEMONVPN_SMOKE='1'; cargo run --manifest-path 
 ```
 
 页面加载并成功取到日志后会在 stderr 打印 `lemonvpn: 日志页已加载`。
+
+## 规则、DNS 与 Fake-IP
+
+规则集管理、地理分类、加密上游、解析池、DNS 缓存和追踪共用资源快照，支持保存后热更新。使用入口、迁移边界及管理 API 见 [管理说明](docs/rules-dns-fakeip.zh.md)。高级 Fake-IP 分类需要 TUN 服务 v2；现有配置不强制迁移。
