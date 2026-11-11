@@ -149,6 +149,11 @@ pub fn stop() -> io::Result<()> {
         }
         thread::sleep(Duration::from_millis(100));
     }
+    // `running()` is false both after a graceful exit and when a broker was
+    // hard-killed. In the latter case its journal may still exist, or the
+    // directory may already be gone; clean both before install/uninstall
+    // removes the files that are the only record of those rules.
+    crate::egress::cleanup_stale()?;
     Ok(())
 }
 pub fn install(owner: u32) -> io::Result<()> {

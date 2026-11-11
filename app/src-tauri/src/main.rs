@@ -199,13 +199,27 @@ fn wait_for_port_release(port: u16, timeout: Duration) {
 }
 
 /// Removes the two shadow routes TUN installs, in case the engine died before
-/// it could take them down itself.
+/// it could take them down itself. The stale adapter's DNS is reset as well so
+/// name resolution cannot keep pointing at the dead TUN address.
 #[cfg(windows)]
 fn cleanup_tun_routes() {
     use std::os::windows::process::CommandExt;
     for (network, mask) in [("0.0.0.0", "128.0.0.0"), ("128.0.0.0", "128.0.0.0")] {
         let _ = std::process::Command::new("route")
             .args(["delete", network, "mask", mask, "10.111.0.1"])
+            .creation_flags(0x0800_0000)
+            .output();
+    }
+    for family in ["ipv4", "ipv6"] {
+        let _ = std::process::Command::new("netsh")
+            .args([
+                "interface",
+                family,
+                "set",
+                "dnsservers",
+                "name=LemonVPN",
+                "source=dhcp",
+            ])
             .creation_flags(0x0800_0000)
             .output();
     }

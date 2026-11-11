@@ -37,6 +37,12 @@ macOS/Linux 仅有 IPv6 出口时，内置 default UDP/53 AliDNS 地址自动改
 - 普通用户不依赖读取 root 进程的 `/proc/<pid>/exe` 判断服务存活，使用本机 Unix socket 的内核 peer credentials 验证 root 服务端；安装/卸载的 root 进程按受保护二进制路径回收实际服务进程。
 - Linux 仍要求支持当前 TUN 实现的内核、iproute2、TUN 设备及管理员授权；这不等于容器可以绕过宿主网络权限。
 
+## Windows TUN 服务生命周期
+
+- broker 启动、会话结束（引擎退出，或协议内核被 Job 对象终止）和卸载时，删除 `0.0.0.0/1`、`128.0.0.0/1` 阴影路由，并把 LemonVPN 适配器的 IPv4/IPv6 DNS 恢复为自动获取；避免残留路由继续把流量送进已停止的适配器。
+- 安装时通过 `sc.exe failure` 配置 SCM 崩溃重启（2s、5s、10s，24 小时重置），等价于 Linux 的 `Restart=on-failure` 与 macOS 的 `KeepAlive`。
+- 适配器本身保留并由下一个内核复用；Wintun 驱动没有删除 API，强行删除会影响正在使用的设备。
+
 ## Linux 系统代理
 
 - GNOME、Cinnamon、MATE 按已安装的 GSettings schema 选择接口；KDE 5/6 使用 KConfig 并通知配置更新。
@@ -49,7 +55,7 @@ macOS/Linux 仅有 IPv6 出口时，内置 default UDP/53 AliDNS 地址自动改
 
 - Windows 宿主共享引擎 workspace 离线 cargo check。
 - Windows Tauri 壳层离线 cargo check。
-- engine-platform 的 x86_64-apple-darwin、x86_64-unknown-linux-gnu 离线 cargo check。
+- engine-platform 的 x86_64-apple-darwin、aarch64-apple-darwin、x86_64-unknown-linux-gnu 与 Windows 目标离线 cargo check。
 - 前端 TypeScript、修改文件 ESLint/Prettier、生产资源构建。
 - 同步完整桌面前端补丁，包含未跟踪的新增源文件。
 

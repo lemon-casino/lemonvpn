@@ -495,6 +495,27 @@ fn launchctl(args: &[&str]) -> io::Result<bool> {
     Command::new("/bin/launchctl").args(args).status().map(|s| s.success())
 }
 
+/// launchd returns from `bootout` before the daemon has finished its SIGTERM
+/// teardown. Removing the service directory (and with it the egress journal)
+/// during that window would lose the only record of routes still installed.
+fn daemon_alive() -> bool {
+    Command::new("/usr/bin/pgrep")
+        .args(["-f", &format!("{SERVICE_DIR}/lemonvpn-service --run")])
+        .output()
+        .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
+}
+
+fn wait_for_daemon_exit(timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    while daemon_alive() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::other("TUN 服务未能停止，保留现有文件"));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
 fn install(owner: u32) -> io::Result<()> {
     if !is_elevated() {
         return Err(err("安装 TUN 服务需要管理员权限"));
@@ -523,9 +544,11 @@ fn install(owner: u32) -> io::Result<()> {
     if directory.exists() {
         reject_symlink(directory)?;
     }
-    // The old daemon must release the binaries before they are replaced.
+    // The old daemon must release the binaries and its routes before they are
+    // replaced; a hard-killed daemon leaves the journal for us to clean.
     let _ = launchctl(&["bootout", &format!("system/{NAME}")]);
-    thread::sleep(Duration::from_millis(300));
+    wait_for_daemon_exit(Duration::from_secs(10))?;
+    crate::egress::cleanup_stale()?;
     fs::create_dir_all(product)?;
     fs::set_permissions(product, fs::Permissions::from_mode(0o755))?;
     root_own(product)?;
@@ -572,6 +595,10 @@ fn uninstall() -> io::Result<()> {
         return Err(err("TUN 服务尚未安装"));
     }
     let _ = launchctl(&["bootout", &format!("system/{NAME}")]);
+    wait_for_daemon_exit(Duration::from_secs(10))?;
+    // Remove routes recorded by a daemon that was killed before it could take
+    // them down; never delete the journal first.
+    crate::egress::cleanup_stale()?;
     fs::remove_file(PLIST)?;
     fs::remove_dir_all(SERVICE_DIR)?;
     Ok(())

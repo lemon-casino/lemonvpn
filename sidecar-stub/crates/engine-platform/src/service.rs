@@ -59,6 +59,9 @@ impl Drop for Session {
         unsafe {
             CloseHandle(self.parent as HANDLE);
         }
+        // The core is killed by its job object when this session ends, so its
+        // own route/DNS cleanup may not run. Restore the physical path here.
+        crate::windows::cleanup_stale();
     }
 }
 fn wide(s: &str) -> Vec<u16> {
@@ -406,6 +409,10 @@ fn service_main(_: Vec<OsString>) {
     let _ = run();
 }
 fn run() -> io::Result<()> {
+    // A previous broker may have been terminated with a session still up.
+    // Nothing owns the stale adapter's routes at this point, so take them down
+    // before the next core can reuse the adapter.
+    crate::windows::cleanup_stale();
     let status = service_control_handler::register(NAME, |event| match event {
         ServiceControl::Stop | ServiceControl::Shutdown => {
             STOP.store(true, Ordering::Relaxed);
@@ -732,6 +739,25 @@ fn install(owner: &str) -> io::Result<()> {
         let _ = service.delete();
         return Err(err("无法设置 TUN 服务启动权限"));
     }
+    // SCM recovery is the desktop equivalent of systemd Restart=on-failure and
+    // launchd KeepAlive: a crashed broker must not leave TUN silently dead.
+    let recovery = std::process::Command::new(crate::managed::system_tool("sc.exe")?)
+        .args([
+            "failure",
+            NAME,
+            "reset=",
+            "86400",
+            "actions=",
+            "restart/2000/restart/5000/restart/10000",
+        ])
+        .creation_flags(0x0800_0000)
+        .output()?;
+    if !recovery.status.success() {
+        eprintln!(
+            "lemonvpn-service: 无法设置服务自动恢复策略: {}",
+            String::from_utf8_lossy(&recovery.stderr).trim()
+        );
+    }
     service.start::<&str>(&[]).map_err(err)?;
     Ok(())
 }
@@ -752,5 +778,7 @@ fn uninstall() -> io::Result<()> {
         thread::sleep(Duration::from_millis(100));
     }
     service.delete().map_err(err)?;
+    // The service is gone, so no session can own these routes any more.
+    crate::windows::cleanup_stale();
     Ok(())
 }

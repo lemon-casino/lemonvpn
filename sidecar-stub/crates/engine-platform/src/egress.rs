@@ -374,6 +374,45 @@ impl Drop for Guard {
     }
 }
 
+/// The journal only covers rules written by a run that could persist it. A
+/// broker killed during install/uninstall, a removed service directory or a
+/// shared namespace can leave protocol-242 rules with no journal at all. Every
+/// rule this project owns carries protocol 242 and a priority in 8750..8800,
+/// so the sweep is unambiguous; callers must already own the service lock.
+#[cfg(target_os = "linux")]
+fn sweep_orphans() -> io::Result<()> {
+    let tool = network::ip_tool()?;
+    for ipv6 in [false, true] {
+        for value in rules(ipv6)?.iter().filter(|value| ours(value)) {
+            let Some(priority) = value["priority"].as_u64() else {
+                continue;
+            };
+            let Some(oif) = value["oif"].as_str() else {
+                continue;
+            };
+            let _ = Command::new(&tool)
+                .args([
+                    if ipv6 { "-6" } else { "-4" },
+                    "rule",
+                    "del",
+                    "pref",
+                    &priority.to_string(),
+                    "oif",
+                    oif,
+                    "lookup",
+                    "main",
+                    "protocol",
+                    PROTOCOL,
+                ])
+                .output();
+        }
+        if rules(ipv6)?.iter().any(ours) {
+            return Err(io::Error::other("无法清理残留的物理出口策略路由"));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn cleanup_stale() -> io::Result<()> {
     for record in records()? {
         let guard = Guard {
@@ -390,5 +429,7 @@ pub(crate) fn cleanup_stale() -> io::Result<()> {
         }
         journal(&guard, false)?;
     }
+    #[cfg(target_os = "linux")]
+    sweep_orphans()?;
     Ok(())
 }

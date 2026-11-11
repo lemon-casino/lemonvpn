@@ -291,6 +291,41 @@ impl Drop for Routes {
     }
 }
 
+/// A core killed inside the service's job object never runs its own teardown.
+/// Remove the shadow default routes and interface DNS that belong to the stale
+/// adapter, otherwise traffic stays trapped while TUN reports off. The adapter
+/// is left in place: the next core reuses it, and the driver has no delete API.
+pub(crate) fn cleanup_stale() {
+    let Ok(wintun) = (unsafe { wintun::load() }) else {
+        return;
+    };
+    let Ok(adapter) = wintun::Adapter::open(&wintun, ADAPTER_NAME) else {
+        return;
+    };
+    let Ok(index) = adapter.get_adapter_index() else {
+        return;
+    };
+    for (network, mask) in [("0.0.0.0", "128.0.0.0"), ("128.0.0.0", "128.0.0.0")] {
+        let _ = Command::new("route")
+            .args(["delete", network, "mask", mask, "if", &index.to_string()])
+            .creation_flags(HIDE_WINDOW)
+            .output();
+    }
+    for family in ["ipv4", "ipv6"] {
+        let _ = Command::new("netsh")
+            .args([
+                "interface",
+                family,
+                "set",
+                "dnsservers",
+                &format!("name={ADAPTER_NAME}"),
+                "source=dhcp",
+            ])
+            .creation_flags(HIDE_WINDOW)
+            .output();
+    }
+}
+
 struct WindowsTunSession {
     stop: Arc<AtomicBool>,
     session: Option<Arc<wintun::Session>>,

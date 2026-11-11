@@ -8,6 +8,7 @@
 - 原生 TCP/UDP 分别使用 IP_BOUND_IF / IPV6_BOUND_IF；兼容内核按地址族分别持有进程，单节点与链式代理的前置端点按可用地址族解析、拨号及失败回退；TLS/SNI 保留原域名。
 - TUN 服务分别维护两族 scoped default 路由。网卡切换先准备新出口，再回收旧路由；同接口网关变化只更新自己持有的条目，已有用户/系统条目保持归属。
 - 自建路由使用 PROTO2 标记及 root 管理的 egress-routes.json 记录。服务启动时按记录和标记清理上次遗留条目，进程退出时按实际归属回收；服务有 flock 锁，避免重复实例争用路由与 socket。
+- 卸载与重装先等待 launchd 下的守护进程真正退出，再按 journal 清理遗留路由，最后才删除服务目录；硬杀守护进程后不会因先删记录而永久遗留路由。
 - 使用 mach_continuous_time 与 mach_absolute_time 的差值识别睡眠时间。即使唤醒后地址和网关不变，也触发连接与 DNS 状态失效，并重建丢失的路由。
 - 网络暂不可用时保留 TUN 启用意图；出口恢复后服务重载固定桥接配置、清理旧连接和 DNS 缓存。辅助内核异常退出、服务重启后也会重试恢复。
 
@@ -21,6 +22,7 @@
 - privileged broker 支持 systemd、OpenRC、runit，缺少管理器时按需启动独立守护进程；用户在 TUN 页面主动授权安装。优先 pkexec，缺少时使用 sudo askpass 或终端授权。应用通过受 peer uid/pid 约束的 Unix socket 提交固定桥接参数。
 - 服务为绑定实际出口设备的 socket 建立 main 表绕行规则，分别覆盖 IPv4/IPv6。规则优先级 8750..8799、protocol 242，早于显式指定的 TUN 捕获优先级 9000；捕获表为 2022，auto-redirect 关闭。
 - 路由修改先记录到 root 的 journal，再操作系统；退出与服务重启只处理记录中的精确条目，保留其他程序的规则。
+- 停止、重装和卸载都在 broker 退出后清理 journal。若硬杀后 journal 已丢失或服务目录已被删除，则按 protocol 242、优先级 8750..8799 扫描并删除孤儿规则；该标记与区间专属于本服务，不会误删其他程序的策略路由。
 - 网络变化、地址变化及睡眠恢复的处理与 macOS 共用生命周期；Linux 通过 CLOCK_BOOTTIME 与 CLOCK_MONOTONIC 的差值识别睡眠。
 - macOS/Linux TUN 使用安装的服务，应用无需以 root 运行。服务端失联、内核恢复或等待网络会通过 recovering 字段呈现在 TUN 设置页。
 
@@ -45,7 +47,7 @@
 ## 检查范围
 
 - Windows 宿主共享引擎 workspace、Tauri 壳层离线编译检查。
-- engine-platform 对 x86_64-apple-darwin、x86_64-unknown-linux-gnu 的离线编译检查。
+- engine-platform 对 x86_64-apple-darwin、aarch64-apple-darwin、x86_64-unknown-linux-gnu 与 Windows 目标的离线编译检查。
 - 前端 TypeScript、修改文件 ESLint 和 Prettier 检查；桌面补丁同步。
 - 没有执行任何测试、连通性查询、系统代理切换、TUN 开关、服务安装或睡眠操作。
 
