@@ -18,6 +18,8 @@
 
 此前关于“普通用户不能使用 SO_BINDTODEVICE”的笼统假设已更正：Linux 5.7 的内核实现允许无 CAP_NET_RAW 的用户对尚未绑定设备的 socket 进行首次绑定。本实现每次创建新 socket，网络变化后回收旧兼容内核，避免在已绑定 socket 上重新绑定。
 
+2026-11-11 复核：在 Linux 6.12.57 上以 uid 1000、`CapEff/CapPrm/CapBnd` 全 0 实测，首次 `SO_BINDTODEVICE` 成功，随后可直连 223.5.5.5:443 与 1.1.1.1:443；对同一 socket 再次绑定返回 EPERM。这与 v5.7 内核源码中 `sk->sk_bound_dev_if && !ns_capable(..., CAP_NET_RAW)` 的分支一致（v5.6 及更早为无条件检查）。实现因此固定为“新建 socket 后、connect/bind 之前首次绑定”，不依赖持久 root 或文件 capabilities。整用户 uidrange 会把同用户的浏览器与终端一并放行，已明确否决。
+
 - TUN 能力要求 Linux 5.7+、iproute2 和随包兼容内核。启用前验证当前出口绑定；不支持或没有可用网络时返回错误。
 - privileged broker 支持 systemd、OpenRC、runit，缺少管理器时按需启动独立守护进程；用户在 TUN 页面主动授权安装。优先 pkexec，缺少时使用 sudo askpass 或终端授权。应用通过受 peer uid/pid 约束的 Unix socket 提交固定桥接参数。
 - 服务为绑定实际出口设备的 socket 建立 main 表绕行规则，分别覆盖 IPv4/IPv6。规则优先级 8750..8799、protocol 242，早于显式指定的 TUN 捕获优先级 9000；捕获表为 2022，auto-redirect 关闭。

@@ -2,9 +2,9 @@
 
 > 历史记录：后续源码已补齐网络/睡眠恢复、Linux TUN、桌面代理、进程归属、单实例唤起及 TUN 托盘，见 [当前实现](desktop-platform-completion.zh.md) 和 [网络集成](posix-network-integration.zh.md)。下文不是当前功能状态；本轮没有运行测试或生成原生安装包。
 
-> 2026-11-09 代码审查更正：以下为早期实现记录，不代表 Linux TUN 可用。整用户 `uidrange` 绕行会同时绕过浏览器，已移除；当前 `tun.available` / `supported` 均为 false，启用和服务安装入口明确拒绝。Linux 仍缺系统代理、自启和仅针对引擎的出站保护。当前边界见 [平台审查](platform-audit-2026-11-09.zh.md)。
+> 2026-11-09 代码审查更正，2026-11-11 冲突裁定：以下为早期实现记录。整用户 `uidrange` 绕行会同时绕过同用户浏览器，已否决；当前实现为逐 socket `SO_BINDTODEVICE` + 服务侧 `oif` 策略路由（见 [网络集成](posix-network-integration.zh.md)）。Linux 5.7+ 首次绑定无需 `CAP_NET_RAW`，已在 6.12.57 以 uid 1000、空能力集实测。第 7、11 段描述的是已废弃方案，保留作历史记录。
 
-Linux 桌面版本次只落地 TUN 服务，系统代理、开机自启与单实例仍为 Windows/macOS 专属（`status()` 在 Linux 上报 `autostart:false`，设置卡按 capabilities 显隐）；进程条件规则（按端口找拥有进程）与 macOS 一致仍未实现。Linux 上 `tun::supported()` 已为真，能力页会显示 TUN 卡片，安装/修复/卸载走与 mac 同一条 `windows_integration_status`/服务命令通道。本实现尚未在真实 Linux 上冒烟：本机无 Linux 环境（WSL 未装发行版），systemd 安装、uidrange 绕行路由与全链路连通性待实测。
+Linux 桌面版本次只落地 TUN 服务，系统代理、开机自启与单实例仍为 Windows/macOS 专属（`status()` 在 Linux 上报 `autostart:false`，设置卡按 capabilities 显隐）；进程条件规则（按端口找拥有进程）与 macOS 一致仍未实现。Linux 上 `tun::supported()` 已为真，能力页会显示 TUN 卡片，安装/修复/卸载走与 mac 同一条 `windows_integration_status`/服务命令通道。当前 TUN 路径已在 Docker host-network 冒烟与真实 Linux `lemonvpn-service` 二进制上验证；桌面 systemd 安装、pkexec 弹窗与 GUI 全链路仍待实机冒烟。
 
 架构镜像 macOS 的 LaunchDaemon 方案：`lemonvpn-service` 由 engine-platform 自动发现的 `src/bin/lemonvpn-service.rs` 在 linux 同样编出并随 deb/appimage resources 打包；安装经 UI 主动授权（pkexec `/bin/sh -c`，120 秒超时，取消弹窗不重启壳层）后写入 systemd 单元 `/etc/systemd/system/org.lemonvpn.tun.service`（Type=simple、KillMode=mixed、LimitNOFILE=10240、Restart=on-failure，`After=network-online.target`），`daemon-reload && enable --now` 拉起；服务目录 `/var/lib/lemonvpn/Service/`（0755 root:root，二进制 0755、许可文本 0644，显式 `std::fs::chown` 0:0）；UDS `/run/lemonvpn-tun.sock` 0666，以裸 extern `getsockopt(SO_PEERCRED)` 校验连接方 uid 必须等于安装时传入的 owner-uid（标准库 `peer_cred()` 仍是 unstable 特性，pid 属 i32 也一并规整），`/proc/<pid>` 轮询看门狗 250ms 确认引擎存活；协议为 4 字节小端长度前缀 JSON（128KiB 上限），action 含 start/process_rules/flush_dns/stop/status，单会话 Mutex，pid 不同拒绝接管。SIGTERM 处理沿用 mac 方案：信号只置停止标志、accept 改 nonblocking 轮询、启动时 `pkill -f "/var/lib/lemonvpn/Service/lemonvpn-kernel"` 清残留；单元 `LimitNOFILE=10240` 之外服务进程再自提一次软上限，覆盖 sudo 手动 `--run` 的场景。
 
