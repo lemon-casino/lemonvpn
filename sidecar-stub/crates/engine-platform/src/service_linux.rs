@@ -12,7 +12,6 @@ use std::{
     io::{self, Read, Write},
     os::unix::{fs::PermissionsExt, io::AsRawFd, net::UnixListener},
     path::{Path, PathBuf},
-    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         Mutex, OnceLock,
@@ -319,6 +318,13 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
                 if session.is_some() {
                     return Ok(json!({"ok":true,"enabled":true}));
                 }
+                if let Some(reason) = crate::egress::foreign_tun()? {
+                    return Err(err(reason));
+                }
+                if Path::new("/sys/class/net/LemonVPN").exists() {
+                    return Err(err("上一个 TUN 内核尚未退出，请稍后重试"));
+                }
+                crate::egress::cleanup_stale()?;
                 let port = value
                     .get("router_port")
                     .and_then(Value::as_u64)
@@ -419,20 +425,20 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
 
 fn run(owner: u32) -> io::Result<()> {
     let _instance = crate::egress::lock_broker()?;
-    // A previous daemon may have been hard-killed with a session still up;
-    // only this service ever spawns the core from the protected directory.
-    let _ = Command::new("pkill")
-        .arg("-f")
-        .arg(format!(
-            "{SERVICE_DIR}/{}",
-            crate::managed::CORE_BINARY_NAME
-        ))
-        .status();
+    // A previous daemon may have been hard-killed with a session still up.
+    // Only kill a core in our own mount namespace: a host-network container
+    // runs the same path but must be left alone.
+    let foreign = crate::egress::foreign_tun()?;
+    crate::egress::kill_own_cores();
     for signum in [1, 2, 15] {
         unsafe { signal(signum, stop_requested as extern "C" fn(i32) as usize) };
     }
     raise_nofile();
-    crate::egress::cleanup_stale()?;
+    if let Some(reason) = foreign {
+        eprintln!("lemonvpn-service: {reason}");
+    } else if crate::egress::wait_for_device_gone(Duration::from_secs(3)) {
+        crate::egress::cleanup_stale()?;
+    }
     let _ = fs::remove_file(SOCKET);
     let listener = UnixListener::bind(SOCKET)?;
     fs::set_permissions(SOCKET, fs::Permissions::from_mode(0o666))?;

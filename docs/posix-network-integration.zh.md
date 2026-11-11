@@ -20,6 +20,8 @@
 
 2026-11-11 复核：在 Linux 6.12.57 上以 uid 1000、`CapEff/CapPrm/CapBnd` 全 0 实测，首次 `SO_BINDTODEVICE` 成功，随后可直连 223.5.5.5:443 与 1.1.1.1:443；对同一 socket 再次绑定返回 EPERM。这与 v5.7 内核源码中 `sk->sk_bound_dev_if && !ns_capable(..., CAP_NET_RAW)` 的分支一致（v5.6 及更早为无条件检查）。实现因此固定为“新建 socket 后、connect/bind 之前首次绑定”，不依赖持久 root 或文件 capabilities。整用户 uidrange 会把同用户的浏览器与终端一并放行，已明确否决。
 
+2026-11-11 跨实例守卫：broker 启动时按网络/挂载命名空间区分实例。同一网络命名空间、且来自本服务挂载命名空间的进程视为自有，可结束其残留内核并清理 8750..8799 的 protocol 242 规则；同一网络命名空间但不同挂载命名空间的进程（典型为 Docker host-network 容器）视为外部实例，服务只拒绝 `start` 并保留其进程与规则，`stop`/卸载也不会触碰。外部实例退出后，下一次 `start` 会重新清理本实例的残留规则。已在 6.12.57 实测：自有 IPv4/IPv6 孤儿规则被清、伪造的不同挂载命名空间实例不被误杀、`start` 返回明确错误、外部退出后恢复清理。
+
 - TUN 能力要求 Linux 5.7+、iproute2 和随包兼容内核。启用前验证当前出口绑定；不支持或没有可用网络时返回错误。
 - privileged broker 支持 systemd、OpenRC、runit，缺少管理器时按需启动独立守护进程；用户在 TUN 页面主动授权安装。优先 pkexec，缺少时使用 sudo askpass 或终端授权。应用通过受 peer uid/pid 约束的 Unix socket 提交固定桥接参数。
 - 服务为绑定实际出口设备的 socket 建立 main 表绕行规则，分别覆盖 IPv4/IPv6。规则优先级 8750..8799、protocol 242，早于显式指定的 TUN 捕获优先级 9000；捕获表为 2022，auto-redirect 关闭。

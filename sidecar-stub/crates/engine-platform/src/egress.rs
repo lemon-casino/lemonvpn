@@ -290,6 +290,137 @@ fn ours(value: &serde_json::Value) -> bool {
         && value["oif"].is_string()
         && (value["table"] == "main" || value["table"].as_u64() == Some(254))
 }
+
+#[cfg(target_os = "linux")]
+fn namespace_matches(pid: u32, kind: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let current = std::fs::metadata(format!("/proc/{}/ns/{kind}", std::process::id()));
+    let other = std::fs::metadata(format!("/proc/{pid}/ns/{kind}"));
+    matches!((current, other), (Ok(a), Ok(b)) if a.dev() == b.dev() && a.ino() == b.ino())
+}
+
+#[cfg(target_os = "linux")]
+fn executable(pid: u32) -> Option<String> {
+    let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    Some(
+        path.to_string_lossy()
+            .trim_end_matches(" (deleted)")
+            .to_owned(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+struct Processes {
+    own_cores: Vec<u32>,
+    own_brokers: Vec<u32>,
+    foreign: Vec<u32>,
+}
+
+/// Split this project's processes into our own and another instance's.
+///
+/// Only processes in our network namespace can affect our rules. Within that
+/// namespace the mount namespace separates us from a host-network container:
+/// the container has the same executable path but its own mounts.
+#[cfg(target_os = "linux")]
+fn processes() -> Processes {
+    let service = std::path::Path::new(SERVICE_DIR)
+        .join("lemonvpn-service")
+        .to_string_lossy()
+        .into_owned();
+    let core = std::path::Path::new(SERVICE_DIR)
+        .join(crate::managed::CORE_BINARY_NAME)
+        .to_string_lossy()
+        .into_owned();
+    let mut result = Processes {
+        own_cores: Vec::new(),
+        own_brokers: Vec::new(),
+        foreign: Vec::new(),
+    };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return result;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() || !namespace_matches(pid, "net") {
+            continue;
+        }
+        let Some(executable) = executable(pid) else {
+            continue;
+        };
+        let is_core = executable == core;
+        if !is_core && executable != service {
+            continue;
+        }
+        if !namespace_matches(pid, "mnt") {
+            result.foreign.push(pid);
+        } else if is_core {
+            result.own_cores.push(pid);
+        } else {
+            result.own_brokers.push(pid);
+        }
+    }
+    result
+}
+
+/// A live TUN owned by another LemonVPN instance in this network namespace.
+/// Docker host-network is the common case; never kill it or sweep its rules.
+#[cfg(target_os = "linux")]
+pub(crate) fn foreign_tun() -> io::Result<Option<String>> {
+    let found = processes();
+    if !found.foreign.is_empty() {
+        let pids = found
+            .foreign
+            .iter()
+            .map(|pid| pid.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Ok(Some(format!(
+            "另一个 LemonVPN TUN 实例正在使用当前网络命名空间（PID {pids}），请先停止它再启用 TUN"
+        )));
+    }
+    if std::path::Path::new("/sys/class/net/LemonVPN").exists() && found.own_cores.is_empty() {
+        return Ok(Some(
+            "另一个 LemonVPN TUN 正在使用当前网络命名空间，请先停止它再启用 TUN".to_owned(),
+        ));
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn own_brokers() -> Vec<u32> {
+    processes().own_brokers
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_own_cores() {
+    extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    for pid in processes().own_cores {
+        unsafe {
+            kill(pid as i32, 15);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn wait_for_device_gone(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::path::Path::new("/sys/class/net/LemonVPN").exists() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    true
+}
+
 #[cfg(target_os = "linux")]
 impl Guard {
     fn present(&self) -> io::Result<bool> {
@@ -414,6 +545,12 @@ fn sweep_orphans() -> io::Result<()> {
 }
 
 pub(crate) fn cleanup_stale() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if foreign_tun()?.is_some() {
+        // Our journal may point at priorities another live instance has since
+        // reused; leave that instance and its rules untouched.
+        return Ok(());
+    }
     for record in records()? {
         let guard = Guard {
             route: record.route,

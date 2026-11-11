@@ -63,24 +63,9 @@ fn write(path: impl AsRef<Path>, text: impl AsRef<[u8]>, mode: u32) -> io::Resul
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
 }
 fn brokers() -> Vec<u32> {
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
-            if pid == std::process::id() {
-                return None;
-            }
-            (fs::read_link(entry.path().join("exe"))
-                .ok()?
-                .to_string_lossy()
-                .trim_end_matches(" (deleted)")
-                == binary().to_string_lossy())
-            .then_some(pid)
-        })
-        .collect()
+    // A host-network container runs the same path in another mount namespace;
+    // only processes that share our mounts are this service instance.
+    crate::egress::own_brokers()
 }
 pub fn running() -> bool {
     if !crate::service_linux::is_elevated() {
