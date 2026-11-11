@@ -1,0 +1,35 @@
+# Default deployment: Web UI + LAN proxy. The management UI is reachable from
+# the LAN and protected by the credentials generated on first start.
+services:
+  lemonvpn:
+    image: ${LEMONVPN_IMAGE:-ghcr.io/lemon-casino/lemonvpn:latest}
+    container_name: lemonvpn
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "${LEMONVPN_LAN_PORT:-18081}:${LEMONVPN_LAN_PORT:-18081}"
+    volumes:
+      - ./data:/data
+    environment:
+      LEMONVPN_UI_USERNAME: ${LEMONVPN_UI_USERNAME:-admin}
+      LEMONVPN_UI_PASSWORD: ${LEMONVPN_UI_PASSWORD:-}
+      LEMONVPN_LAN_ENABLED: "1"
+      LEMONVPN_LAN_BIND: "0.0.0.0"
+      LEMONVPN_LAN_PORT: ${LEMONVPN_LAN_PORT:-18081}
+      LEMONVPN_LAN_USERNAME: ${LEMONVPN_LAN_USERNAME:-}
+      LEMONVPN_LAN_PASSWORD: ${LEMONVPN_LAN_PASSWORD:-}
+      LEMONVPN_LAN_ALLOW_ANONYMOUS: ${LEMONVPN_LAN_ALLOW_ANONYMOUS:-0}
+      LEMONVPN_TUN: "0"
+      TZ: ${TZ:-UTC}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18080/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

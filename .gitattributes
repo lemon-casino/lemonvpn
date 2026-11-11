@@ -1,2 +1,7 @@
 # Patch files are applied with `git apply`; CRLF checkout would break them.
 *.patch -text
+
+# Container files are used verbatim by the image and shell.
+docker/** text eol=lf
+*.sh text eol=lf
+.dockerignore text eol=lf

@@ -1,0 +1,15 @@
+.git
+.github
+.lcode
+doona
+honk
+output
+tmp
+docs
+sidecar-stub/target
+sidecar-stub/*.etl
+app/node_modules
+app/dist
+app/src-tauri
+node_modules
+**/*.log

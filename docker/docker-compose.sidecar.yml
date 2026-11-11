@@ -1,0 +1,41 @@
+# Container-scoped TUN: the VPN runs in its own network namespace and other
+# containers join it with `network_mode: "service:lemonvpn"`. The host network
+# is untouched.
+services:
+  lemonvpn:
+    image: ${LEMONVPN_IMAGE:-ghcr.io/lemon-casino/lemonvpn:latest}
+    container_name: lemonvpn
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "8080:8080"
+      - "${LEMONVPN_LAN_PORT:-18081}:${LEMONVPN_LAN_PORT:-18081}"
+    volumes:
+      - ./data:/data
+    environment:
+      LEMONVPN_UI_USERNAME: ${LEMONVPN_UI_USERNAME:-admin}
+      LEMONVPN_UI_PASSWORD: ${LEMONVPN_UI_PASSWORD:-}
+      LEMONVPN_LAN_ENABLED: "1"
+      LEMONVPN_LAN_BIND: "0.0.0.0"
+      LEMONVPN_LAN_PORT: ${LEMONVPN_LAN_PORT:-18081}
+      LEMONVPN_LAN_USERNAME: ${LEMONVPN_LAN_USERNAME:-}
+      LEMONVPN_LAN_PASSWORD: ${LEMONVPN_LAN_PASSWORD:-}
+      LEMONVPN_TUN: "1"
+      LEMONVPN_TUN_STRICT: "1"
+      LEMONVPN_TUN_EXCLUDE_LAN: "0"
+      TZ: ${TZ:-UTC}
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Example client container sharing the VPN network namespace:
+  # client:
+  #   image: curlimages/curl:latest
+  #   network_mode: "service:lemonvpn"
+  #   depends_on: [lemonvpn]

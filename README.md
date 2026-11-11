@@ -50,6 +50,18 @@ Windows 0.1.4 更新：修复 TUN 服务管道通信，服务安装/修复归入
 - 开发方案与架构决策:[docs/desktop-development-plan.zh.md](docs/desktop-development-plan.zh.md)
 - 许可:GPL-3.0-only(上游 honk / doona 亦为 GPL-3.0-only)
 
+## Docker
+
+把同一套 Rust 引擎与 doona Web UI 打包成单容器镜像：浏览器打开管理界面，局域网设备通过 `18081` 的 HTTP / SOCKS5 代理使用当前规则与策略组，配置、订阅和内核数据落在 `/data`。默认 compose 为代理模式，另提供 host 网络与 sidecar 两种 TUN 部署。
+
+```sh
+cd docker
+cp .env.example .env
+docker compose up -d
+```
+
+端口、环境变量、TUN 权限、安全边界与故障排查见 [Docker 版](docs/docker.zh.md)，设计与取舍见 [Docker 版开发计划](docs/docker-plan.zh.md)。
+
 ## 仓库布局
 
 本仓库承载桌面壳(Tauri 2)、引擎 sidecar 托管、打包与桌面 CI。上游代码不在本仓库跟踪:
