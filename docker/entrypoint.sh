@@ -169,6 +169,38 @@ prepare_lan() {
   fi
 }
 
+# Remove policy rules left behind when a previous container was killed before
+# its broker could clean up. A TUN device disappears with its process, so a
+# present device means another live broker owns this network namespace and we
+# must not touch its rules.
+cleanup_stale_tun() {
+  if ip link show LemonVPN >/dev/null 2>&1; then
+    return 1
+  fi
+  local pref i
+  # 8750-8799: broker egress rules; 8890: LAN exclusions; 9000-9010: mihomo.
+  for pref in $(seq 8750 8799) 8890 9000 9001 9002 9010; do
+    for i in $(seq 1 64); do
+      ip rule del pref "$pref" >/dev/null 2>&1 || break
+    done
+    for i in $(seq 1 64); do
+      ip -6 rule del pref "$pref" >/dev/null 2>&1 || break
+    done
+  done
+  # Catch rules that reference mihomo's table or device at other priorities.
+  for i in $(seq 1 64); do
+    ip rule del lookup 2022 >/dev/null 2>&1 || break
+  done
+  for i in $(seq 1 64); do
+    ip -6 rule del lookup 2022 >/dev/null 2>&1 || break
+  done
+  for i in $(seq 1 64); do
+    ip rule del iif LemonVPN >/dev/null 2>&1 || break
+  done
+  ip link del LemonVPN >/dev/null 2>&1 || true
+  return 0
+}
+
 install_tun_service() {
   local parent
   parent="$(dirname "$SERVICE_DIR")"
@@ -243,16 +275,23 @@ prepare_lan
 
 if [[ "${LEMONVPN_TUN:-0}" == 1 || -c /dev/net/tun ]]; then
   if [[ -c /dev/net/tun ]] && capsh --has-p=cap_net_admin >/dev/null 2>&1; then
-    log "TUN capabilities found; installing standalone broker."
-    install_tun_service
-    "$SERVICE_DIR/lemonvpn-service" --run --owner-uid "$RUN_UID" &
-    BROKER_PID=$!
-    for _ in $(seq 1 100); do
-      [[ -S "$TUN_SOCKET" ]] && break
-      kill -0 "$BROKER_PID" 2>/dev/null || fatal "TUN broker exited during startup"
-      sleep 0.1
-    done
-    [[ -S "$TUN_SOCKET" ]] || fatal "TUN broker socket did not appear"
+    if ! cleanup_stale_tun; then
+      if [[ "${LEMONVPN_TUN:-0}" == 1 ]]; then
+        fatal "another LemonVPN TUN is active in this network namespace; stop it before starting TUN mode"
+      fi
+      log "Another LemonVPN TUN is active; skipping broker setup (proxy mode only)."
+    else
+      log "TUN capabilities found; installing standalone broker."
+      install_tun_service
+      "$SERVICE_DIR/lemonvpn-service" --run --owner-uid "$RUN_UID" &
+      BROKER_PID=$!
+      for _ in $(seq 1 100); do
+        [[ -S "$TUN_SOCKET" ]] && break
+        kill -0 "$BROKER_PID" 2>/dev/null || fatal "TUN broker exited during startup"
+        sleep 0.1
+      done
+      [[ -S "$TUN_SOCKET" ]] || fatal "TUN broker socket did not appear"
+    fi
   elif [[ "${LEMONVPN_TUN:-0}" == 1 ]]; then
     fatal "TUN needs /dev/net/tun and CAP_NET_ADMIN; use docker-compose.tun.yml"
   else

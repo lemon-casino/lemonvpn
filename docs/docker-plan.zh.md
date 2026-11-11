@@ -11,6 +11,7 @@
 - TUN 由镜像内的 `lemonvpn-service` 以 standalone broker 运行；entrypoint 把服务安装到 `/var/lib/lemonvpn/Service/`，引擎以 uid 1000 通过 `/run/lemonvpn-tun.sock` 请求。
 - 验收中发现并修复：`prepare_lan()` 的 `umask 077` 泄漏，使 `/var/lib/lemonvpn` 变成 0700，uid 1000 无法穿越，引擎误判服务未安装。
 - 新增 `docs/docker.zh.md`、`.github/workflows/docker.yml`；arm64 构建与 GHCR 发布尚未实际运行。
+- 修复不干净退出后的规则残留：入口脚本在启动时清理 `8750–8799`、`8890`、`9000+` 与 table 2022 的遗留规则；检测到仍存活的 `LemonVPN` 设备时拒绝接管。宿主侧提供 `docker/tun-cleanup.sh`。
 
 本计划基于对现有桌面版引擎（`sidecar-stub/`）、doona 前端和局域网共享实现的只读排查，目标是在不改动引擎主监听绑定（`127.0.0.1`）的前提下，交付可用的 Docker 镜像：浏览器访问 Web UI，局域网设备通过共享端口走 HTTP/SOCKS5 代理，配置与订阅持久化在数据卷中。
 

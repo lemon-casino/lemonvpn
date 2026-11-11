@@ -139,6 +139,8 @@ curl --socks5-hostname user:pass@HOST:18081 https://example.com
 
 TUN 会接管流量路由，需要额外权限，因此不在默认 compose 中。提供两种方式：
 
+容器启动时会先清理上一次不干净退出（`docker kill`、OOM、`docker rm`）残留的策略规则。若检测到仍有存活的 `LemonVPN` 设备（例如桌面版 TUN 或另一个容器），会拒绝接管并退出，避免两个 TUN 互相破坏。宿主侧也可手动运行 `sudo ./docker/tun-cleanup.sh`。
+
 ### 7.1 host 网络（改动宿主路由）
 
 ```sh
@@ -238,3 +240,5 @@ docker pull ghcr.io/lemon-casino/lemonvpn:latest
 | 端口冲突 | `LEMONVPN_LAN_PORT` 不能等于 18080/8080；宿主端口被占用时改映射 |
 | 容器启动即退出 | `docker logs` 查看是否 LAN 凭据或配置校验失败；`lan-settings.json` 必须是严格 JSON |
 | LAN 设置改不动 | 已有 `lan-settings.json` 时环境变量不会覆盖，设 `LEMONVPN_LAN_RESEED=1` |
+| `another LemonVPN TUN is active` | 宿主或另一容器仍有 `LemonVPN` 设备；先停掉对应实例再启动 TUN |
+| TUN 报「物理出口策略路由优先级已用尽」 | 旧镜像的残留规则累积；执行 `sudo ./docker/tun-cleanup.sh`，当前入口脚本会在启动时自动清理 |
