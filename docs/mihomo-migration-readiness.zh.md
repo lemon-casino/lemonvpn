@@ -9,10 +9,10 @@
 | 项目 | `192.168.0.6` 当前状态 |
 | --- | --- |
 | 部署目录 / 容器 | `/data/LemonVPN` / `lemonvpn`，healthy，restart=unless-stopped |
-| 镜像 | `lemonvpn:production-20261115`，与候选镜像 ID 一致：`sha256:e9642dae4d1f082e7d85f6c8119b24ca89e0bc58196c556eeb90f24df01efb04` |
+| 镜像 | `lemonvpn:0.1.43-lan-relay-20261115`，基于正式 amd64 `v0.1.43` 替换修复引擎；镜像 ID `sha256:fe3a8f95a7a7464ab6d7cbde785cf88d7f2f4792ffda1adcf2aa686fe8415cc8` |
 | 面板 / 引擎 API | `http://192.168.0.6:8081/`，登录沿用候选机；Rust API 仅 `127.0.0.1:18080`，旧 9090 Clash API 已随旧容器停止 |
-| HTTP / SOCKS / DNS | 混合代理 `7890` TCP/UDP，沿用原代理的免认证方式；DNS 监听 `192.168.0.6:53` TCP/UDP，允许本地、192.168.0/24、192.168.1/24 与 Docker 私网 |
-| 配置 | 候选当前的 9 个订阅节点、策略组 cesh、六类分流及 DNS/Fake-IP 设置；仅将 LAN 地址、端口和允许网段适配生产主机 |
+| HTTP / SOCKS / DNS | 混合代理 `7890` TCP/UDP，保留用户当前启用的代理认证；DNS 监听 `192.168.0.6:53` TCP/UDP，允许本地、192.168.0/24、192.168.1/24 与 Docker 私网 |
+| 配置 | 当前 9 个订阅节点、策略组 cesh、8 个分类绑定及 DNS/Fake-IP 设置；原六类分流基础上增加 Telegram 域名/IP → cesh，LAN 地址、端口和允许网段适配生产主机 |
 | TUN / Fake-IP | TUN 开启，IPv6 关闭，198.18.0.1/16 地址池、13 项排除及持久化保留；旧服务停止后取得的数据库复制到独立 tun-state，190 条映射逐项核对全部保留 |
 | 旧服务 / 回退 | `metacubexd` exited，restart=no；原卷未由新服务修改。执行 `/data/LemonVPN/rollback.sh` 可停止新服务并恢复旧容器及原 always 重启策略 |
 | 备份 / 证据 | `/data/LemonVPN/backups`、`/data/LemonVPN/evidence`；元数据和配置含凭据，仅保存于私有目录，不提交 Git |
@@ -22,6 +22,8 @@
 仅做上线核对，未运行测试套件：内核同步无等待或错误、配置诊断为空；外部客户端的 TCP/UDP DNS 均返回原 `google.com → 198.18.0.40` 映射；混合代理访问 YouTube 返回 HTTPS 204，使用原 Fake-IP 地址访问 Google 返回 HTTPS 204，百度 HTTPS 200。后续具体终端与业务仍由用户继续观察。旧内联节点快照及旧自动选择参数差异没有被伪装成当前候选配置的完整等价迁移。
 
 随后用户报告 Docker Hub 的 TLS 握手超时。只针对该故障检查：Docker 守护进程实际加载的 HTTP/HTTPS 代理均为 `127.0.0.1:7890`，不是仅在配置文件写入但未生效；registry 域名命中国外分类并走 cesh。通过宿主 TUN 和显式代理访问 registry 均完成正常 TLS 并返回标准未认证响应 401，随后实际 `docker pull nginx:latest` 完整成功，摘要为 `sha256:165ddde8751e75a1c907d24ef10d9f6deb08b57e0fe56caf67512486aff76d82`。本次未复现原超时，因此未将原因断言为某个节点或 Docker Hub 故障，也未修改配置或重启 Docker；证据为生产目录 `evidence/docker-pull.json`。
+
+2026-11-15 19:59（Asia/Shanghai），按用户授权部署 Actions 已成功构建的正式 `v0.1.43` amd64 镜像，核对版本标签、完整提交和镜像摘要后，只替换生产 `lemonvpn` 容器。停止旧容器后备份 `data` 和 `tun-state`；备份位置 `/data/LemonVPN/backups/before-v0.1.43-20261115-195917`。新容器 healthy、TUN 已恢复、内核同步无等待或错误、配置诊断为空；9 个节点、8 个分类绑定、LAN 代理、DNS 监听和 Fake-IP 设置逐项保持一致。其他运行容器 ID 与启动时间未变，旧 metacubexd 仍停止；五分钟自动回退计时器已在检查通过后取消。证据为 `/data/LemonVPN/evidence/upgrade-v0.1.43.json`。未运行测试套件，未切换生产 DNS 的固定监听地址，未改动 Windows 软件；此前关于运行部署未替换的记录已由本次部署更新。
 
 ## 切换前的部署基线
 
@@ -72,7 +74,7 @@
 | MIG-31 规则集分流与 DNS 出站 | 已补齐并应用用户确认的方案 | 规则集旁新增“设置分流”，可修改流量出站；规则页支持统一编辑、停用、删除与排序。下载规则集、DNS 查询和命中后流量的出站分别标注；流量绑定支持 block。候选机按用户确认绑定六类规则，境外 DoH 经 cesh，使用标准服务域名及固定引导 IP，给代理握手保留 8 秒超时余量。最终 Google、YouTube 实际 DNS 查询均返回 NOERROR 且路由 cesh，约 1150/396ms；百度使用国内上游、real-ip、direct，约 22ms。这是本次观测值，不代表所有节点或网络延迟 |
 | MIG-32 大分类 Fake-IP 热更新 | 已修复并应用 | Linux/macOS TUN 服务改用 socket 就绪等待，消除逐块固定 200ms 延迟；域名产物总传输上限由 30 秒增至 120 秒，继续保留 32 MiB、帧大小、顺序与 SHA256 校验。国内约 22 万域名的 real-ip 分类及境外/AI fake-ip 分类已热更新成功，内核 PID 不变；代码同时供桌面后端使用 |
 | MIG-33 分流管理归位与拓扑 | 已部署并核对 | “分流”页默认显示分类分流，保留总览、记录；规则集的设置分流链接定位到对应分类编辑框，规则页提供管理入口。分类支持修改出站、启停、删除及带上下插入提示的拖动排序，保存后热更新。拓扑通过规则接口的扩展字段读取真实的分类规则 ID 和当前顺序，将分类分流展示在用户规则之后、fallback 之前；流程记录的分类规则链接回分流管理。源码规则编辑器继续只修改配置文件规则 |
-| MIG-34 多网卡 DNS 回包 | 共用代码已修复，六种架构编译检查通过；运行部署未替换 | 原 0.0.0.0 监听从 Docker 网桥查询时可能以 172.17.0.1 回答发往 192.168.0.6 的请求。新增 Windows/Linux/macOS 逐报文目标地址读取及源地址控制，IPv6 保留接口范围，丢弃截断或缺少必要元数据的报文；收发错误写入 DNS 状态。继续保持已有固定 IP 的生产配置，部署新版本并完成实际网络核对前不改回通配地址。未运行测试。原现场证据：dns-source-fix.json、container-dns-source.json |
+| MIG-34 多网卡 DNS 回包 | 共用代码已修复，六种架构编译检查通过；生产已部署 v0.1.43 | 原 0.0.0.0 监听从 Docker 网桥查询时可能以 172.17.0.1 回答发往 192.168.0.6 的请求。新增 Windows/Linux/macOS 逐报文目标地址读取及源地址控制，IPv6 保留接口范围，丢弃截断或缺少必要元数据的报文；收发错误写入 DNS 状态。生产 v0.1.43 已健康启动，继续保留固定 IP 监听，未改为通配地址；未运行测试或补做多接口网络验收。原现场证据：dns-source-fix.json、container-dns-source.json；部署证据：upgrade-v0.1.43.json |
 | MIG-35 Tunnel DNS 优先级 | 已修正并热更新 | 原有 argotunnel.com/cftunnel.com Fake-IP 排除和直连路由均保留，但迁移后的专用 DNS 策略被通用国外分类抢先匹配。已将这两类专用策略移至前面，显式 real-ip，并保持旧阿里 DoH 直连；离线追踪确认命中专用池，容器内两个 region 域名正常应答。迁移脚本同步修正，未更换运行镜像。myip.ipip.net 在旧配置和源码中没有专门例外；当前命中国内分类，实际 DNS 返回 NOERROR、真实 IP，路由 direct。证据：tunnel-dns-priority.json |
 
 本轮候选补丁已重新构建并部署到 `192.168.126.130:8080`，16 个现有节点及 DNS 文档保持不变；未改动 Windows 运行软件或 `192.168.0.6`。编译检查和浏览器页面核对通过。执行中误跑了隔离功能校验，未运行仓库测试套件；隔离数据不含用户节点，校验容器已停止。
@@ -90,7 +92,7 @@
 手动选择也已持久化到 `group-selections.json`；落盘失败返回错误并保留原选择，容器重建后 TCP/UDP 选择保持不变。候选环境当前“🔰 节点选择”固定为已经验证可用的香港 61 节点，用户可在出站页面自行切换；这不代表所有订阅节点都已逐一验收。
 
 引导 DNS 修复同时进入桌面共用 Rust 引擎与前端构建补丁；本轮重新构建并部署的是 Linux Docker，未重新生成桌面安装包。外部节点域名解析故障仍需地址提供方恢复或修订（见 MIG-25），退避不会将失败伪装成成功，也不会修改节点地址。
-| MIG-36 规则集分流入口 | 已补齐共享前端并通过类型检查 | 已有关联分类分流的规则集隐藏“设置分流”，包括已停用的绑定；未绑定的规则集仍显示入口。流量去向摘要继续展示，已有绑定在“分流 → 分类分流”修改。发布补丁已同步，桌面与 Docker 使用同一实现 |
+| MIG-36 规则集分流入口 | 已补齐共享前端并通过类型检查，生产已部署 v0.1.43 | 已有关联分类分流的规则集隐藏“设置分流”，包括已停用的绑定；未绑定的规则集仍显示入口。流量去向摘要继续展示，已有绑定在“分流 → 分类分流”修改。发布补丁已同步，桌面与 Docker 使用同一实现 |
 
 ## 保留的 13 项排除
 
@@ -138,3 +140,25 @@ www.msftconnecttest.com
 初始脱敏快照：本地 `output/mihomo-audit-20261114/migration/`。本轮构建、部署命令和脱敏功能证据：本地 `output/migration-enhance-20261115/`；含凭据的原始迁移包不提交 Git。
 
 Geodata 来源与校验说明：[Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat)。
+
+
+## 2026-11-15 Telegram 局域网共享反复重连排查
+
+生产 v0.1.43 的被动观察确认 Telegram IP 命中 `preset_telegram_ip -> cesh`，容器健康且未重启。兼容内核的 warning 流捕获多个 Telegram 拨号在 WebSocket 握手时收到远端 `connection reset by peer`。当前 9 个节点共用入口域名 `cdst.lemon.vin`，该时段使用 `108.165.152.223:443`；切换协议或落地节点不保证绕过该入口。已有连接确实有回传，但不能据此认定 Telegram 已稳定。证据：生产目录 `evidence/telegram-stability-20261115/`。
+
+共用引擎源码修复本地 SOCKS 提前成功导致的质量误判：兼容内核的握手成功不计节点成功或延迟，真实首个回传计成功；客户端仍连接、已经上传数据而上游无任何回传即关闭时，记录失败及短暂失败退避。转发的致命 IO 错误结束双向 socket，读写均可取消；半关闭连接在 30 秒无进展后回收，仍持续回传的数据流继续排空，正常双向空闲长连接不受这个期限影响。失败写入流记录与脱敏日志。
+
+Windows 本机和 Linux 隔离容器的 `cargo check --locked -p lemonvpn-engine-core` 均通过，未运行测试。Linux 检查使用内存临时目录、离线依赖与限定资源的独立编译容器，未启动引擎。未改动生产配置、订阅、节点选择或运行容器，未替换 Windows 软件。该排查阶段尚未部署；入口的远端重置仍需恢复或更换可用入口，不能将代码修复描述为已经解决线上 Telegram 重连。
+
+
+### 2026-11-15 22:30 部署局域网转发修复
+
+按用户授权，已构建 Linux amd64 release 引擎，在正式 0.1.43 镜像基础上生成并部署 `lemonvpn:0.1.43-lan-relay-20261115`。镜像 ID：`sha256:fe3a8f95a7a7464ab6d7cbde785cf88d7f2f4792ffda1adcf2aa686fe8415cc8`；引擎 SHA256：`f8d2dceb3ed00933ce5377947ff371858a0e4628f2ca6da4d6c1acfdc8e1976f`。已复核运行进程 `/proc/<pid>/exe` 的哈希，确认加载的是修复引擎。
+
+容器 healthy、TUN 已恢复、内核同步无等待或错误；9 个节点、8 个分类绑定、DNS/Fake-IP、局域网代理/DNS 和手动节点选择均保持。只替换 LemonVPN，其他容器启动时间未变；未运行测试，未改动 Windows 软件。该次部署时尚未提交或推送 Git。
+
+一致备份：`/data/LemonVPN/backups/before-lan-relay-20261115-223042`。生产部署证据：`/data/LemonVPN/evidence/relay-deploy-20261115.json`；本地构建清单和证据：`output/relay-deploy-20261115/`。原正式镜像保留可回退。代理仍为 `192.168.0.6:7890`，Web 为 `http://192.168.0.6:8081/`。此次部署不代表共享节点入口的远端重置已消失。
+
+部署后 40 秒被动观察中，容器持续 healthy、自动重启次数 0、内核同步无等待；Telegram 活动连接均走 cesh，已有回传的连接累计下载量从约 562 KB 增至约 929 KB。该短时观察不替代用户对 Telegram 的持续业务验收。
+
+部署后的 15 秒内核 warning 被动窗口仍捕获 1 次远端连接重置、2 条 Telegram 相关警告；已如实保留证据 `incoming/relay-20261115/post-deploy-log-observation.json`。本次共享转发修复已上线，但公共入口的网络故障尚未消除。自动回退定时器已取消。

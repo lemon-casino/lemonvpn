@@ -1,9 +1,9 @@
 //! Shared plumbing for the inbound: dialing upstreams and shuttling bytes.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -196,7 +196,9 @@ pub fn connect(decision: &config::Decision, host: &str, port: u16) -> io::Result
         config::Target::Chain { nodes, .. } => crate::compat::connect_chain(nodes, host, port),
     };
     if let config::Target::Node(node) = &decision.target {
-        crate::group_policy::dial_result(node, "tcp", result.is_ok(), started.elapsed());
+        if result.is_err() || !crate::compat::available() {
+            crate::group_policy::dial_result(node, "tcp", result.is_ok(), started.elapsed());
+        }
     }
     if result.is_err() {
         outbounds::record_error(decision);
@@ -266,7 +268,7 @@ pub fn read_headers(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     })
 }
 
-/// Copies bytes both ways until either side closes, then shuts both down.
+/// Relays both directions, preserving an actively draining half-close.
 /// Both directions count as they are read, so the traffic ring sees a long
 /// transfer instead of one jump when it ends.
 pub fn tunnel(
@@ -277,14 +279,13 @@ pub fn tunnel(
     target: (&str, u16),
     inbound_stop: Option<&std::sync::atomic::AtomicBool>,
 ) -> io::Result<()> {
-    // The guard closes the flow record when this tunnel returns.
-    let _flow = flow;
+    let mut flow = flow;
     let meter = outbounds::Meter::open(decision);
     for stream in [&client, &upstream] {
         // Periodic reads let an embedded host stop idle tunnels even when an
         // OS does not interrupt a pending recv on a duplicated socket.
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-        let _ = stream.set_write_timeout(None);
+        stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+        stream.set_write_timeout(Some(Duration::from_millis(250)))?;
     }
 
     let _open = OpenConnection::new();
@@ -293,7 +294,7 @@ pub fn tunnel(
         .ok()
         .map(|src| connections::Live::tcp_target(src, target.0, target.1, client.try_clone().ok()));
     if let Some(live) = &live {
-        live.set_route(decision, _flow.as_ref());
+        live.set_route(decision, flow.as_ref());
     }
     if let (Some(live), Ok(socket)) = (&live, upstream.try_clone()) {
         live.attach_socket(socket);
@@ -305,37 +306,193 @@ pub fn tunnel(
         return Ok(());
     }
     let retired = live.as_ref().map(|live| live.cancellation());
-    let download_counters = live.as_ref().map(|live| Arc::clone(&live.counters));
+    let counters = live
+        .as_ref()
+        .map(|live| Arc::clone(&live.counters))
+        .unwrap_or_default();
+    let relay = Arc::new(RelayState {
+        cancelled: AtomicBool::new(false),
+        client_done: AtomicBool::new(false),
+        half_closed: Mutex::new(None),
+        retired,
+        sockets: [client.try_clone()?, upstream.try_clone()?],
+    });
+    let feedback = match &decision.target {
+        config::Target::Node(node) if crate::compat::available() => Some(node.as_ref().clone()),
+        _ => None,
+    };
     let outbound = meter.handle();
 
     let mut client_read = Counted {
         inner: client.try_clone()?,
         add: state::add_upload,
-        counter: download_counters.clone(),
+        counter: Arc::clone(&counters),
         outbound: Some(outbound.clone()),
         upload: true,
-        retired: retired.clone(),
+        relay: Arc::clone(&relay),
+        feedback: None,
     };
-    let mut upstream_write = upstream.try_clone()?;
-    let upload = thread::spawn(move || {
-        let _ = io::copy(&mut client_read, &mut upstream_write);
-        let _ = upstream_write.shutdown(Shutdown::Write);
-    });
+    let mut upstream_write = RelayWriter {
+        inner: upstream.try_clone()?,
+        relay: Arc::clone(&relay),
+    };
+    let upload_relay = Arc::clone(&relay);
+    let upload = thread::Builder::new()
+        .name("tunnel-upload".into())
+        .spawn(move || {
+            let result = io::copy(&mut client_read, &mut upstream_write);
+            upload_relay.client_done.store(true, Ordering::Release);
+            if result.is_err() {
+                upload_relay.abort();
+            } else {
+                upload_relay.half_close();
+            }
+            let _ = upstream_write.inner.shutdown(Shutdown::Write);
+            result
+        })?;
 
     let mut upstream_read = Counted {
         inner: upstream,
         add: state::add_download,
-        counter: download_counters,
+        counter: Arc::clone(&counters),
         outbound: Some(outbound),
         upload: false,
-        retired,
+        relay: Arc::clone(&relay),
+        feedback: feedback.clone(),
     };
-    let mut client_write = client;
-    let _ = io::copy(&mut upstream_read, &mut client_write);
-    let _ = client_write.shutdown(Shutdown::Write);
-    let _ = upload.join();
+    let mut client_write = RelayWriter {
+        inner: client,
+        relay: Arc::clone(&relay),
+    };
+    let download = io::copy(&mut upstream_read, &mut client_write);
+    let cancelled = relay.external_stop();
+    // A remote EOF/error before any response must not remain a successful
+    // dial. A client cancellation and a completed response are not failures.
+    let no_response = !cancelled
+        && !relay.client_done.load(Ordering::Acquire)
+        && counters.upload.load(Ordering::Relaxed) > 0
+        && counters.download.load(Ordering::Relaxed) == 0;
+    if no_response {
+        if let Some(node) = &feedback {
+            crate::group_policy::relay_result(node, false);
+        }
+    }
+    if download.is_err() {
+        relay.abort();
+    } else {
+        relay.half_close();
+    }
+    let _ = client_write.inner.shutdown(Shutdown::Write);
+    let upload = upload
+        .join()
+        .unwrap_or_else(|_| Err(io::Error::other("转发线程异常结束")));
+    let cancelled = cancelled || relay.external_stop();
+    relay.abort();
+    let result = download.and(upload);
+    if !cancelled && (result.is_err() || no_response) {
+        outbounds::record_error(decision);
+        if let Some(flow) = flow.take() {
+            flow.finish("failed");
+        }
+        let kind = result
+            .as_ref()
+            .err()
+            .map(|e| format!("{:?}", e.kind()))
+            .unwrap_or_else(|| "NoResponse".into());
+        crate::logs::warn(
+            "engine::tunnel",
+            "连接转发失败。",
+            Some(crate::logs::fields(&[
+                ("kind", &kind),
+                ("outbound", &decision.outbound),
+            ])),
+        );
+    }
 
-    Ok(())
+    result.map(|_| ())
+}
+
+/// Fully open idle tunnels remain unlimited. After either peer sends EOF,
+/// retain the other direction while it makes progress, with a bounded idle
+/// drain so abandoned clients cannot exhaust the LAN worker limit.
+struct RelayState {
+    cancelled: AtomicBool,
+    client_done: AtomicBool,
+    half_closed: Mutex<Option<Instant>>,
+    retired: Option<Arc<AtomicBool>>,
+    sockets: [TcpStream; 2],
+}
+impl RelayState {
+    fn stopped(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire) || self.external_stop()
+    }
+    fn external_stop(&self) -> bool {
+        crate::runtime::stopping()
+            || self
+                .retired
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            || self
+                .half_closed
+                .lock()
+                .unwrap()
+                .is_some_and(|at| at.elapsed() >= Duration::from_secs(30))
+    }
+    fn half_close(&self) {
+        self.half_closed
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Instant::now);
+    }
+    fn progress(&self) {
+        if let Some(at) = self.half_closed.lock().unwrap().as_mut() {
+            *at = Instant::now();
+        }
+    }
+    fn abort(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        for socket in &self.sockets {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+struct RelayWriter {
+    inner: TcpStream,
+    relay: Arc<RelayState>,
+}
+impl Write for RelayWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        loop {
+            if self.relay.stopped() {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "转发已结束",
+                ));
+            }
+            match self.inner.write(bytes) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
+                result => {
+                    if result.as_ref().is_ok_and(|n| *n > 0) {
+                        self.relay.progress();
+                    }
+                    return result;
+                }
+            }
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Counts one open tunnel for as long as it exists, however it ends.
@@ -357,28 +514,26 @@ impl Drop for OpenConnection {
 struct Counted<R> {
     inner: R,
     add: fn(u64),
-    counter: Option<Arc<connections::Counters>>,
+    counter: Arc<connections::Counters>,
     outbound: Option<outbounds::Handle>,
     upload: bool,
-    retired: Option<Arc<std::sync::atomic::AtomicBool>>,
+    relay: Arc<RelayState>,
+    feedback: Option<config::Node>,
 }
 
 impl<R: Read> Read for Counted<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let count = loop {
-            if crate::runtime::stopping()
-                || self
-                    .retired
-                    .as_ref()
-                    .is_some_and(|flag| flag.load(Ordering::Acquire))
-            {
+            if self.relay.stopped() {
                 return Ok(0);
             }
             match self.inner.read(buf) {
                 Err(err)
                     if matches!(
                         err.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
                     ) =>
                 {
                     continue
@@ -388,13 +543,15 @@ impl<R: Read> Read for Counted<R> {
         };
         if count > 0 {
             (self.add)(count as u64);
-            if let Some(counters) = &self.counter {
-                let counter = if self.upload {
-                    &counters.upload
-                } else {
-                    &counters.download
-                };
-                counter.fetch_add(count as u64, Ordering::Relaxed);
+            self.relay.progress();
+            let counter = if self.upload {
+                &self.counter.upload
+            } else {
+                &self.counter.download
+            };
+            counter.fetch_add(count as u64, Ordering::Relaxed);
+            if let Some(node) = self.feedback.take() {
+                crate::group_policy::relay_result(&node, true);
             }
             if let Some(outbound) = &self.outbound {
                 if self.upload {

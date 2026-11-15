@@ -174,6 +174,25 @@ pub(crate) fn dial_result(node: &Node, network: &str, good: bool, delay: Duratio
     config::sync_chain_selections();
 }
 
+/// A compatibility core acknowledges SOCKS before dialing the remote node.
+/// Only returned payload proves that relay usable; never rank its loopback
+/// handshake latency as the node's latency.
+pub(crate) fn relay_result(node: &Node, good: bool) {
+    let mut state = state();
+    let health = state.health.entry(key(node, "tcp")).or_default();
+    health.dials.push_back(good);
+    while health.dials.len() > 32 {
+        health.dials.pop_front();
+    }
+    if good {
+        health.last_success = Some(Instant::now());
+    } else {
+        health.last_failure = Some(Instant::now());
+    }
+    // The policy worker observes this on its next tick. Do not retire a chain
+    // from its own first-payload read or while its relay state is locked.
+}
+
 pub(crate) fn select(
     group: &Group,
     nodes: &[Node],
