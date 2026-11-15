@@ -36,6 +36,8 @@ pub fn references(kind: &str, id: &str) -> Value {
                 .map(|p| json!({"scope":"pool","id":p.id,"name":p.name})),
         );
     } else if kind == "pool" {
+        refs.extend(snapshot.document.pools.iter().filter(|p| p.failover == id)
+            .map(|p| json!({"scope":"pool/failover","id":p.id,"name":p.name})));
         refs.extend(
             snapshot
                 .document
@@ -133,9 +135,13 @@ pub fn remove(body: &str) -> Result<Value, String> {
         }
         removed_pools.extend(empty.iter().cloned());
         doc.pools.retain(|p| !empty.contains(&p.id));
+        for pool in &mut doc.pools { if empty.contains(&pool.failover) { pool.failover.clear(); } }
         doc.policies.retain(|p| !empty.contains(&p.pool));
     } else {
         doc.pools.retain(|p| p.id != req.id);
+        for pool in &mut doc.pools {
+            if pool.failover == req.id { pool.failover = req.replacement.clone().unwrap_or_default(); }
+        }
         for policy in &mut doc.policies {
             if policy.pool == req.id {
                 policy.pool = req.replacement.clone().unwrap_or_default();

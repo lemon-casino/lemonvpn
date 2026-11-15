@@ -327,6 +327,16 @@ pub fn compile(document: Document) -> Result<Snapshot, String> {
         }
     }
     for pool in &document.pools {
+        let mut seen = HashSet::new();
+        let mut cursor = pool;
+        loop {
+            if !seen.insert(&cursor.id) || seen.len() > 4 {
+                return Err(format!("{}：故障回退不能成环，最多四级解析池", pool.name));
+            }
+            if cursor.failover.is_empty() { break; }
+            cursor = document.pools.iter().find(|p| p.id == cursor.failover)
+                .ok_or_else(|| format!("{}：故障回退解析池不存在", pool.name))?;
+        }
         if pool.members.is_empty()
             || pool.members.len() > 8
             || !matches!(pool.strategy.as_str(), "fallback" | "race")
@@ -394,7 +404,7 @@ pub fn compile(document: Document) -> Result<Snapshot, String> {
     let signature=crate::sha256::hex(json!({
         "sets":sets.values().map(|s|json!([s.id,s.digest,s.set.enabled,s.set.effective])).collect::<Vec<_>>(),
         "resolvers":document.resolvers.iter().map(|r|json!([r.id,r.url,r.outbound,r.bootstrap,r.tls_name,r.timeout_ms])).collect::<Vec<_>>(),
-        "pools":document.pools.iter().map(|p|json!([p.id,p.members,p.strategy])).collect::<Vec<_>>(),
+        "pools":document.pools.iter().map(|p|json!([p.id,p.members,p.strategy,p.failover])).collect::<Vec<_>>(),
         "policies":policies.iter().map(|(p,c)|json!([p.id,format!("{c:?}"),p.pool,p.address_mode])).collect::<Vec<_>>(),
         "bindings":bindings.iter().map(|(p,c)|json!([p.id,format!("{c:?}"),p.outbound])).collect::<Vec<_>>(),
         "bootstrap":document.bootstrap,"cache":document.cache,

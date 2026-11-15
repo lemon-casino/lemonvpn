@@ -320,8 +320,11 @@ fn spawn_supervisor(handle: tauri::AppHandle) {
             continue;
         }
         eprintln!("lemonvpn: 引擎无法恢复,关闭系统代理");
-        cleanup_tun_routes();
-        let port = handle.state::<Engine>().port();
+        let engine = handle.state::<Engine>();
+        if engine.owned_datapath() && !isolated_ui_smoke() {
+            cleanup_tun_routes();
+        }
+        let port = engine.port();
         if let Err(err) = proxy::disable_for(&format!("127.0.0.1:{port}")) {
             eprintln!("lemonvpn: 关闭系统代理失败: {err}");
         }

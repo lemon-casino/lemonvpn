@@ -15,6 +15,11 @@ use crate::config;
 use crate::json;
 use crate::state;
 
+#[path = "dns_bootstrap.rs"]
+mod bootstrap;
+pub(crate) fn clear_bootstrap_failures(domain: Option<&str>) -> io::Result<usize> { bootstrap::clear(domain) }
+pub(crate) fn bootstrap_statistics() -> serde_json::Value { bootstrap::statistics() }
+
 const MAX_CACHE: usize = 1024;
 const MAX_LOG: usize = 2048;
 const MAX_PAGE: usize = 500;
@@ -40,17 +45,7 @@ fn routed_exchange(query:&[u8],name:&str,kind:Option<&str>,initial:Option<&str>,
     Ok((result.wire,result.upstream))
 }
 pub(crate) fn bootstrap_resolve(host:&str)->io::Result<Vec<IpAddr>>{
-    let mut result=Vec::new();let mut last=invalid("节点/上游域名缺少可用的引导 DNS");
-    let roots=crate::rules_runtime::current().document.bootstrap.clone();
-    for kind in ["A","AAAA"]{
-        let query=encode_query(QUERY_ID.fetch_add(1,Ordering::Relaxed),host,if kind=="A"{1}else{28})?;
-        for (i,url) in roots.iter().enumerate(){
-            let resolver=crate::rules_runtime::model::Resolver{id:format!("bootstrap-{i}"),name:"引导解析".into(),url:url.clone(),..Default::default()};
-            let generation=crate::config::generation();let cache_key=format!("__bootstrap_{i}");
-            match crate::dns_wire_cache::query(&query,&cache_key,&generation,true,||crate::dns_transport::exchange(&resolver,&query).map(|wire|crate::dns_wire_cache::Packet{wire,upstream:Some(resolver.id.clone())})){Ok(reply)=>{let(_,answers)=parse_response(&reply.wire)?;result.extend(answers.into_iter().filter_map(|a|a.data.parse::<IpAddr>().ok()));break},Err(e)=>last=e}
-        }
-    }
-    if result.is_empty(){Err(last)}else{Ok(result)}
+    bootstrap::resolve(host)
 }
 
 pub const RECORD_TYPES: &[&str] = &[
@@ -185,7 +180,7 @@ pub(crate) fn start_forwarder(
     Ok((port, thread))
 }
 
-fn forward_wire(query: &[u8]) -> io::Result<Vec<u8>> {
+pub(crate) fn forward_wire(query: &[u8]) -> io::Result<Vec<u8>> {
     if query.len() < 12 || query[2] & 0x80 != 0 || query[4..6] != [0, 1] {
         return Err(invalid("DNS 查询无效"));
     }
@@ -194,6 +189,7 @@ fn forward_wire(query: &[u8]) -> io::Result<Vec<u8>> {
         return Err(invalid("DNS 查询截断"));
     }
     let kind = type_name(u16::from_be_bytes([query[end], query[end + 1]]));
+    if kind==Some("AAAA") && !crate::dns_settings::current()?.ipv6_enabled { return empty_reply(query,0); }
     let generation = config::generation();
     let routed = config::dns_route_for(&name, kind);
     let forced = routed.as_ref().map(|(upstream, _)| upstream.as_str());
@@ -281,7 +277,7 @@ pub(crate) fn reply_code(action: &str) -> Option<u8> {
         _ => None,
     }
 }
-fn empty_reply(query: &[u8], rcode: u8) -> io::Result<Vec<u8>> {
+pub(crate) fn empty_reply(query: &[u8], rcode: u8) -> io::Result<Vec<u8>> {
     let (_, end) = read_name(query, 12)?;
     if query.len() < end + 4 {
         return Err(invalid("DNS 问题截断"));
@@ -353,6 +349,7 @@ pub fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
     let families = crate::platform::managed::egress_families();
     let mut collected = Vec::new();
     for kind in ["A", "AAAA"] {
+        if kind=="AAAA" && !crate::dns_settings::current()?.ipv6_enabled { continue; }
         if families.is_some_and(|f|!f[usize::from(kind=="AAAA")]) { continue; }
         match lookup(&name, kind, None, true) {
             Ok(result) => {
@@ -982,10 +979,18 @@ pub fn delete_name(query: &str) -> Result<String, (u16, &'static str, String)> {
 pub fn flush() -> String {
     crate::dns_wire_cache::flush();
     crate::dns_transport::flush();
+    bootstrap::flush();
     let mut resolver = store();
     let deleted = resolver.cache.len();
     resolver.cache.clear();
     format!(r#"{{"matched":{deleted},"deleted":{deleted}}}"#)
+}
+pub(crate) fn flush_all() -> io::Result<String> {
+    let removed = flush();
+    // Rust caches have already been cleared if one of the managed cores fails.
+    // Report partial failure so the UI never claims an all-layer success.
+    crate::compat::flush_tun_dns().map_err(|e|io::Error::other(format!("Rust 缓存已清理；内核 DNS 缓存清理失败：{e}")))?;
+    Ok(removed)
 }
 
 pub(crate) fn apply_runtime_limits() {

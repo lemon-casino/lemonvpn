@@ -123,12 +123,7 @@ fn handle_inner(
     let port = u16::from_be_bytes(port_bytes);
 
     if request[1] == 3 {
-        // LAN sharing currently exposes TCP only; never advertise a loopback
-        // UDP relay address to a remote device or bypass the target ACL.
-        if lan {
-            return reply(&mut client, REP_COMMAND_NOT_SUPPORTED);
-        }
-        return udp_associate(client, process, bridged);
+        return udp_associate(client, process, bridged, lan, port, stop);
     }
 
     let peer = client.peer_addr().ok();
@@ -176,6 +171,12 @@ struct UdpFlow {
     meter: crate::outbounds::Meter,
     _flow: crate::flows::Guard,
 }
+enum AssociationSocket { Local(UdpSocket), Lan(crate::lan_udp::Association) }
+impl AssociationSocket {
+    fn local_addr(&self)->io::Result<SocketAddr>{match self{Self::Local(s)=>s.local_addr(),Self::Lan(s)=>s.local_addr()}}
+    fn recv_from(&self,b:&mut[u8])->io::Result<(usize,SocketAddr)>{match self{Self::Local(s)=>s.recv_from(b),Self::Lan(s)=>s.recv_from(b)}}
+    fn send_to(&self,b:&[u8],to:SocketAddr)->io::Result<usize>{match self{Self::Local(s)=>s.send_to(b,to),Self::Lan(s)=>s.send_to(b,to)}}
+}
 impl Drop for UdpFlow {
     fn drop(&mut self) {
         crate::state::connection_closed();
@@ -186,22 +187,26 @@ fn udp_associate(
     mut client: TcpStream,
     process: Option<crate::platform::process::ProcessInfo>,
     bridged: bool,
+    lan: bool,
+    requested_port: u16,
+    stop: Option<&std::sync::atomic::AtomicBool>,
 ) -> io::Result<()> {
     if !crate::compat::available() {
         return reply(&mut client, REP_COMMAND_NOT_SUPPORTED);
     }
     let peer = client.peer_addr()?;
-    let socket = UdpSocket::bind("127.0.0.1:0")?;
-    let address = socket.local_addr()?;
+    let socket = if lan { AssociationSocket::Lan(crate::lan_udp::Association::open(SocketAddr::new(peer.ip(),requested_port))?) }
+        else { let s=UdpSocket::bind("127.0.0.1:0")?;s.set_nonblocking(true)?;AssociationSocket::Local(s) };
+    let mut address = socket.local_addr()?;
+    if address.ip().is_unspecified() { address.set_ip(client.local_addr()?.ip()); }
     let mut response = vec![5, 0, 0];
     crate::compat::write_address(&mut response, &address.ip().to_string(), address.port())?;
     client.write_all(&response)?;
     client.set_nonblocking(true)?;
-    socket.set_nonblocking(true)?;
     let mut recipient: Option<SocketAddr> = None;
     let mut flows: HashMap<(String, u16), UdpFlow> = HashMap::new();
     let mut bytes = vec![0; 65535];
-    while !crate::runtime::stopping() && !crate::control::suspended() {
+    while !crate::runtime::stopping() && !crate::control::suspended() && !stop.is_some_and(|s|s.load(std::sync::atomic::Ordering::SeqCst)) {
         let mut peek = [0];
         match client.peek(&mut peek) {
             Ok(0) => break,
@@ -247,7 +252,10 @@ fn udp_associate(
                     flows::blocked_udp(from, &host, port, &decision);
                     continue;
                 }
-                let relay = match crate::compat::Datagram::open(&decision, &host, port) {
+                let target = if lan {
+                    match crate::proxy::lan_datagram_target(&decision, &host) { Ok(host)=>host, Err(_)=>continue }
+                } else { host.clone() };
+                let relay = match crate::compat::Datagram::open(&decision, &target, port) {
                     Ok(r) => r,
                     Err(_) => {
                         crate::outbounds::record_error(&decision);

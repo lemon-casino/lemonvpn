@@ -17,12 +17,18 @@ use std::{
 trait Wire: Read + Write + Send {}
 impl<T: Read + Write + Send> Wire for T {}
 struct Idle {
+    decision: Option<crate::config::Decision>,
     wire: Box<dyn Wire>,
     socket: TcpStream,
     at: Instant,
 }
 #[derive(Default)]
 struct Stat {
+    name: String,
+    server: String,
+    outbound: String,
+    error_domain: Option<String>,
+    error_type: Option<String>,
     queries: u64,
     failures: u64,
     samples: Vec<u64>,
@@ -132,8 +138,13 @@ pub fn route_key(pool: &str) -> String {
     let Some(pool) = snapshot.document.pools.iter().find(|p| p.id == pool) else {
         return "legacy".into();
     };
-    let targets = pool
-        .members
+    let mut ids = pool.members.clone();
+    let mut cursor = pool;
+    for _ in 0..3 {
+        let Some(next) = snapshot.document.pools.iter().find(|p| p.id == cursor.failover) else { break; };
+        ids.extend(next.members.iter().cloned()); cursor = next;
+    }
+    let targets = ids
         .iter()
         .filter_map(|id| snapshot.document.resolvers.iter().find(|r| &r.id == id))
         .map(|resolver| {
@@ -185,23 +196,30 @@ pub fn statistics() -> Value {
     let stats = STATS.get_or_init(Default::default).lock().unwrap();
     json!({"scope":"Rust upstream exchanges","endpoints":stats.iter().map(|(id,s)|{
         let mut samples=s.samples.clone();samples.sort_unstable();let quantile=|p:usize|samples.get(samples.len().saturating_sub(1)*p/100).copied();
-        json!({"id":id,"queries":s.queries,"failures":s.failures,"p50_ms":quantile(50),"p95_ms":quantile(95),"last_error":s.error})
+        json!({"id":id,"name":s.name,"server":s.server,"outbound":s.outbound,"queries":s.queries,"failures":s.failures,"p50_ms":quantile(50),"p95_ms":quantile(95),"last_error":s.error,"last_error_domain":s.error_domain,"last_error_type":s.error_type})
     }).collect::<Vec<_>>()})
 }
 pub fn exchange_pool(id: &str, query: &[u8]) -> io::Result<Vec<u8>> {
     let snapshot = crate::rules_runtime::current();
-    let pool = snapshot
-        .document
-        .pools
-        .iter()
-        .find(|p| p.id == id)
-        .ok_or_else(|| invalid("解析池不存在"))?;
+    let mut id = id;
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        if !visited.insert(id) || visited.len() > 4 { return Err(invalid("DNS 故障回退循环")); }
+        let pool = snapshot.document.pools.iter().find(|p| p.id == id)
+            .ok_or_else(|| invalid("解析池不存在"))?;
+        match exchange_pool_once(pool, &snapshot.document, query) {
+            Ok(reply) => return Ok(reply),
+            Err(error) if pool.failover.is_empty() => return Err(error),
+            Err(_) => id = &pool.failover,
+        }
+    }
+}
+fn exchange_pool_once(pool: &crate::rules_runtime::model::Pool, document: &crate::rules_runtime::model::Document, query: &[u8]) -> io::Result<Vec<u8>> {
     let members = pool
         .members
         .iter()
         .filter_map(|id| {
-            snapshot
-                .document
+            document
                 .resolvers
                 .iter()
                 .find(|r| &r.id == id)
@@ -211,8 +229,8 @@ pub fn exchange_pool(id: &str, query: &[u8]) -> io::Result<Vec<u8>> {
     let mut last = invalid("没有可用 DNS 上游");
     if pool.strategy == "race" {
         let (tx, rx) = std::sync::mpsc::channel();
-        let count = members.len().min(2);
-        for resolver in members.iter().take(2) {
+        let count = members.len().min(8);
+        for resolver in members.iter().take(8) {
             let tx = tx.clone();
             let query = query.to_vec();
             let mut resolver = resolver.clone();
@@ -253,12 +271,38 @@ pub fn exchange_pool(id: &str, query: &[u8]) -> io::Result<Vec<u8>> {
 }
 pub fn exchange(resolver: &Resolver, query: &[u8]) -> io::Result<Vec<u8>> {
     let started = Instant::now();
-    let result = with_bootstrap(|| once(resolver, query)).map_err(|error| {
+    let question = crate::dns::read_name(query,12).ok().and_then(|(name,end)| {
+        let kind=u16::from_be_bytes(query.get(end..end+2)?.try_into().ok()?);
+        Some((name.trim_end_matches('.').to_owned(),match kind {1=>"A".into(),28=>"AAAA".into(),_=>format!("TYPE{kind}")}))
+    });
+    // Keep URL queries/paths out of diagnostics: custom DoH URLs can contain tokens.
+    let server=endpoint(resolver).map(|(url,_,port)|format!("{}://{}:{port}",url.scheme(),url.host().unwrap())).unwrap_or_default();
+    let result = with_bootstrap(|| {
+        let first = once(resolver, query);
+        // A failed encrypted proxy path already feeds back its chosen node.
+        // Allow one fresh selection within the original endpoint time budget.
+        let retryable = first.as_ref().err().is_some_and(|e| matches!(e.kind(),
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset |
+            io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe |
+            io::ErrorKind::NotConnected));
+        let left = resolver.timeout_ms.saturating_sub(started.elapsed().as_millis() as u64);
+        if retryable && resolver.outbound != "direct" && left >= 250 {
+            let mut next = resolver.clone(); next.timeout_ms = left;
+            once(&next, query)
+        } else { first }
+    }).and_then(|reply| {
+        if reply.get(3).is_some_and(|flags|!matches!(flags&15,0|3)) {
+            let code=reply[3]&15;
+            let label=match code {1=>"FORMERR",2=>"SERVFAIL",4=>"NOTIMP",5=>"REFUSED",_=>"DNS_ERROR"};
+            return Err(invalid(format!("DNS 返回 {label}（RCODE {code}）")));
+        }
+        Ok(reply)
+    }).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!(
-                "DNS 上游“{}”经出站“{}”查询失败：{error}",
-                resolver.name, resolver.outbound
+                "{} {}：{}（{}，{}）查询失败：{error}",
+                question.as_ref().map_or("未知域名",|q|q.0.as_str()),question.as_ref().map_or("",|q|q.1.as_str()),resolver.name,server,resolver.outbound
             ),
         )
     });
@@ -267,12 +311,19 @@ pub fn exchange(resolver: &Resolver, query: &[u8]) -> io::Result<Vec<u8>> {
         all.pop_first();
     }
     let stats = all.entry(resolver.id.clone()).or_default();
+    stats.name = resolver.name.clone();
+    stats.server = server;
+    stats.outbound = resolver.outbound.clone();
     stats.queries += 1;
     if let Err(e) = &result {
         stats.failures += 1;
         stats.error = Some(e.to_string());
+        stats.error_domain=question.as_ref().map(|q|q.0.clone());
+        stats.error_type=question.as_ref().map(|q|q.1.clone());
     } else {
         stats.error = None;
+        stats.error_domain=None;
+        stats.error_type=None;
         stats.samples.push(started.elapsed().as_millis() as u64);
         if stats.samples.len() > 256 {
             stats.samples.remove(0);
@@ -292,26 +343,28 @@ fn addresses(resolver: &Resolver, host: &str, port: u16) -> io::Result<Vec<Socke
     } else {
         crate::dns::bootstrap_resolve(host)?
     };
+    let ipv6=crate::dns_settings::current()?.ipv6_enabled;
     Ok(ips
         .into_iter()
+        .filter(|ip| ip.is_ipv4() || ip.is_loopback() || ipv6)
         .map(|ip| SocketAddr::new(ip, port))
         .collect())
 }
-fn connect(resolver: &Resolver, host: &str, port: u16) -> io::Result<TcpStream> {
+fn connect(resolver: &Resolver, host: &str, port: u16) -> io::Result<(TcpStream, Option<crate::config::Decision>)> {
     let mut last = invalid("DNS 服务器无可用地址");
     let timeout = Duration::from_millis(resolver.timeout_ms);
     for address in addresses(resolver, host, port)? {
         let result = if resolver.outbound == "direct" {
-            crate::platform::current().connect_tcp(address, timeout)
+            crate::platform::current().connect_tcp(address, timeout).map(|socket| (socket, None))
         } else {
-            crate::config::connect_outbound(&resolver.outbound, &address.ip().to_string(), port)
+            crate::config::connect_outbound_tracked(&resolver.outbound, &address.ip().to_string(), port).map(|(socket, decision)| (socket, Some(decision)))
         };
         match result {
-            Ok(socket) => {
+            Ok((socket, decision)) => {
                 socket.set_read_timeout(Some(timeout))?;
                 socket.set_write_timeout(Some(timeout))?;
                 socket.set_nodelay(true)?;
-                return Ok(socket);
+                return Ok((socket, decision));
             }
             Err(e) => last = e,
         }
@@ -412,10 +465,10 @@ fn once_retry(resolver: &Resolver, query: &[u8], retry: bool) -> io::Result<Vec<
             list.pop()
         });
     let reused = cached.is_some();
-    let (mut wire, socket) = if let Some(idle) = cached {
-        (idle.wire, idle.socket)
+    let (mut wire, socket, decision) = if let Some(idle) = cached {
+        (idle.wire, idle.socket, idle.decision)
     } else {
-        let socket = connect(resolver, &host, port)?;
+        let (socket, decision) = connect(resolver, &host, port)?;
         let monitor = socket.try_clone()?;
         let wire = if matches!(url.scheme(), "https" | "tls") {
             let name = if resolver.tls_name.is_empty() {
@@ -432,7 +485,7 @@ fn once_retry(resolver: &Resolver, query: &[u8], retry: bool) -> io::Result<Vec<
         } else {
             Box::new(socket) as Box<dyn Wire>
         };
-        (wire, monitor)
+        (wire, monitor, decision)
     };
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     LIVE.get_or_init(Default::default)
@@ -491,7 +544,10 @@ fn once_retry(resolver: &Resolver, query: &[u8], retry: bool) -> io::Result<Vec<
             drop(_active);
             return once_retry(resolver, query, false);
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            if let Some(decision) = &decision { crate::config::infrastructure_failure(decision, &e); }
+            return Err(e);
+        },
     };
     if reusable && epoch == self::epoch() && generation == crate::config::generation() {
         let mut pool = POOL.get().unwrap().lock().unwrap();
@@ -501,6 +557,7 @@ fn once_retry(resolver: &Resolver, query: &[u8], retry: bool) -> io::Result<Vec<
         let list = pool.entry(key).or_default();
         if list.len() < 4 {
             list.push(Idle {
+                decision,
                 wire,
                 socket,
                 at: Instant::now(),

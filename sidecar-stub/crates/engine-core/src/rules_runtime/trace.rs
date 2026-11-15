@@ -89,18 +89,7 @@ pub fn run(body: &str) -> Result<Value, String> {
     }
     let provider_matches=snapshot.sets.values().map(|set|json!({"id":set.id,"sha256":set.digest,"known":set.set.known(&input),"matched":set.set.matches(&input),"count":set.set.entries.len()})).collect::<Vec<_>>();
     let settings = crate::dns_settings::current().map_err(|e| e.to_string())?;
-    let excluded = settings.filters.iter().any(|pattern| {
-        if pattern == "*" {
-            return true;
-        }
-        if let Some(suffix) = pattern.strip_prefix("+.") {
-            return host == suffix || host.ends_with(&format!(".{suffix}"));
-        }
-        if let Some(suffix) = pattern.strip_prefix("*.") {
-            return host.ends_with(&format!(".{suffix}"));
-        }
-        host == *pattern
-    });
+    let excluded = settings.filters.iter().any(|pattern| crate::platform::dns_settings::filter_matches(pattern, &host));
     let address_mode = if settings.mode == "redir-host" || excluded {
         "real-ip"
     } else {

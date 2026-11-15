@@ -11,10 +11,17 @@ pub struct DnsSettings {
     pub ipv6_range: String,
     pub filters: Vec<String>,
     pub store_fake_ip: bool,
+    #[serde(default = "enabled")]
+    pub ipv6_enabled: bool,
+    #[serde(default)]
+    pub sniff_enabled: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub address_rules: Vec<AddressRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain_sets: Vec<DomainSet>,
+}
+fn enabled() -> bool {
+    true
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +43,8 @@ impl Default for DnsSettings {
             ipv6_range: "fc00::/18".into(),
             filters: Vec::new(),
             store_fake_ip: false,
+            ipv6_enabled: true,
+            sniff_enabled: false,
             address_rules: Vec::new(),
             domain_sets: Vec::new(),
         }
@@ -59,25 +68,25 @@ impl DnsSettings {
         for pattern in self.filters {
             let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
             let host = pattern
-                .strip_prefix("*.")
-                .or_else(|| pattern.strip_prefix("+."))
+                .strip_prefix("+.")
+                .or_else(|| pattern.strip_prefix('.'))
                 .unwrap_or(&pattern);
-            if pattern != "*"
-                && (host.is_empty()
-                    || host.len() > 253
-                    || !host.is_ascii()
-                    || host.split('.').any(|label| {
-                        label.is_empty()
+            if host.is_empty()
+                || host.len() > 253
+                || !host.is_ascii()
+                || host.split('.').any(|label| {
+                    label != "*"
+                        && (label.is_empty()
                             || label.len() > 63
                             || label.starts_with('-')
                             || label.ends_with('-')
                             || !label
                                 .bytes()
-                                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                    }))
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+                })
             {
                 return Err(io::Error::other(format!(
-                    "无效排除域名：{pattern}（支持 *.example.com、+.example.com）"
+                    "无效排除域名：{pattern}（* 匹配一级，+. 包含所有子域）"
                 )));
             }
             if !filters.contains(&pattern) {
@@ -141,6 +150,19 @@ impl DnsSettings {
         }
     }
     pub fn apply(&self, config: &mut Value) {
+        config["ipv6"] = json!(self.ipv6_enabled);
+        config["dns"]["ipv6"] = json!(self.ipv6_enabled);
+        config["tun"]["inet6-address"] = if self.ipv6_enabled {
+            json!(["fdfe:dcba:9876::1/126"])
+        } else {
+            json!([])
+        };
+        config["tun"]["route-address"] = if self.ipv6_enabled {
+            json!(["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"])
+        } else {
+            json!(["0.0.0.0/1", "128.0.0.0/1"])
+        };
+        config["sniffer"] = json!({"enable":self.sniff_enabled,"parse-pure-ip":true,"override-destination":true,"skip-domain":["Mijia Cloud","+.push.apple.com"],"sniff":{"HTTP":{"ports":[80,"8080-8880"]},"TLS":{"ports":[443,8443]},"QUIC":{"ports":[443,8443]}}});
         config["dns"]["enhanced-mode"] = json!(self.mode);
         config["dns"]["fake-ip-range"] = json!(self.ipv4_range);
         config["dns"]["fake-ip-range6"] = json!(self.ipv6_range);
@@ -151,12 +173,10 @@ impl DnsSettings {
         if !self.address_rules.is_empty() {
             let mut rules = Vec::new();
             for pattern in &self.filters {
-                if pattern == "*" {
-                    rules.push("MATCH,real-ip".to_string());
-                } else if let Some(suffix) = pattern.strip_prefix("+.") {
+                if let Some(suffix) = pattern.strip_prefix("+.") {
                     rules.push(format!("DOMAIN-SUFFIX,{suffix},real-ip"));
-                } else if pattern.starts_with("*.") {
-                    rules.push(format!("DOMAIN-WILDCARD,{pattern},real-ip"));
+                } else if pattern.contains('*') || pattern.starts_with('.') {
+                    rules.push(format!("DOMAIN-REGEX,{},real-ip", filter_regex(pattern)));
                 } else {
                     rules.push(format!("DOMAIN,{pattern},real-ip"));
                 }
@@ -173,12 +193,50 @@ impl DnsSettings {
         }
     }
     pub fn version(&self) -> u64 {
-        if self.address_rules.is_empty() {
-            1
-        } else {
-            2
-        }
+        3
     }
+}
+/// Match the same label wildcards as Mihomo's DNS domain trie, without regex
+/// compilation or a backtracking matcher on the query path.
+pub fn filter_matches(pattern: &str, host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let suffix = pattern
+        .strip_prefix("+.")
+        .or_else(|| pattern.strip_prefix('.'));
+    let value = suffix.unwrap_or(pattern);
+    let labels: Vec<_> = value.split('.').collect();
+    let names: Vec<_> = host.split('.').collect();
+    if names.len() < labels.len()
+        || (suffix.is_none() && names.len() != labels.len())
+        || (pattern.starts_with('.') && names.len() == labels.len())
+    {
+        return false;
+    }
+    labels
+        .iter()
+        .zip(&names[names.len() - labels.len()..])
+        .all(|(a, b)| *a == "*" || a == b)
+}
+fn filter_regex(pattern: &str) -> String {
+    let (prefix, value) = if let Some(s) = pattern.strip_prefix("+.") {
+        ("(?:[^.]+\\.)*", s)
+    } else if let Some(s) = pattern.strip_prefix('.') {
+        ("(?:[^.]+\\.)+", s)
+    } else {
+        ("", pattern)
+    };
+    let labels = value
+        .split('.')
+        .map(|s| {
+            if s == "*" {
+                "[^.]+".to_owned()
+            } else {
+                s.replace('-', "\\-")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\\.");
+    format!("^{prefix}{labels}$")
 }
 fn validate_range(text: &str, ipv6: bool) -> io::Result<String> {
     let error = || {
@@ -229,12 +287,8 @@ pub fn hot_apply(
 ) -> io::Result<()> {
     let reset = ["enhanced-mode", "fake-ip-range", "fake-ip-range6"]
         .iter()
-        .any(|key| old["dns"][key] != next["dns"][key])
-        || old["profile"]["store-fake-ip"] != next["profile"]["store-fake-ip"];
+        .any(|key| old["dns"][key] != next["dns"][key]);
     let result: io::Result<()> = (|| {
-        if reset {
-            process.request("POST", "/cache/fakeip/flush", None)?;
-        }
         process.configure(next.clone())?;
         if reset {
             process.request("POST", "/cache/fakeip/flush", None)?;

@@ -9,20 +9,62 @@ on:
         description: Existing version tag to build (v0.1.41)
         required: true
         type: string
+      run_smoke:
+        description: Explicitly run the proxy smoke test on the CI runner
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: docker-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
+  prepare:
+    name: Validate immutable version tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      sha: ${{ steps.meta.outputs.sha }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      doona_revision: ${{ steps.meta.outputs.doona_revision }}
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Validate tag, commit and pinned dependencies
+        id: meta
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          RELEASE_SHA: ''
+        run: node app/scripts/release.mjs prepare
+      - name: Resolve image name
+        id: image
+        run: |
+          set -euo pipefail
+          image="$(printf 'ghcr.io/%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.arch }}
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -30,31 +72,14 @@ jobs:
           - arch: amd64
             platform: linux/amd64
             runner: ubuntu-24.04
-          # GitHub-hosted arm64 runner. On a repository without ARM runners,
-          # switch this leg to ubuntu-24.04 with QEMU (much slower).
           - arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
-
-      - name: Resolve build inputs
-        id: meta
-        run: |
-          set -euo pipefail
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
-          version="${tag#v}"
-          revision="$(sed -n 's/^DOONA_DESKTOP_REVISION=//p' pins.env | tr -d '\r')"
-          image="$(printf '%s' 'ghcr.io/${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          test -n "$revision" || { echo "missing DOONA_DESKTOP_REVISION in pins.env" >&2; exit 1; }
-          {
-            echo "version=$version"
-            echo "revision=$revision"
-            echo "image=$image"
-          } >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -72,51 +97,67 @@ jobs:
           file: docker/Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-${{ matrix.arch }}
+          tags: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
           build-args: |
-            DOONA_REVISION=${{ steps.meta.outputs.revision }}
-            LEMONVPN_VERSION=${{ steps.meta.outputs.version }}
+            DOONA_REVISION=${{ needs.prepare.outputs.doona_revision }}
+            LEMONVPN_VERSION=${{ needs.prepare.outputs.version }}
             NPM_REGISTRY=https://registry.npmjs.org
           labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.sha }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
-          # Keep the per-arch manifest unencumbered so it can be merged below.
           provenance: false
           sbom: false
 
-      - name: Smoke test proxy mode (amd64)
-        if: matrix.arch == 'amd64'
+      - name: Smoke test proxy mode (explicit opt-in only)
+        if: github.event_name == 'workflow_dispatch' && inputs.run_smoke && matrix.arch == 'amd64'
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          docker pull "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-amd64"
-          ./docker/smoke.sh "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-amd64"
+          docker pull "$IMAGE@$DIGEST"
+          ./docker/smoke.sh "$IMAGE@$DIGEST"
 
-      - name: Record digest
+      - name: Record immutable digest
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          BUILD_ARCH: ${{ matrix.arch }}
         run: |
-          printf '%s' '${{ steps.build.outputs.digest }}' > "digest-${{ matrix.arch }}.txt"
+          set -euo pipefail
+          [[ "$BUILD_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          printf '%s' "$BUILD_DIGEST" > "digest-$BUILD_ARCH.txt"
 
       - uses: actions/upload-artifact@v4
         with:
           name: digest-${{ matrix.arch }}
           path: digest-${{ matrix.arch }}.txt
+          if-no-files-found: error
 
   merge:
-    name: Merge multi-arch manifest
-    needs: build
+    name: Publish version manifest
+    needs: [prepare, build]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - name: Resolve tags
-        id: meta
-        run: |
-          set -euo pipefail
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
-          version="${tag#v}"
-          image="$(printf '%s' 'ghcr.io/${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          {
-            echo "version=$version"
-            echo "image=$image"
-          } >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Publication tooling comes from this workflow; image sources are pinned above.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Verify tag still points to the build commit
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node app/scripts/docker-release.mjs verify
 
       - uses: actions/download-artifact@v4
         with:
@@ -132,16 +173,63 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create version and latest manifests
+      - name: Create version manifest from both architectures
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          image="${{ steps.meta.outputs.image }}"
-          version="${{ steps.meta.outputs.version }}"
           amd64="$(cat digests/digest-amd64.txt)"
           arm64="$(cat digests/digest-arm64.txt)"
-          docker buildx imagetools create \
-            -t "$image:$version" \
-            -t "$image:latest" \
-            "$image@$amd64" \
-            "$image@$arm64"
-          docker buildx imagetools inspect "$image:$version"
+          [[ "$amd64" =~ ^sha256:[a-f0-9]{64}$ && "$arm64" =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker buildx imagetools create -t "$IMAGE:$VERSION" "$IMAGE@$amd64" "$IMAGE@$arm64"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+
+  latest:
+    name: Update latest stable version
+    needs: [prepare, merge]
+    if: needs.prepare.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Only the moving alias is serialized. Version publications must never
+    # cancel one another when several release tags finish close together.
+    concurrency:
+      group: docker-latest-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Publication tooling comes from this workflow; image sources are pinned above.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Keep latest on the highest stable version tag
+        id: gate
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node app/scripts/docker-release.mjs latest
+      - uses: docker/setup-buildx-action@v3
+        if: steps.gate.outputs.latest == 'true'
+      - uses: docker/login-action@v3
+        if: steps.gate.outputs.latest == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Update latest alias
+        if: steps.gate.outputs.latest == 'true'
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE:$VERSION"
+          docker buildx imagetools inspect "$IMAGE:latest"

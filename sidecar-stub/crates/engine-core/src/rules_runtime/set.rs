@@ -89,6 +89,10 @@ pub struct CompiledSet {
     pub projection: Vec<String>,
 }
 impl CompiledSet {
+    pub(crate) fn needs_resolution(&self,input:&RoutingInput<'_>)->bool {
+        self.enabled && !self.matches(input) && ((!self.v4.is_empty() || !self.v6.is_empty()) || self.rest.iter().any(|c|crate::config::condition_needs_resolution(c,input)))
+    }
+
     pub(crate) fn collect_geo_codes(
         &self,
         codes: &mut std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
@@ -290,6 +294,9 @@ fn domain(text: &str) -> Result<(Condition, String), String> {
 pub fn classical(text: &str, depth: usize) -> Result<Condition, String> {
     if depth > 16 {
         return Err("规则组合嵌套超过 16 层".into());
+    }
+    if let Some(inner)=text.strip_suffix(",no-resolve") {
+        return Ok(Condition::NoResolve(Box::new(classical(inner,depth+1)?)));
     }
     let (kind, payload) = text.split_once(',').ok_or("classical 条目缺少条件值")?;
     let payload = payload

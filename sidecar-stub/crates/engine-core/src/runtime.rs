@@ -125,6 +125,7 @@ impl Engine {
             "Engine listener bound on loopback.",
             Some(logs::fields(&[("address", &address.to_string())])),
         );
+        crate::dns_server::start();
         Ok(Self {
             address,
             shutdown,
@@ -168,6 +169,7 @@ impl Engine {
         STOPPING.store(true, Ordering::SeqCst);
         self.shutdown.cancel();
         crate::lan::shutdown();
+        crate::dns_server::shutdown();
         crate::connections::close_all();
         let result = tun::disable();
         crate::compat::shutdown();

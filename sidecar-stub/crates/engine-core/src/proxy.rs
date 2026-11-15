@@ -169,6 +169,21 @@ pub(crate) fn connect_inbound(
     connect(decision, host, port)
 }
 
+pub(crate) fn lan_datagram_target(decision: &config::Decision, host: &str) -> io::Result<String> {
+    let permitted = |ip: IpAddr| match ip {
+        IpAddr::V4(v) => !v.is_private() && !v.is_loopback() && !v.is_link_local() && !v.is_multicast() && !v.is_broadcast() && v.octets()[0] != 0 && v.octets()[0] < 224,
+        IpAddr::V6(v) => !v.is_unspecified() && !v.is_loopback() && !v.is_multicast() && !v.is_unique_local() && !v.is_unicast_link_local() && v.to_ipv4_mapped().is_none(),
+    };
+    if let Ok(ip)=host.parse::<IpAddr>() {
+        return permitted(ip).then(||host.to_owned()).ok_or_else(||io::Error::new(io::ErrorKind::PermissionDenied,"局域网共享仅代理公网目标"));
+    }
+    if matches!(decision.target, config::Target::Direct) {
+        return crate::dns::resolve(host)?.into_iter().find(|ip|permitted(*ip)).map(|ip|ip.to_string())
+            .ok_or_else(||io::Error::new(io::ErrorKind::PermissionDenied,"局域网共享仅代理公网目标"));
+    }
+    Ok(host.to_owned())
+}
+
 pub fn connect(decision: &config::Decision, host: &str, port: u16) -> io::Result<TcpStream> {
     let started = Instant::now();
     let result = match &decision.target {

@@ -87,12 +87,30 @@ pub fn handle(
             return match crate::rules_runtime::trace::run(&body){Ok(value)=>http::respond_with(&mut client,200,&value.to_string(),&format!("{CACHE_HEADERS}{cors}")),Err(e)=>error(&mut client,422,"dns_trace_failed",&e,cors)};
         }
         ("GET", "/api/v1/dns/statistics") => {
-            let value=serde_json::json!({"cache":crate::dns_wire_cache::statistics(),"transport":crate::dns_transport::statistics()});
+            let value=serde_json::json!({"cache":crate::dns_wire_cache::statistics(),"transport":crate::dns_transport::statistics(),"bootstrap":crate::dns::bootstrap_statistics()});
             return http::respond_with(&mut client,200,&value.to_string(),&format!("{CACHE_HEADERS}{cors}"));
+        }
+        ("DELETE", "/api/v1/dns/bootstrap/failures") => {
+            let request:serde_json::Value=match serde_json::from_str(&body){Ok(v)=>v,Err(_)=>return error(&mut client,400,"invalid_request","请求须为 JSON",cors)};
+            if !request.is_object() || request.get("domain").is_some_and(|v|!v.is_null() && !v.is_string()) { return error(&mut client,422,"invalid_request","domain 须为域名或 null",cors); }
+            return match crate::dns::clear_bootstrap_failures(request["domain"].as_str()) {
+                Ok(removed)=>http::respond_with(&mut client,200,&serde_json::json!({"removed":removed}).to_string(),&format!("{CACHE_HEADERS}{cors}")),
+                Err(e)=>error(&mut client,422,"invalid_domain",&e.to_string(),cors),
+            };
+        }
+        ("POST", "/api/v1/dns/bootstrap/retry") => {
+            let request:serde_json::Value=match serde_json::from_str(&body){Ok(v)=>v,Err(_)=>return error(&mut client,400,"invalid_request","请求须为 JSON",cors)};
+            let Some(domain)=request["domain"].as_str() else { return error(&mut client,422,"invalid_domain","需要填写域名",cors); };
+            if let Err(e)=crate::dns::clear_bootstrap_failures(Some(domain)) { return error(&mut client,422,"invalid_domain",&e.to_string(),cors); }
+            crate::dns_wire_cache::remove_name(domain);
+            return match crate::dns::bootstrap_resolve(domain) {
+                Ok(addresses)=>http::respond_with(&mut client,200,&serde_json::json!({"domain":domain,"addresses":addresses}).to_string(),&format!("{CACHE_HEADERS}{cors}")),
+                Err(e)=>error(&mut client,503,"bootstrap_resolution_failed",&e.to_string(),cors),
+            };
         }
         ("DELETE", "/api/v1/dns/wire-cache") => {
             let request:serde_json::Value=serde_json::from_str(&body).unwrap_or_default();
-            let removed=if let Some(name)=request["domain"].as_str(){crate::dns_wire_cache::remove_name(name)}else{let count=crate::dns_wire_cache::statistics()["entries"].as_u64().unwrap_or(0) as usize;crate::dns::flush();count};
+            let removed=if let Some(name)=request["domain"].as_str(){crate::dns_wire_cache::remove_name(name)}else{let count=crate::dns_wire_cache::statistics()["entries"].as_u64().unwrap_or(0) as usize;match crate::dns::flush_all(){Ok(_)=>{},Err(e)=>return error(&mut client,503,"dns_cache_partial_failure",&e.to_string(),cors)};count};
             return http::respond_with(&mut client,200,&serde_json::json!({"removed":removed}).to_string(),&format!("{CACHE_HEADERS}{cors}"));
         }
         ("POST", "/api/v1/dns/wire-cache/fakeip/flush") => {
@@ -125,6 +143,12 @@ pub fn handle(
                 Ok(body) => http::respond_with(&mut client,200,&body,&format!("{CACHE_HEADERS}{cors}")),
                 Err(e) => error(&mut client,500,"dns_settings_read_failed",&e.to_string(),cors),
             };
+        }
+        ("GET", "/api/v1/dns/listener") => {
+            return match crate::dns_server::status_json(){Ok(body)=>http::respond_with(&mut client,200,&body,&format!("{CACHE_HEADERS}{cors}")),Err(e)=>error(&mut client,500,"dns_listener_read_failed",&e.to_string(),cors)};
+        }
+        ("PUT", "/api/v1/dns/listener") => {
+            return match crate::dns_server::update(&body){Ok(body)=>http::respond_with(&mut client,200,&body,&format!("{CACHE_HEADERS}{cors}")),Err((status,code,message))=>error(&mut client,status,code,&message,cors)};
         }
         ("PUT", "/api/v1/dns/settings") => {
             return match crate::dns_settings::update(&body) {
@@ -363,11 +387,11 @@ pub fn handle(
         }
         ("DELETE", path) if path.starts_with("/api/v1/providers/") => {
             let id = share::percent_decode(&path["/api/v1/providers/".len()..]);
-            return match providers::delete(&id) {
+            return match config::delete_managed_provider(&id) {
                 Ok(body) => {
                     http::respond_with(&mut client, 200, &body, &format!("{CACHE_HEADERS}{cors}"))
                 }
-                Err(message) => error(&mut client, 500, "internal_error", &message, cors),
+                Err((status, code, message)) => error(&mut client, status, code, &message, cors),
             };
         }
         ("POST", "/api/v1/nodes") => {
@@ -435,12 +459,10 @@ pub fn handle(
             };
         }
         ("POST", "/api/v1/dns/cache/flush") => {
-            return http::respond_with(
-                &mut client,
-                200,
-                &dns::flush(),
-                &format!("{CACHE_HEADERS}{cors}"),
-            )
+            return match dns::flush_all() {
+                Ok(body)=>http::respond_with(&mut client,200,&body,&format!("{CACHE_HEADERS}{cors}")),
+                Err(e)=>error(&mut client,503,"dns_cache_partial_failure",&e.to_string(),cors),
+            }
         }
         ("DELETE", path) if path.starts_with("/api/v1/dns/cache/") => {
             let id = &path["/api/v1/dns/cache/".len()..];
@@ -758,7 +780,7 @@ fn version() -> String {
 
 fn capabilities() -> String {
     format!(
-        r#"{{"observed_at":"{observed}","profiles":["base"],"limits":{{"max_request_target_bytes":8192,"max_header_bytes":16384,"max_json_body_bytes":1048576}},"resources":{{"runtime":{{"available":true}},"traffic_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"desktop":{{"available":true}},"datapath":{{"available":true,"kinds":["userspace"],"details":[]}},"connections":{{"available":true,"can_close":true,"max_bulk_close":1000}},"config":{{"available":true,"writable":true,"create":true,"max_bytes":{max_bytes},"max_sources":4}},"config_validate":{{"available":true,"modes":["syntax","full"],"max_bytes":{max_bytes},"max_sources":4}},"runtime_memory":{{"available":true,"metrics":["process.rss_bytes"]}},"runtime_outbounds":{{"available":true}},"memory_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"rules":{{"available":true,"max_rules":{max_bytes}}},"flows":{{"available":true,"recording":"{flow_recording}","scopes":["userspace_tcp","userspace_udp"],"max_flows":{max_flows},"max_steps_per_flow":1,"retention_seconds":{retention},"snapshot_ttl_seconds":30,"max_page_size":1000}},"nodes":{{"available":true,"can_manage":true}},"x-rule-management":{{"available":true,"reset":true,"reorder":true}},"x-hot-apply":{hot_apply},"x-lan-sharing":{{"available":true,"hot_apply":true,"protocols":["http","socks5"],"tcp_only":true,"private_ipv4_only":true}},"x-dns-settings":{{"available":true,"hot_apply":true,"version":2}},"x-rules-runtime":{{"available":true,"version":1,"max_json_body_bytes":33554432,"formats":["yaml","text","mrs"],"dns_protocols":["udp","tcp","tls","https"],"atomic":true,"fakeip_projection":true}},"x-proxy-chain":{{"available":true,"max_hops":8,"front_groups":true,"exit_groups":true,"traffic_activity":true,"preview":true,"network_preview":false}},"x-node-management":{{"subscription_delete":true,"persistent_delete":true}},"x-group-management":{{"delete":true,"replace_references":true,"atomic":true}},"x-node-membership":{{"available":true,"atomic":true,"batch":true,"max_batch_nodes":256}},{tun},{providers},"groups":{{"available":true,"config_patch":true,"selection":true,"max_patch_operations":16}},{dns},{probes},"routing_trace":{{"available":true,"resolve_modes":["none","live"]}},"runtime_settings":{{"available":true,"fields":["record_flows","record_logs","record_dns_log","log.level","dns_log.max_records","flows.max_flows","flows.retention_seconds","geodata"]}},"geodata":{{"available":true,"assets":["geoip","geosite"],"can_update":true,"configurable_sources":true,"max_urls":4,"checksum":"sha256sum","interval_hours":{{"min":1,"max":168,"default":24}},"lifecycle":{{"file_values":"start","overrides_persist":true}}}},"dns_rules":{{"available":true,"max_rules":64}},"reload":{{"available":true}},"suspend":{{"available":true}},"resume":{{"available":true}},"events":{events},"logs":{logs}}}}}"#,
+        r#"{{"observed_at":"{observed}","profiles":["base"],"limits":{{"max_request_target_bytes":8192,"max_header_bytes":16384,"max_json_body_bytes":1048576}},"resources":{{"runtime":{{"available":true}},"traffic_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"desktop":{{"available":true}},"datapath":{{"available":true,"kinds":["userspace"],"details":[]}},"connections":{{"available":true,"can_close":true,"max_bulk_close":1000}},"config":{{"available":true,"writable":true,"create":true,"max_bytes":{max_bytes},"max_sources":4}},"config_validate":{{"available":true,"modes":["syntax","full"],"max_bytes":{max_bytes},"max_sources":4}},"runtime_memory":{{"available":true,"metrics":["process.rss_bytes"]}},"runtime_outbounds":{{"available":true}},"memory_history":{{"available":true,"max_window_seconds":{window},"max_points":{points}}},"rules":{{"available":true,"max_rules":{max_bytes}}},"flows":{{"available":true,"recording":"{flow_recording}","scopes":["userspace_tcp","userspace_udp"],"max_flows":{max_flows},"max_steps_per_flow":1,"retention_seconds":{retention},"snapshot_ttl_seconds":30,"max_page_size":1000}},"nodes":{{"available":true,"can_manage":true}},"x-rule-management":{{"available":true,"reset":true,"reorder":true}},"x-hot-apply":{hot_apply},"x-lan-sharing":{{"available":true,"hot_apply":true,"protocols":["http","socks5"],"tcp_only":false,"udp_associate":true,"private_ipv4_only":true}},"x-dns-settings":{{"available":true,"hot_apply":true,"version":3}},"x-dns-listener":{{"available":true,"hot_apply":true,"protocols":["udp","tcp"]}},"x-rules-runtime":{{"available":true,"version":1,"max_json_body_bytes":33554432,"formats":["yaml","text","mrs"],"dns_protocols":["udp","tcp","tls","https"],"atomic":true,"fakeip_projection":true}},"x-proxy-chain":{{"available":true,"max_hops":8,"front_groups":true,"exit_groups":true,"traffic_activity":true,"preview":true,"network_preview":false}},"x-node-management":{{"subscription_delete":true,"persistent_delete":true}},"x-group-management":{{"delete":true,"replace_references":true,"atomic":true}},"x-node-membership":{{"available":true,"atomic":true,"batch":true,"max_batch_nodes":256}},{tun},{providers},"groups":{{"available":true,"config_patch":true,"selection":true,"max_patch_operations":16}},{dns},{probes},"routing_trace":{{"available":true,"resolve_modes":["none","live"]}},"runtime_settings":{{"available":true,"fields":["record_flows","record_logs","record_dns_log","log.level","dns_log.max_records","flows.max_flows","flows.retention_seconds","geodata"]}},"geodata":{{"available":true,"assets":["geoip","geosite"],"can_update":true,"configurable_sources":true,"max_urls":4,"checksum":"sha256sum","interval_hours":{{"min":1,"max":168,"default":24}},"lifecycle":{{"file_values":"start","overrides_persist":true}}}},"dns_rules":{{"available":true,"max_rules":64}},"reload":{{"available":true}},"suspend":{{"available":true}},"resume":{{"available":true}},"events":{events},"logs":{logs}}}}}"#,
         hot_apply = crate::compat::hot_apply_json(),
         observed = state::iso8601(SystemTime::now()),
         window = state::WINDOW_SECONDS,

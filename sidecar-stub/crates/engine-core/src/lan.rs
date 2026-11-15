@@ -41,6 +41,8 @@ struct Settings {
     enabled: bool,
     bind_address: Ipv4Addr,
     port: u16,
+    #[serde(default)]
+    advertised_address: Option<Ipv4Addr>,
     authentication: Option<Credentials>,
 }
 impl Default for Settings {
@@ -49,12 +51,16 @@ impl Default for Settings {
             enabled: false,
             bind_address: Ipv4Addr::UNSPECIFIED,
             port: 18081,
+            advertised_address: None,
             authentication: None,
         }
     }
 }
 impl Settings {
     fn validate(&self) -> io::Result<()> {
+        if self.advertised_address.is_some_and(|ip| !ip.is_private() && !ip.is_loopback()) {
+            return Err(io::Error::other("UDP 对外地址须为局域网 IPv4 地址"));
+        }
         if self.port < 1024
             || (!self.bind_address.is_unspecified() && !self.bind_address.is_private())
         {
@@ -79,6 +85,7 @@ impl Settings {
 }
 struct Listener {
     socket: TcpListener,
+    udp: Arc<crate::lan_udp::Hub>,
     stop: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
     task: Option<JoinHandle<()>>,
@@ -97,7 +104,9 @@ impl Listener {
         socket.set_nonblocking(true)?;
         Ok(socket)
     }
-    fn start(socket: TcpListener, settings: Settings) -> io::Result<Self> {
+    fn start(socket: TcpListener, settings: Settings, previous: Option<&Self>) -> io::Result<Self> {
+        let udp = crate::lan_udp::Hub::open(socket.local_addr()?, settings.advertised_address, previous.map(|p| &p.udp))?;
+        let udp_worker=udp.clone();
         let acceptor = socket.try_clone()?;
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
@@ -114,16 +123,18 @@ impl Listener {
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
-                serve(acceptor, settings, stopped);
+                serve(acceptor, settings, stopped, udp_worker);
             })?;
         Ok(Self {
             socket,
+            udp,
             stop,
             ready,
             task: Some(task),
         })
     }
     fn activate(&self) {
+        self.udp.activate();
         self.ready.store(true, Ordering::SeqCst);
     }
 }
@@ -181,7 +192,7 @@ pub(crate) fn start() {
     let result = (|| {
         let settings = read(&mut state)?;
         if settings.enabled {
-            state.listener = Some(Listener::start(Listener::open(&settings, None)?, settings)?);
+            state.listener = Some(Listener::start(Listener::open(&settings, None)?, settings, None)?);
         }
         if let Some(listener) = &state.listener {
             listener.activate();
@@ -235,6 +246,7 @@ pub(crate) fn update(body: &str) -> Result<String, (u16, &'static str, String)> 
                         )
                     })?,
                     next.clone(),
+                    state.listener.as_ref(),
                 )
                 .map_err(|e| (503, "lan_start_failed", e.to_string()))?,
             )
@@ -261,9 +273,10 @@ pub(crate) fn update(body: &str) -> Result<String, (u16, &'static str, String)> 
     }
     status(&mut state).map_err(|e| (500, "lan_settings_read_failed", e.to_string()))
 }
-fn serve(listener: TcpListener, settings: Settings, stop: Arc<AtomicBool>) {
+fn serve(listener: TcpListener, settings: Settings, stop: Arc<AtomicBool>, udp: Arc<crate::lan_udp::Hub>) {
     let mut clients: Vec<(TcpStream, JoinHandle<()>)> = Vec::new();
     while !stop.load(Ordering::SeqCst) && !crate::runtime::stopping() {
+        udp.poll();
         match listener.accept() {
             Ok((stream, peer)) => {
                 // Binding all interfaces never permits Internet-facing peers.

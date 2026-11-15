@@ -90,6 +90,39 @@ fn handle_inner(
     if !lan && target.starts_with('/') {
         let path = path_of(&target);
         if is_api_path(path) {
+            // Only loopback authorities address this control listener. A public
+            // hostname resolving to loopback must not turn DNS rebinding into
+            // same-origin access to the unauthenticated desktop API. Docker's
+            // authenticated reverse proxy rewrites Host to its loopback upstream.
+            if !local_api_authority(&text) {
+                return respond(
+                    &mut client,
+                    403,
+                    r#"{"error":{"code":"invalid_host","message":"管理 API 仅接受本机地址"}}"#,
+                );
+            }
+            // CORS alone does not prevent a browser from sending a simple POST
+            // containing JSON as text/plain. JSON POSTs require a preflight
+            // across origins. PUT/PATCH/DELETE already require one, including
+            // bodyless DELETE calls; trusted WebViews and native callers keep
+            // their existing contract.
+            if method == "POST"
+                && cors.is_empty()
+                && !same_ui_origin(&text)
+                && header_value(&text, "Origin").is_some()
+                && !header_value(&text, "Content-Type").is_some_and(|value| {
+                    value
+                        .split(';')
+                        .next()
+                        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+                })
+            {
+                return respond(
+                    &mut client,
+                    415,
+                    r#"{"error":{"code":"unsupported_media_type","message":"浏览器写入请求须使用 application/json"}}"#,
+                );
+            }
             return api::handle(client, &method, &target, &text, &cors);
         }
     }
@@ -252,6 +285,41 @@ pub(crate) fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> 
         })
 }
 
+/// nginx overwrites this non-safelisted header with the authenticated UI's
+/// authority. It preserves bodyless same-origin operation starts, including a
+/// TLS frontend proxy, without trusting browser-supplied forwarding headers.
+fn same_ui_origin(headers: &str) -> bool {
+    match (
+        header_value(headers, "Origin"),
+        header_value(headers, "X-LemonVPN-UI-Authority"),
+    ) {
+        (Some(origin), Some(authority)) => {
+            origin == format!("http://{authority}") || origin == format!("https://{authority}")
+        }
+        _ => false,
+    }
+}
+
+fn local_api_authority(headers: &str) -> bool {
+    let Some(authority) = header_value(headers, "Host") else {
+        return false;
+    };
+    let Ok(url) = url::Url::parse(&format!("http://{authority}/")) else {
+        return false;
+    };
+    url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && match url.host() {
+            Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        }
+}
+
 /// The only cross-origin caller is the shell's own WebView, whose origin is
 /// fixed per platform. Any other origin keeps the browser's default deny.
 pub(crate) fn cors_headers(headers: &str) -> String {
@@ -321,6 +389,8 @@ pub(crate) fn respond_with(
         200 => "OK",
         202 => "Accepted",
         400 => "Bad Request",
+        403 => "Forbidden",
+        415 => "Unsupported Media Type",
         404 => "Not Found",
         405 => "Method Not Allowed",
         407 => "Proxy Authentication Required",

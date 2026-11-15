@@ -456,7 +456,7 @@ fn provider_json(provider: &Provider) -> String {
     format!(
         concat!(
             r#"{{"id":"{}","name":"{}","kind":"{}","url_redacted":{},"node_count":{},"#,
-            r#""updated_at":{},"expires_at":{},"traffic":{traffic},"status":"{}","last_error":{last_error}}}"#
+            r#""updated_at":{},"expires_at":{},"traffic":{traffic},"status":"{}","last_error":{last_error},"x-managed":true}}"#
         ),
         json::escape(&provider.name),
         json::escape(&provider.name),
@@ -473,7 +473,7 @@ fn provider_json(provider: &Provider) -> String {
                 .excluded
                 .contains(&crate::sha256::hex(node.link.as_bytes())))
             .count(),
-        timestamp(provider.updated_at),
+        timestamp(provider.updated_at.filter(|time| *time > UNIX_EPOCH)),
         timestamp(provider.expires_at),
         provider.status,
         traffic = traffic,
@@ -606,8 +606,8 @@ pub fn create(body: &str) -> Result<(String, String), (u16, &'static str, String
 
 /// Authenticated editor payload. Unlike the list, it includes the original URL.
 pub fn settings(id: &str) -> Option<String> {
-    store().iter().find(|provider|provider.name==id && provider.kind=="subscription").map(|provider|serde_json::json!({
-        "name":provider.name,"url":provider.url,"update_interval":provider.update_interval,"user_agent":provider.user_agent,"cache":provider.cache
+    store().iter().find(|provider|provider.name==id).map(|provider|serde_json::json!({
+        "name":provider.name,"url":provider.url.as_deref().unwrap_or(""),"update_interval":provider.update_interval,"user_agent":provider.user_agent,"cache":provider.cache
     }).to_string())
 }
 pub fn update(id: &str, body: &str) -> Result<String, (u16, &'static str, String)> {
@@ -624,7 +624,7 @@ pub fn update(id: &str, body: &str) -> Result<String, (u16, &'static str, String
     let mut providers = store();
     let index = providers
         .iter()
-        .position(|provider| provider.name == id && provider.kind == "subscription")
+        .position(|provider| provider.name == id)
         .ok_or_else(|| (404, "resource_not_found", "订阅不存在".to_owned()))?;
     if providers[index].refreshing {
         return Err((
@@ -660,6 +660,7 @@ pub fn update(id: &str, body: &str) -> Result<String, (u16, &'static str, String
                 )
             })?;
         next.url = Some(url.to_owned());
+        next.kind = "subscription";
     }
     if let Some(interval) = object.get("update_interval") {
         next.update_interval = interval
@@ -711,25 +712,76 @@ pub fn update(id: &str, body: &str) -> Result<String, (u16, &'static str, String
     Ok(result)
 }
 
-pub fn delete(id: &str) -> Result<String, String> {
-    let deleted = {
-        let mut store = store();
-        let previous = store.clone();
-        let before = store.len();
-        store.retain(|provider| provider.name != id);
-        let deleted = before - store.len();
-        if deleted > 0 {
-            if let Err(message) = save(&store) {
-                *store = previous;
-                return Err(message);
-            }
-        }
-        deleted
-    };
-    if deleted > 0 {
-        config::reload_providers();
+/// Delete a whole managed source under the same transaction as group cleanup.
+pub(crate) fn remove_provider_checked(
+    id: &str,
+    expected: &[config::Node],
+    existing: &[String],
+    validate: impl FnOnce(Vec<config::Node>) -> Result<(), String>,
+    commit_sources: impl FnOnce() -> Result<(), String>,
+) -> Result<usize, (u16, &'static str, String)> {
+    let mut store = store();
+    let index = store.iter().position(|p| p.name == id).ok_or_else(|| {
+        (
+            404,
+            "resource_not_found",
+            "节点来源已不存在，请刷新列表".to_owned(),
+        )
+    })?;
+    if store[index].refreshing {
+        return Err((409, "state_conflict", "订阅正在刷新，请稍后移除".to_owned()));
     }
-    Ok(format!(r#"{{"deleted":{deleted}}}"#))
+    let before = collect_nodes(&store, existing);
+    let members = before
+        .iter()
+        .filter(|n| n.provider.as_deref() == Some(id))
+        .collect::<Vec<_>>();
+    if members.len() != expected.len()
+        || members
+            .iter()
+            .zip(expected)
+            .any(|(a, b)| a.name != b.name || a.link != b.link)
+    {
+        return Err((
+            409,
+            "state_conflict",
+            "节点来源已变化，请刷新后重试".to_owned(),
+        ));
+    }
+    let previous = store.clone();
+    store.remove(index);
+    let after = collect_nodes(&store, existing);
+    // A duplicate title can acquire another ID when an earlier source is removed.
+    // Refuse that ambiguous write rather than silently redirecting references.
+    let unchanged = before
+        .iter()
+        .filter(|n| n.provider.as_deref() != Some(id))
+        .zip(&after)
+        .all(|(a, b)| a.name == b.name && a.link == b.link && a.provider == b.provider);
+    if !unchanged {
+        *store = previous;
+        return Err((
+            409,
+            "state_conflict",
+            "其他来源有同名节点，请先更名后移除".to_owned(),
+        ));
+    }
+    if let Err(message) = validate(after) {
+        *store = previous;
+        return Err((409, "state_conflict", message));
+    }
+    if let Err(message) = save(&store) {
+        *store = previous;
+        return Err((500, "internal_error", message));
+    }
+    if let Err(mut message) = commit_sources() {
+        *store = previous;
+        if let Err(error) = save(&store) {
+            message.push_str(&format!("；恢复节点来源失败：{error}"));
+        }
+        return Err((500, "source_write_failed", message));
+    }
+    Ok(1)
 }
 
 /// Queues a refresh; the fetch runs on its own thread and finishes the
@@ -928,6 +980,7 @@ pub(crate) fn remove_node_checked(
     node: &config::Node,
     existing: &[String],
     validate: impl FnOnce(Vec<config::Node>) -> Result<(), String>,
+    commit_sources: impl FnOnce() -> Result<(), String>,
 ) -> Result<usize, (u16, &'static str, String)> {
     let mut store = store();
     let previous = store.clone();
@@ -970,6 +1023,13 @@ pub(crate) fn remove_node_checked(
     if let Err(message) = save(&store) {
         *store = previous;
         return Err((500, "internal_error", message));
+    }
+    if let Err(mut message) = commit_sources() {
+        *store = previous;
+        if let Err(error) = save(&store) {
+            message.push_str(&format!("；恢复节点数据失败：{error}"));
+        }
+        return Err((500, "source_write_failed", message));
     }
     Ok(1)
 }

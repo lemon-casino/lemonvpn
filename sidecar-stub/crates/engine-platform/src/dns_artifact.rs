@@ -72,7 +72,7 @@ pub fn handle(value: &Value) -> Option<io::Result<Value>> {
                 transfer.at = Instant::now();
             }
             "dns_artifact_commit" => {
-                let transfer = state.as_mut().filter(|t| t.id == id).ok_or_else(error)?;
+                let transfer = state.as_mut().filter(|t| t.id == id && t.at.elapsed() < Duration::from_secs(120) && !t.complete).ok_or_else(error)?;
                 if transfer.bytes.len() != transfer.size || digest(&transfer.bytes) != id {
                     return Err(error());
                 }
@@ -81,6 +81,7 @@ pub fn handle(value: &Value) -> Option<io::Result<Value>> {
                         .map_err(|_| error())?
                         .validated()?;
                 transfer.complete = true;
+                transfer.at = Instant::now();
             }
             _ => return Err(error()),
         }

@@ -219,7 +219,8 @@ pub(crate) fn remove_group(body: &str) -> Result<String, SourceWriteError> {
             .ok_or_else(|| conflict("其他出站被意外删除"))?;
         let map_option = |value: &Option<String>| value.as_deref().map(&mapped).transpose();
         if old.policy != new.policy
-            || old.default != new.default
+            || map_option(&old.default)? != new.default
+            || old.members.iter().map(|v|mapped(v)).collect::<Result<Vec<_>,_>>()? != new.members
             || map_option(&old.final_outbound)? != new.final_outbound
             || map_option(&old.dialer)? != new.dialer
             || map_option(&old.landing)? != new.landing

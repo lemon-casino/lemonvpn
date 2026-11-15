@@ -13,21 +13,25 @@ services:
     ports:
       - "8080:8080"
       - "${LEMONVPN_LAN_PORT:-18081}:${LEMONVPN_LAN_PORT:-18081}"
+      - "${LEMONVPN_LAN_PORT:-18081}:${LEMONVPN_LAN_PORT:-18081}/udp"
     volumes:
       - ./data:/data
+      # Keep the privileged kernel cache separate from the uid-1000 data directory.
+      - tun-state:/var/lib/lemonvpn/Service/runtime
     environment:
       LEMONVPN_UI_USERNAME: ${LEMONVPN_UI_USERNAME:-admin}
       LEMONVPN_UI_PASSWORD: ${LEMONVPN_UI_PASSWORD:-}
       LEMONVPN_LAN_ENABLED: "1"
       LEMONVPN_LAN_BIND: "0.0.0.0"
       LEMONVPN_LAN_PORT: ${LEMONVPN_LAN_PORT:-18081}
+      LEMONVPN_LAN_ADVERTISED_ADDRESS: ${LEMONVPN_LAN_ADVERTISED_ADDRESS:-}
       LEMONVPN_LAN_USERNAME: ${LEMONVPN_LAN_USERNAME:-}
       LEMONVPN_LAN_PASSWORD: ${LEMONVPN_LAN_PASSWORD:-}
       LEMONVPN_TUN: "1"
       LEMONVPN_TUN_STRICT: "1"
       LEMONVPN_TUN_EXCLUDE_LAN: "0"
       TZ: ${TZ:-UTC}
-    stop_grace_period: 20s
+    stop_grace_period: 35s
     logging:
       driver: json-file
       options:
@@ -39,3 +43,6 @@ services:
   #   image: curlimages/curl:latest
   #   network_mode: "service:lemonvpn"
   #   depends_on: [lemonvpn]
+
+volumes:
+  tun-state:

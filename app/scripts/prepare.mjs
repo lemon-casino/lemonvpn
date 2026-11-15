@@ -23,6 +23,7 @@ import {prepareBranding} from './prepare-branding.mjs';
 import {prepareProxyHealth} from './prepare-proxy-health.mjs';
 import {prepareRulesDns, rulesDnsApplied} from './prepare-rules-dns.mjs';
 import {prepareLanSharing} from './prepare-lan-sharing.mjs';
+import {prepareMigration} from './prepare-migration.mjs';
 
 /** Sidecar binary name, without the target triple Tauri appends. */
 const SIDECAR = 'lemonvpn-engine-stub';
@@ -134,6 +135,7 @@ function prepareFrontend(pnpm) {
     prepareLanSharing(doonaDir);
     prepareRulesDns(doonaDir);
   }
+  prepareMigration(doonaDir);
   prepareBranding(doonaDir);
   if (!existsSync(join(doonaDir, 'node_modules'))) {
     throw new Error(`${doonaDir} 尚未安装依赖:先运行 pnpm --dir doona install`);

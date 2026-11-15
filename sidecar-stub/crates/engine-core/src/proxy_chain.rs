@@ -38,6 +38,7 @@ impl SelectionWatch {
                 continue;
             }
             if let Some(group) = config.groups.iter().find(|group| group.name == name) {
+                pending.extend(group.members.iter().cloned());
                 pending.extend(
                     [&group.dialer, &group.landing, &group.final_outbound]
                         .into_iter()
@@ -102,14 +103,22 @@ fn possible(
     let group = group.ok_or_else(|| format!("前置代理“{name}”不存在或不是代理节点／组"))?;
     visiting.push(name.to_owned());
     let result = (|| {
+        let roster = |visiting: &mut Vec<String>, work: &mut usize| -> Result<(HashSet<String>,usize),String> {
+            let mut names=HashSet::new();let mut count=0;
+            for member in &group.members {
+                let (found,depth)=possible(member,groups,nodes,visiting,work)?;
+                names.extend(found);count=count.max(depth);
+            }
+            Ok((names,count))
+        };
         let (mut exits, mut depth) = if group.dialer.is_some() {
             if let Some(exit) = &group.landing {
                 possible(exit, groups, nodes, visiting, work)?
             } else {
-                (group.members.iter().cloned().collect(), 1)
+                roster(visiting,work)?
             }
         } else {
-            (group.members.iter().cloned().collect(), 1)
+            roster(visiting,work)?
         };
         // Check dormant fallback edges too: subscription updates can activate them.
         if let Some(fallback) = &group.final_outbound {

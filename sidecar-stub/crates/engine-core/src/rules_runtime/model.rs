@@ -102,6 +102,8 @@ pub struct Pool {
     pub name: String,
     pub members: Vec<String>,
     pub strategy: String,
+    /// Used only when every member fails. NXDOMAIN remains authoritative.
+    pub failover: String,
 }
 impl Default for Pool {
     fn default() -> Self {
@@ -110,6 +112,7 @@ impl Default for Pool {
             name: String::new(),
             members: vec![],
             strategy: "fallback".into(),
+            failover: String::new(),
         }
     }
 }

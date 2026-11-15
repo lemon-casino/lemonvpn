@@ -342,11 +342,47 @@ pub(crate) fn settings_log_level() -> crate::logs::Level {
 
 static SELECTIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
+fn selections() -> MutexGuard<'static, HashMap<String, String>> {
+    SELECTIONS.get_or_init(|| {
+        let loaded = (|| -> io::Result<HashMap<String, String>> {
+            let path = config::data_dir().join("group-selections.json");
+            let file = match std::fs::File::open(path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+                Err(e) => return Err(e),
+            };
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > 1024 * 1024 { return Err(io::Error::other("组选择文件过大")); }
+            let values: HashMap<String, String> = serde_json::from_slice(&bytes)?;
+            if values.len() > 20000 || values.iter().any(|(k,v)| {
+                !k.starts_with("tcp:") && !k.starts_with("udp:") || k.len() > 2048 || v.len() > 2048
+                    || k.chars().any(char::is_control) || v.chars().any(char::is_control)
+            }) { return Err(io::Error::other("组选择文件无效")); }
+            Ok(values)
+        })();
+        Mutex::new(loaded.unwrap_or_else(|e| {
+            crate::logs::warn("engine::groups", "Saved group selections could not be restored.", Some(crate::logs::fields(&[("error", &e.to_string())])));
+            HashMap::new()
+        }))
+    }).lock().unwrap_or_else(|p|p.into_inner())
+}
+
+fn save_selections(values: &HashMap<String, String>) -> io::Result<()> {
+    let bytes = serde_json::to_vec(values)?;
+    if bytes.len() > 1024 * 1024 { return Err(io::Error::other("组选择状态超过保存上限")); }
+    crate::storage::write_atomic(&config::data_dir().join("group-selections.json"), &bytes)
+}
+
+fn save_selection_cleanup(values: &HashMap<String, String>) {
+    if let Err(e) = save_selections(values) {
+        crate::logs::warn("engine::groups", "Removed group selections could not be saved.", Some(crate::logs::fields(&[("error", &e.to_string())])));
+    }
+}
+
 pub(crate) fn forget_member(groups: &[String], member: &str) {
-    let mut selections = SELECTIONS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let mut selections = selections();
     for group in groups {
         for network in ["tcp", "udp"] {
             let key = format!("{network}:{group}");
@@ -355,16 +391,15 @@ pub(crate) fn forget_member(groups: &[String], member: &str) {
             }
         }
     }
+    save_selection_cleanup(&selections);
 }
 
 pub(crate) fn forget_group(group: &str) {
-    let mut selections = SELECTIONS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let mut selections = selections();
     for network in ["tcp", "udp"] {
         selections.remove(&format!("{network}:{group}"));
     }
+    save_selection_cleanup(&selections);
 }
 
 /// The member a pinned selection or manual choice resolves to, by group name.
@@ -373,10 +408,7 @@ pub fn selection_override(group: &str) -> Option<String> {
 }
 
 pub fn selection_override_for(group: &str, network: &str) -> Option<String> {
-    SELECTIONS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    selections()
         .get(&format!("{network}:{group}"))
         .cloned()
 }
@@ -392,7 +424,7 @@ pub fn select(client: &mut TcpStream, cors: &str, id: &str, body: &str) -> io::R
     let Some(member) = json::field(body, "member_id") else {
         return fail(client, cors, 400, "invalid_request", "member_id 缺失");
     };
-    let member_name = member.strip_prefix("node-").unwrap_or(&member).to_owned();
+    let member_name = member.strip_prefix("node-").or_else(||member.strip_prefix("group-")).unwrap_or(&member).to_owned();
     let network = json::field(body, "network").unwrap_or_else(|| "both".to_owned());
     if !["tcp", "udp", "both"].contains(&network.as_str()) {
         return fail(
@@ -409,18 +441,20 @@ pub fn select(client: &mut TcpStream, cors: &str, id: &str, body: &str) -> io::R
         let group = config.groups.iter().find(|group| group.name == name)?;
         let selector = matches!(group.policy, config::Policy::Selector);
         if !group.members.contains(&member_name) {
-            return Some((false, selector, 0));
+            return Some(Ok((false, selector, 0)));
         }
-        let mut selections = SELECTIONS
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut selections = selections();
+        let mut next = selections.clone();
         let mut changed = false;
         for kind in ["tcp", "udp"] {
             if network == "both" || network == kind {
-                let previous = selections.insert(format!("{kind}:{name}"), member_name.clone());
+                let previous = next.insert(format!("{kind}:{name}"), member_name.clone());
                 changed |= previous.as_ref() != Some(&member_name);
             }
+        }
+        if changed {
+            if let Err(e) = save_selections(&next) { return Some(Err(e)); }
+            *selections = next;
         }
         drop(selections);
         let interrupted = if changed {
@@ -428,10 +462,14 @@ pub fn select(client: &mut TcpStream, cors: &str, id: &str, body: &str) -> io::R
         } else {
             0
         };
-        Some((true, selector, interrupted))
+        Some(Ok((true, selector, interrupted)))
     });
-    let Some((in_group, selector, interrupted)) = manual else {
+    let Some(manual) = manual else {
         return fail(client, cors, 404, "resource_not_found", "没有这个组");
+    };
+    let (in_group, selector, interrupted) = match manual {
+        Ok(value) => value,
+        Err(e) => return fail(client, cors, 500, "selection_write_failed", &format!("组选择保存失败，原选择保留：{e}")),
     };
     if !in_group {
         return fail(client, cors, 422, "unsupported_value", "成员不在该组内");
@@ -449,14 +487,13 @@ pub fn select(client: &mut TcpStream, cors: &str, id: &str, body: &str) -> io::R
             ("connections_closed", &interrupted.to_string()),
         ])),
     );
-    let revision = config::group_selection_snapshot(id)
-        .map(|(revision, _)| revision)
-        .unwrap_or_default();
+    let (revision, selection) = config::group_selection_snapshot(id).unwrap_or_default();
+    let leaf = &selection[if network=="udp" {"udp"} else {"tcp"}]["resolved_leaf_node_id"];
     ok(
         client,
         cors,
         200,
-        &serde_json::json!({"group_id":id,"member_id":member,"resolved_leaf_node_id":format!("node-{member_name}"),"network":network,"source":source,"selection_revision":revision,"connections_interrupted":interrupted>0,"connections_closed":interrupted}).to_string(),
+        &serde_json::json!({"group_id":id,"member_id":member,"resolved_leaf_node_id":leaf,"network":network,"source":source,"selection_revision":revision,"connections_interrupted":interrupted>0,"connections_closed":interrupted}).to_string(),
     )
 }
 
@@ -480,25 +517,31 @@ pub fn clear_selection(
     }
     let interrupted = config::with_current(|config| {
         config.groups.iter().find(|group| group.name == name)?;
-        let mut selections = SELECTIONS
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut selections = selections();
+        let mut next = selections.clone();
         let mut changed = false;
         for kind in ["tcp", "udp"] {
             if network == "both" || network == kind {
-                changed |= selections.remove(&format!("{kind}:{name}")).is_some();
+                changed |= next.remove(&format!("{kind}:{name}")).is_some();
             }
         }
+        if changed {
+            if let Err(e) = save_selections(&next) { return Some(Err(e)); }
+            *selections = next;
+        }
         drop(selections);
-        Some(if changed {
+        Some(Ok(if changed {
             connections::selection_changed(&name, network)
         } else {
             0
-        })
+        }))
     });
     let Some(interrupted) = interrupted else {
         return fail(client, cors, 404, "resource_not_found", "没有这个组");
+    };
+    let interrupted = match interrupted {
+        Ok(value) => value,
+        Err(e) => return fail(client, cors, 500, "selection_write_failed", &format!("解除固定保存失败，原选择保留：{e}")),
     };
     crate::dns::flush();
     crate::compat::queue_hot_apply();
@@ -655,7 +698,7 @@ pub fn patch_group(
             }
             "/config/default_member_id" => {
                 let value =
-                    value.map(|value| value.strip_prefix("node-").unwrap_or(&value).to_owned());
+                    value.map(|value| value.strip_prefix("node-").or_else(||value.strip_prefix("group-")).unwrap_or(&value).to_owned());
                 if op.op == "test" {
                     if value != default_value {
                         return fail(

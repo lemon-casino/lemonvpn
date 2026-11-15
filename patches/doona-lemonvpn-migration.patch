@@ -1,0 +1,2315 @@
+diff --git a/src/api/api.ts b/src/api/api.ts
+index 03ffec3..727bddf 100644
+--- a/src/api/api.ts
++++ b/src/api/api.ts
+@@ -86,7 +86,7 @@ export type TunStatus = {
+   udp?: string;
+   recovering?: string | null;
+ };
+-export type LanSettings = {enabled: boolean; bind_address: string; port: number; authentication: {username: string; password: string} | null};
++export type LanSettings = {enabled: boolean; bind_address: string; port: number; advertised_address?: string | null; authentication: {username: string; password: string} | null};
+ export type LanStatus = {
+   settings: LanSettings;
+   revision: string;
+@@ -95,7 +95,7 @@ export type LanStatus = {
+   addresses: Array<{interface: string; address: string}>;
+   address_error: string | null;
+ };
+-export type DnsSettings = {mode: 'fake-ip' | 'redir-host'; ipv4_range: string; ipv6_range: string; filters: string[]; store_fake_ip: boolean};
++export type DnsSettings = {mode: 'fake-ip' | 'redir-host'; ipv4_range: string; ipv6_range: string; filters: string[]; store_fake_ip: boolean; ipv6_enabled: boolean; sniff_enabled: boolean};
+ export type DnsSettingsStatus = {settings: DnsSettings; revision: string; tun_enabled: boolean};
+ export type DesktopStatus = {
+   observed_at: string;
+diff --git a/src/api/client.ts b/src/api/client.ts
+index 12058c0..35f8e80 100644
+--- a/src/api/client.ts
++++ b/src/api/client.ts
+@@ -394,7 +394,7 @@ export function createApi(base: string, token?: string, clock: ServerClock = cre
+     lanSettings: async signal => data(await lanSettingsClient.GET('/api/v1/lan/settings', {signal})),
+     setLanSettings: (revision, settings, signal) => lanSettingsClient.PUT('/api/v1/lan/settings', {body: {revision, settings}, signal}).then(data),
+     rulesRuntime: async <T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, signal?: AbortSignal): Promise<T> => {
+-      if (!/^\/api\/v1\/(rules\/runtime|dns\/(trace|statistics|wire-cache)|geodata\/categories|runtime\/apply)([/?]|$)/.test(path))
++      if (!/^\/api\/v1\/(rules\/runtime|dns\/(trace|statistics|wire-cache|listener|bootstrap\/retry)|geodata\/categories|runtime\/apply)([/?]|$)/.test(path))
+         throw new Error('Invalid resource path');
+       return data(await runtimeClient[method](path, {body, signal})) as T;
+     },
+diff --git a/src/api/invalidation.ts b/src/api/invalidation.ts
+index 7eeb80a..e913dc4 100644
+--- a/src/api/invalidation.ts
++++ b/src/api/invalidation.ts
+@@ -23,6 +23,7 @@ export type ResourceName =
+   | 'desktopProxy'
+   | 'dnsCache'
+   | 'dnsSettings'
++  | 'dnsListener'
+   | 'lanSettings'
+   | 'dnsLog'
+   | 'runtimeSettings'
+@@ -56,6 +57,7 @@ export const invalidations: Record<EventKind, {now: ResourceName[] | 'all'}> = {
+       'runtimeMemory',
+       'desktopStatus',
+       'dnsSettings',
++      'dnsListener',
+       'rulesRuntime',
+       'ruleReferences',
+       'ruleEntries',
+diff --git a/src/api/model.ts b/src/api/model.ts
+index 4abada9..9ec3eec 100644
+--- a/src/api/model.ts
++++ b/src/api/model.ts
+@@ -122,7 +122,7 @@ export type GeoAssetKind = Schema['GeoAssetKind'];
+ export type GeoDataSettings = Schema['GeoDataSettings'];
+ export type GeoDataSettingsPatch = Schema['GeoDataSettingsPatch'];
+ export type GeoDataDownload = Schema['GeoDataDownload'];
+-export type RuleList = Schema['RuleList'];
++export type RuleList = Schema['RuleList'] & {'x-lemonvpn-resource-rules'?: Schema['RoutingRule'][]};
+ export type DnsRcodeAction = 'nxdomain' | 'refused' | 'servfail';
+ // Keep the contract's reject action while preserving the native return code.
+ export type DnsRoutingRule = Schema['DnsRoutingRule'] & {'x-lemonvpn-action'?: DnsRcodeAction | null};
+diff --git a/src/api/rulesRuntime.ts b/src/api/rulesRuntime.ts
+index baf2657..8c9f152 100644
+--- a/src/api/rulesRuntime.ts
++++ b/src/api/rulesRuntime.ts
+@@ -21,7 +21,7 @@ export type RuleProvider = {
+   headers: Record<string, string>;
+ };
+ export type Resolver = {id: string; name: string; url: string; outbound: string; bootstrap: string[]; tls_name: string; timeout_ms: number};
+-export type Pool = {id: string; name: string; members: string[]; strategy: string};
++export type Pool = {id: string; name: string; members: string[]; strategy: string; failover?: string};
+ export type Policy = {id: string; name: string; enabled: boolean; condition: string; pool: string; address_mode: string};
+ export type Binding = {id: string; name: string; enabled: boolean; condition: string; outbound: string};
+ export type CacheOptions = {capacity: number; max_bytes: number; negative: boolean; stale_seconds: number; prefetch: boolean};
+diff --git a/src/dae/groupRemoval.ts b/src/dae/groupRemoval.ts
+index 0ce48b4..6f23b98 100644
+--- a/src/dae/groupRemoval.ts
++++ b/src/dae/groupRemoval.ts
+@@ -29,7 +29,7 @@ export function groupReferenceDetails(sources: ConfigSource[], name: string): Gr
+       if (group.name === name) continue;
+       for (const field of blockFields(text, group, all)) {
+         const values = tokens.filter(token => token.from >= field.valueFrom && token.to <= field.valueTo);
+-        if (['final', 'dialer', 'landing'].includes(field.name) && unquote(field.value) === name && values.length === 1) {
++        if (['default', 'final', 'dialer', 'landing'].includes(field.name) && unquote(field.value) === name && values.length === 1) {
+           add(values[0].from, values[0].to, values[0].line, field.name === 'final' ? 'group-final' : 'chain', group.name);
+         }
+         if (field.name !== 'filter') continue;
+@@ -37,7 +37,7 @@ export function groupReferenceDetails(sources: ConfigSource[], name: string): Gr
+           const token = values[index];
+           const call = text.slice(token.from, token.to);
+           const open = values[index + 1];
+-          if (!['group', '!group'].includes(call) || text.slice(open.from, open.to) !== '(') continue;
++          if (!['group', '!group', 'outbound'].includes(call) || text.slice(open.from, open.to) !== '(') continue;
+           for (let at = index + 2; at < values.length; at++) {
+             const argument = values[at];
+             if (argument.parens <= open.parens) break;
+@@ -45,10 +45,10 @@ export function groupReferenceDetails(sources: ConfigSource[], name: string): Gr
+             if (argument.parens !== open.parens + 1 || !['text', 'quoted'].includes(argument.kind)) continue;
+             if (
+               unquote(text.slice(argument.from, argument.to))
+-                .split(/[|,]/)
++                .split(call === 'outbound' ? /$^/ : /[|,]/)
+                 .some(part => part.trim() === name)
+             )
+-              add(argument.from, argument.to, argument.line, 'group-filter', group.name);
++              add(argument.from, argument.to, argument.line, call === 'outbound' ? 'chain' : 'group-filter', group.name);
+           }
+         }
+       }
+diff --git a/src/desktop.ts b/src/desktop.ts
+index 2d05b28..2bb167e 100644
+--- a/src/desktop.ts
++++ b/src/desktop.ts
+@@ -1,5 +1,5 @@
+-// The desktop host publishes this before the frontend starts. Browser builds
+-// continue to use the upstream backend/profile controls.
++// The native host publishes this before the frontend starts. Web and desktop
++// share the LemonVPN shell; only native integrations depend on this marker.
+ import './ui/styles/desktop-interactions.css';
+ 
+ export type DesktopInfo = {name: string; version: string; platform: string; arch: string; engineUrl: string};
+@@ -14,7 +14,7 @@ const host = globalThis as {
+ export const desktop = host.__LEMONVPN_DESKTOP__;
+ export const hasDesktop = !!desktop;
+ export const framelessDesktop = desktop?.platform === 'windows';
+-export const appName = hasDesktop ? 'LemonVPN' : 'doona';
++export const appName = 'LemonVPN';
+ 
+ if (hasDesktop && typeof document !== 'undefined') {
+   document.documentElement.classList.add('lemonvpn-desktop');
+diff --git a/src/features/activity/ActivityHub.tsx b/src/features/activity/ActivityHub.tsx
+index ba7bc0c..db83c18 100644
+--- a/src/features/activity/ActivityHub.tsx
++++ b/src/features/activity/ActivityHub.tsx
+@@ -2,7 +2,6 @@ import {lazy, Suspense} from 'react';
+ import {withCatalogue, useT} from '../../i18n';
+ import {PageSkeleton, Tabs} from '../../ui/ui';
+ import {useCapabilities} from '../../store';
+-import {hasDesktop} from '../../desktop';
+ import type {PageProps} from '../../shell/routes';
+ import {within} from '../../shell/route';
+ import {Activity as Dashboard} from '../../shell/widgets/Dashboard';
+@@ -12,7 +11,6 @@ const Connections = lazy(withCatalogue('rest', () => import('../connections/Conn
+ export function Activity(props: PageProps) {
+   const t = useT();
+   const capabilities = useCapabilities();
+-  if (!hasDesktop) return <Dashboard {...props} />;
+   const section = new URLSearchParams(props.query).get('section') === 'connections' ? 'connections' : 'dashboard';
+   const available = capabilities.data?.resources.connections.available !== false;
+   const items = [{id: 'dashboard', label: t('activity.dashboardTab'), content: <Dashboard {...props} />}];
+diff --git a/src/features/activity/ModeSwitch.tsx b/src/features/activity/ModeSwitch.tsx
+index 381aad3..4d17204 100644
+--- a/src/features/activity/ModeSwitch.tsx
++++ b/src/features/activity/ModeSwitch.tsx
+@@ -1,13 +1,11 @@
+-import {Suspense, useEffect, useState, type ComponentProps} from 'react';
++import {Suspense, useEffect, type ComponentProps} from 'react';
+ import {useT, withCatalogue} from '../../i18n';
+ import type {EngineReason} from '../../api/engines';
+-import {Button, Card, ConfirmDialog, ErrorMessage, Light, ChoiceMenu, PopoverDialog, Segmented, WidestLabel} from '../../ui/ui';
++import {Button, Card, ErrorMessage, Light, ChoiceMenu, PopoverDialog, Segmented, WidestLabel} from '../../ui/ui';
+ import {LoadBoundary} from '../../ui/LoadBoundary';
+ import {preloadable} from '../../ui/preloadable';
+ import type {ModeReadOnlyHint} from './ModeReadOnlyHint';
+ import Shuffle from '../../ui/icons/Shuffle';
+-import Filter from '../../ui/icons/Filter';
+-import {hasDesktop} from '../../desktop';
+ // The read-only explanation and its messages load once the status shows, so the popover opens with its text at once.
+ const hint = preloadable<ComponentProps<typeof ModeReadOnlyHint>>(
+   withCatalogue('rest', () => import('./ModeReadOnlyHint').then(module => ({default: module.ModeReadOnlyHint})))
+@@ -36,30 +34,11 @@ type ModeCardsModel = {
+ 
+ export function ModeApply({model: vm}: {model: Pick<ModeCardsModel, 'mode' | 'modes' | 'writable' | 'dirty' | 'incomplete' | 'busy' | 'apply'>}) {
+   const t = useT();
+-  const [asking, setAsking] = useState<string | null>(null);
+   return vm.writable ? (
+     <>
+-      <Button
+-        accent
+-        isDisabled={!vm.dirty || vm.incomplete}
+-        isPending={vm.busy}
+-        onPress={() => (hasDesktop || vm.mode === 'rule' ? vm.apply() : setAsking(vm.mode))}
+-      >
++      <Button accent isDisabled={!vm.dirty || vm.incomplete} isPending={vm.busy} onPress={vm.apply}>
+         {t('config.save')}
+       </Button>
+-      <ConfirmDialog
+-        title={t('act.modeConfirm', {mode: vm.modes.find(([id]) => id === asking)?.[1] ?? ''})}
+-        confirmLabel={t('config.save')}
+-        isOpen={asking !== null}
+-        isDisabled={vm.busy || !vm.dirty || vm.incomplete || asking !== vm.mode}
+-        onCancel={() => setAsking(null)}
+-        onConfirm={() => {
+-          setAsking(null);
+-          vm.apply();
+-        }}
+-      >
+-        <p className="rp-label">{t(asking === 'direct' ? 'act.modeDirectHelp' : 'act.modeGlobalHelp')}</p>
+-      </ConfirmDialog>
+     </>
+   ) : null;
+ }
+@@ -104,70 +83,32 @@ export function ModeSwitch({model: vm, fill, deferApply = false}: {model: ModeCa
+ 
+ export function ModeCards({model: vm, part}: {model: ModeCardsModel; part?: 'mode' | 'global'}) {
+   const t = useT();
+-  if (hasDesktop) {
+-    if (part === 'global') return null;
+-    return (
+-      <>
+-        {vm.error && <ErrorMessage error={vm.error} onRetry={vm.retry} />}
+-        <Card
+-          title={t('act.mode')}
+-          aria-label={t('act.mode')}
+-          tile={{icon: <Shuffle />, tint: 3, kind: 'control'}}
+-          reason={vm.reasons.mode ?? (vm.mode === 'global' ? vm.reasons.global : null)}
+-          aside={
+-            <span className="rp-cluster rp-mode-combined">
+-              <span className="rp-cluster rp-mode-primary">
+-                <ModeSwitch model={vm} deferApply />
+-                <ModeApply model={vm} />
+-              </span>
+-              <span
+-                className="rp-cluster rp-global-controls rp-mode-global-slot"
+-                aria-hidden={vm.mode !== 'global'}
+-                inert={vm.mode !== 'global'}
+-                data-active={vm.mode === 'global'}
+-              >
+-                <span className="rp-label">{t('act.global')}</span>
+-                <ChoiceMenu
+-                  key={vm.mode === 'global' ? 'global' : 'inactive'}
+-                  quiet
+-                  isDisabled={vm.mode !== 'global' || vm.busy || !vm.writable}
+-                  label={t('act.global')}
+-                  value={vm.target}
+-                  onChange={vm.pickTarget}
+-                  items={vm.targets}
+-                  searchLabel={t('ui.filterOutbounds')}
+-                >
+-                  <WidestLabel labels={vm.targets.map(target => target.label)}>{vm.targetText}</WidestLabel>
+-                </ChoiceMenu>
+-              </span>
+-            </span>
+-          }
+-        />
+-      </>
+-    );
+-  }
++  if (part === 'global') return null;
+   return (
+     <>
+-      {part !== 'global' && vm.error && <ErrorMessage error={vm.error} onRetry={vm.retry} />}
+-      {part !== 'global' && (
+-        <Card
+-          title={t('act.mode')}
+-          aria-label={t('act.mode')}
+-          tile={{icon: <Shuffle />, tint: 3, kind: 'control'}}
+-          reason={vm.reasons.mode}
+-          aside={<ModeSwitch model={vm} />}
+-        />
+-      )}
+-      {part !== 'mode' && (
+-        <Card
+-          title={t('act.global')}
+-          tile={{icon: <Filter />, tint: 2, kind: 'control'}}
+-          reason={vm.reasons.global}
+-          aside={
+-            <span className="rp-cluster rp-global-controls">
++      {vm.error && <ErrorMessage error={vm.error} onRetry={vm.retry} />}
++      <Card
++        title={t('act.mode')}
++        aria-label={t('act.mode')}
++        tile={{icon: <Shuffle />, tint: 3, kind: 'control'}}
++        reason={vm.reasons.mode ?? (vm.mode === 'global' ? vm.reasons.global : null)}
++        aside={
++          <span className="rp-cluster rp-mode-combined">
++            <span className="rp-cluster rp-mode-primary">
++              <ModeSwitch model={vm} deferApply />
++              <ModeApply model={vm} />
++            </span>
++            <span
++              className="rp-cluster rp-global-controls rp-mode-global-slot"
++              aria-hidden={vm.mode !== 'global'}
++              inert={vm.mode !== 'global'}
++              data-active={vm.mode === 'global'}
++            >
++              <span className="rp-label">{t('act.global')}</span>
+               <ChoiceMenu
++                key={vm.mode === 'global' ? 'global' : 'inactive'}
+                 quiet
+-                isDisabled={vm.busy || !vm.writable}
++                isDisabled={vm.mode !== 'global' || vm.busy || !vm.writable}
+                 label={t('act.global')}
+                 value={vm.target}
+                 onChange={vm.pickTarget}
+@@ -176,11 +117,10 @@ export function ModeCards({model: vm, part}: {model: ModeCardsModel; part?: 'mod
+               >
+                 <WidestLabel labels={vm.targets.map(target => target.label)}>{vm.targetText}</WidestLabel>
+               </ChoiceMenu>
+-              <ModeApply model={vm} />
+             </span>
+-          }
+-        />
+-      )}
++          </span>
++        }
++      />
+     </>
+   );
+ }
+diff --git a/src/features/dns/Dns.tsx b/src/features/dns/Dns.tsx
+index bbfec86..b25b644 100644
+--- a/src/features/dns/Dns.tsx
++++ b/src/features/dns/Dns.tsx
+@@ -38,6 +38,7 @@ import {Upstreams} from './Upstreams';
+ import {DnsPolicies, DnsUpstreams, DnsLiveStats, WireCache, FakeIpPolicySummary} from '../shared/resources/DnsWorkspace';
+ import {ResourceTrace} from '../shared/resources/ResourceTrace';
+ import {FakeIpSettings} from './FakeIpSettings';
++import {DnsListener} from './DnsListener';
+ import type {MatchKind} from './match';
+ import type {dnsAnswerView} from './view';
+ import {QuickRuleButton, RuleDialog} from '../shared/RuleDialog';
+@@ -148,6 +149,7 @@ export function Dns(props: PageProps) {
+     fakeip: (
+       <>
+         <FakeIpSettings />
++        <DnsListener />
+         <FakeIpPolicySummary />
+       </>
+     ),
+diff --git a/src/features/dns/DnsListener.tsx b/src/features/dns/DnsListener.tsx
+new file mode 100644
+index 0000000..2e2348d
+--- /dev/null
++++ b/src/features/dns/DnsListener.tsx
+@@ -0,0 +1,125 @@
++import {useState} from 'react';
++import {runtime} from '../../api/rulesRuntime';
++import {useResource} from '../../store/resource';
++import {useAction} from '../../store/action';
++import {useDraftGuard} from '../../shell/draft';
++import {useT} from '../../i18n';
++import {Badge, Button, Card, ErrorMessage, Form, Switch, TextField, Toolbar} from '../../ui/ui';
++import {TextArea} from '../../ui/TextArea';
++
++type Settings = {enabled: boolean; bind_address: string; port: number; allowed_networks: string[]};
++type Status = {
++  settings: Settings;
++  revision: string;
++  active: boolean;
++  error: string | null;
++  tun_enabled: boolean;
++  queries: number;
++  failures: number;
++  last_error: string | null;
++};
++export function DnsListener() {
++  const t = useT();
++  const resource = useResource({key: ['dnsListener'], every: 10000, fetch: signal => runtime<Status>('GET', '/api/v1/dns/listener', undefined, signal)});
++  const action = useAction<'save'>({shared: 'dns-listener'});
++  const [draft, setDraft] = useState<{revision: string; settings: Settings; networks: string; port: string} | null>(null);
++  const data = resource.data;
++  const settings = draft?.settings ?? data?.settings;
++  const dirty =
++    !!draft &&
++    !!data &&
++    (JSON.stringify(draft.settings) !== JSON.stringify(data.settings) ||
++      draft.port !== String(data.settings.port) ||
++      draft.networks !== data.settings.allowed_networks.join('\n'));
++  const guard = useDraftGuard(dirty, () => setDraft(null), 'dns.listenerTitle');
++  const edit = (change: Partial<Settings>, extra?: {networks?: string; port?: string}) => {
++    if (!settings || !data) return;
++    setDraft({
++      revision: draft?.revision ?? data.revision,
++      settings: {...settings, ...change},
++      networks: draft?.networks ?? data.settings.allowed_networks.join('\n'),
++      port: draft?.port ?? String(data.settings.port),
++      ...extra
++    });
++  };
++  const save = async () => {
++    if (!draft || !data || draft.revision !== data.revision) return;
++    const result = await action.run('save', signal =>
++      runtime<Status>(
++        'PUT',
++        '/api/v1/dns/listener',
++        {
++          revision: draft.revision,
++          settings: {
++            ...draft.settings,
++            port: Number(draft.port),
++            allowed_networks: draft.networks
++              .split(/\r?\n/)
++              .map(s => s.trim())
++              .filter(Boolean)
++          }
++        },
++        signal
++      )
++    );
++    if (result) {
++      setDraft(null);
++      guard.clear();
++      resource.refetch();
++    }
++  };
++  return (
++    <Card title={t('dns.listenerTitle')} note={t('dns.listenerHelp')}>
++      <ErrorMessage error={resource.error ?? action.error} onRetry={resource.refetch} />
++      {settings && data && (
++        <Form
++          className="rp-fakeip-form"
++          onSubmit={e => {
++            e.preventDefault();
++            void save();
++          }}
++        >
++          <Toolbar>
++            <Switch isSelected={settings.enabled} isDisabled={!!action.busy} onChange={enabled => edit({enabled})}>
++              {t('dns.listenerEnable')}
++            </Switch>
++            <Badge>{t(data.active ? 'lan.active' : 'lan.inactive')}</Badge>
++            <span className="rp-note">{t('dns.listenerCount', {queries: data.queries, failures: data.failures})}</span>
++          </Toolbar>
++          <div className="rp-fakeip-grid">
++            <TextField label={t('lan.bind')} value={settings.bind_address} onChange={bind_address => edit({bind_address})} />
++          <TextField label={t('dns.listenerPort')} value={draft?.port ?? String(settings.port)} onChange={port => edit({}, {port})} />
++          </div>
++          <TextArea
++            label={t('dns.listenerNetworks')}
++            value={draft?.networks ?? settings.allowed_networks.join('\n')}
++            onChange={networks => edit({}, {networks})}
++          />
++          {(data.error || data.last_error) && <p role="alert">{data.error ?? data.last_error}</p>}
++          <p className="rp-note">{t(data.tun_enabled ? 'dns.listenerFake' : 'dns.listenerReal')}</p>
++          <Toolbar>
++            <Button
++              accent
++              type="submit"
++              isPending={!!action.busy}
++              isDisabled={
++                !dirty || draft?.revision !== data.revision || !/^\d+$/.test(draft?.port ?? '') || Number(draft?.port) < 1 || Number(draft?.port) > 65535
++              }
++            >
++              {t('rr.save')}
++            </Button>
++            <Button
++              isDisabled={!!action.busy || !draft}
++              onPress={() => {
++                setDraft(null);
++                guard.clear();
++              }}
++            >
++              {t('ui.cancel')}
++            </Button>
++          </Toolbar>
++        </Form>
++      )}
++    </Card>
++  );
++}
+diff --git a/src/features/dns/FakeIpSettings.tsx b/src/features/dns/FakeIpSettings.tsx
+index 3e4469d..c15b7e4 100644
+--- a/src/features/dns/FakeIpSettings.tsx
++++ b/src/features/dns/FakeIpSettings.tsx
+@@ -14,7 +14,7 @@ import {TextArea} from '../../ui/TextArea';
+ import '../../ui/styles/fakeip-settings.css';
+ 
+ type Draft = {revision: string; settings: DnsSettings; filters: string};
+-const defaults: DnsSettings = {mode: 'fake-ip', ipv4_range: '198.18.0.1/16', ipv6_range: 'fc00::/18', filters: [], store_fake_ip: false};
++const defaults: DnsSettings = {mode: 'fake-ip', ipv4_range: '198.18.0.1/16', ipv6_range: 'fc00::/18', filters: [], store_fake_ip: false, ipv6_enabled: true, sniff_enabled: false};
+ function rangeValid(text: string, ipv6: boolean): boolean {
+   if (ipv6 && !text.trim()) return true;
+   const match = /^([^/]+)\/(\d+)$/.exec(text.trim());
+@@ -47,8 +47,8 @@ export function FakeIpSettings() {
+   const dirty =
+     !!settings &&
+     !!data &&
+-    JSON.stringify([settings.mode, settings.ipv4_range, settings.ipv6_range, settings.filters, settings.store_fake_ip]) !==
+-      JSON.stringify([data.settings.mode, data.settings.ipv4_range, data.settings.ipv6_range, data.settings.filters, data.settings.store_fake_ip]);
++    JSON.stringify([settings.mode, settings.ipv4_range, settings.ipv6_range, settings.filters, settings.store_fake_ip, settings.ipv6_enabled, settings.sniff_enabled]) !==
++      JSON.stringify([data.settings.mode, data.settings.ipv4_range, data.settings.ipv6_range, data.settings.filters, data.settings.store_fake_ip, data.settings.ipv6_enabled, data.settings.sniff_enabled]);
+   const stale = !!draft && !!data && draft.revision !== data.revision;
+   const guard = useDraftGuard(dirty, () => setDraft(null), 'dns.fakeIpTitle');
+   const busy = !!action.busy;
+@@ -115,6 +115,8 @@ export function FakeIpSettings() {
+             >
+               {t('dns.fakeIpPersistence')}
+             </Switch>
++            <Switch isSelected={settings.ipv6_enabled} isDisabled={busy} onChange={ipv6_enabled => edit({ipv6_enabled})} description={t('dns.ipv6Help')}>{t('dns.ipv6Enable')}</Switch>
++            <Switch isSelected={settings.sniff_enabled} isDisabled={busy} onChange={sniff_enabled => edit({sniff_enabled})} description={t('dns.sniffHelp')}>{t('dns.sniffEnable')}</Switch>
+             <TextField
+               label={t('dns.fakeIpRange4')}
+               value={settings.ipv4_range}
+diff --git a/src/features/dns/Upstreams.tsx b/src/features/dns/Upstreams.tsx
+index 159ba4f..2657a3c 100644
+--- a/src/features/dns/Upstreams.tsx
++++ b/src/features/dns/Upstreams.tsx
+@@ -1,5 +1,4 @@
+ import {useMemo, useState} from 'react';
+-import {hasDesktop} from '../../desktop';
+ import {useCapabilities, useConfig, useConfigEditor, useDnsRules} from '../../store';
+ import {useCompleteness} from '../../store/config';
+ import type {ConfigSource} from '../../api/model';
+@@ -16,8 +15,8 @@ type Dialog = {kind: 'add' | 'edit' | 'remove'; source: ConfigSource; generation
+ export function Upstreams() {
+   const t = useT();
+   const caps = useCapabilities().data?.resources;
+-  const config = useConfig(hasDesktop && caps?.config.available === true);
+-  const dns = useDnsRules(hasDesktop && caps?.dns_rules.available === true);
++  const config = useConfig(caps?.config.available === true);
++  const dns = useDnsRules(caps?.dns_rules.available === true);
+   const sources = config.data?.sources ?? [];
+   const complete = useCompleteness(sources);
+   const rows = useMemo(() => readDnsUpstreams(config.data?.sources ?? []), [config.data?.sources]);
+@@ -91,7 +90,7 @@ export function Upstreams() {
+     retry();
+     toast('positive', t('dns.upstreamSaved'));
+   };
+-  if (!hasDesktop || !caps?.config.available) return null;
++  if (!caps?.config.available) return null;
+   return (
+     <>
+       <Card title={t('dns.upstreamsTitle')} note={t('dns.upstreamsHelp')}>
+diff --git a/src/features/dns/nav.ts b/src/features/dns/nav.ts
+index b8c39a3..a06f35d 100644
+--- a/src/features/dns/nav.ts
++++ b/src/features/dns/nav.ts
+@@ -1,6 +1,5 @@
+ import type {Capabilities} from '../../api/model';
+ import {offered} from '../../api/capabilities';
+-import {hasDesktop} from '../../desktop';
+ import {dnsSettingsAvailable} from '../../store/desktop';
+ import type {Key} from '../../i18n';
+ 
+@@ -10,8 +9,8 @@ export function dnsTabs(
+   resources: Capabilities['resources'] | undefined
+ ): Array<{id: 'stats' | 'log' | 'query' | 'cache' | 'upstreams' | 'fakeip' | 'policies'; titleKey: Key}> {
+   return [
+-    ...(hasDesktop ? [{id: 'policies' as const, titleKey: 'rr.policies' as const}] : []),
+-    ...(hasDesktop && offered(resources, 'config', {whileLoading: false}) ? [{id: 'upstreams' as const, titleKey: 'dns.upstreamsTitle' as const}] : []),
++    ...(offered(resources, 'dns_rules', {whileLoading: false}) ? [{id: 'policies' as const, titleKey: 'rr.policies' as const}] : []),
++    ...(offered(resources, 'config', {whileLoading: false}) ? [{id: 'upstreams' as const, titleKey: 'dns.upstreamsTitle' as const}] : []),
+     ...(dnsSettingsAvailable(resources) ? [{id: 'fakeip' as const, titleKey: 'dns.fakeIpTitle' as const}] : []),
+     ...(offered(resources, 'dns_cache', {whileLoading: true}) ? [{id: 'cache' as const, titleKey: 'ui.cache' as const}] : []),
+     ...(offered(resources, 'dns_query', {whileLoading: true}) ? [{id: 'query' as const, titleKey: 'dns.query' as const}] : []),
+diff --git a/src/features/flows/Flows.tsx b/src/features/flows/Flows.tsx
+index b5095df..9185208 100644
+--- a/src/features/flows/Flows.tsx
++++ b/src/features/flows/Flows.tsx
+@@ -34,13 +34,18 @@ import {ruleHref} from '../shared/link';
+ import {QuickRuleButton, RuleDialog} from '../shared/RuleDialog';
+ import {useFlowsPage} from './useFlowsPage';
+ import {TableCards} from '../../ui/TableCards';
++import {ResourceManager} from '../shared/resources/ResourceManager';
+ 
+ type FlowRow = ReturnType<typeof useFlowRecords>['rows'][number];
+ 
+ export function Flows(props: PageProps) {
+   const t = useT();
+   const view = useFlowsPage(props);
+-  const content = {map: <RoutingMap {...props} />, records: <FlowRecords {...props} />};
++  const content = {
++    bindings: <ResourceManager kind="bindings" providerId={new URLSearchParams(props.query).get('provider')} />,
++    map: <RoutingMap {...props} />,
++    records: <FlowRecords {...props} />
++  };
+   if (view.loading) return <PageSkeleton />;
+   if (view.error) return <ErrorMessage error={view.error} onRetry={view.retry} />;
+   return (
+@@ -124,7 +129,7 @@ function FlowRecords(props: PageProps) {
+         wide: true,
+         render: row => (
+           <span className="rp-rule">
+-            <RuleRef expression={row.expression} href={ruleHref(row.ruleId, view.rulesListed)} />
++            <RuleRef expression={row.expression} href={view.resourceRuleLinks.get(row.ruleId ?? '') ?? ruleHref(row.ruleId, view.rulesListed)} />
+             {row.recomputed && <Badge tip={t('rule.sourceHelp.recomputed')}>{t('conn.recomputed')}</Badge>}
+           </span>
+         )
+@@ -146,7 +151,7 @@ function FlowRecords(props: PageProps) {
+         }
+       }
+     ],
+-    [t, view.rulesListed]
++    [t, view.rulesListed, view.resourceRuleLinks]
+   );
+   return (
+     <>
+diff --git a/src/features/flows/effectiveRules.ts b/src/features/flows/effectiveRules.ts
+new file mode 100644
+index 0000000..f446e43
+--- /dev/null
++++ b/src/features/flows/effectiveRules.ts
+@@ -0,0 +1,9 @@
++import type {RuleList} from '../../api/model';
++
++// Keep source-file editors separate from generated category rules, while the
++// topology and flow filters use the actual rule IDs of the active generation.
++export function effectiveRules(list: RuleList | undefined): RuleList | undefined {
++  if (!list?.['x-lemonvpn-resource-rules']?.length) return list;
++  const byId = new Map([...list.rules, ...list['x-lemonvpn-resource-rules']].map(rule => [rule.rule_id, rule]));
++  return {...list, rules: [...byId.values()].sort((a, b) => a.index - b.index)};
++}
+diff --git a/src/features/flows/nav.ts b/src/features/flows/nav.ts
+index 0d99a1f..a044490 100644
+--- a/src/features/flows/nav.ts
++++ b/src/features/flows/nav.ts
+@@ -2,12 +2,17 @@ import type {Capabilities} from '../../api/model';
+ import {offered} from '../../api/capabilities';
+ import type {Key} from '../../i18n';
+ 
+-export type FlowTab = 'map' | 'records';
+-// The map of where traffic goes comes first and is the default, then the records it is drawn from.
++export type FlowTab = 'bindings' | 'map' | 'records';
++// Manage routing here; topology and retained records show its effect.
+ export function flowsTabs(resources: Capabilities['resources'] | undefined): Array<{id: FlowTab; titleKey: Key}> {
+-  if (!offered(resources, 'flows', {whileLoading: true})) return [];
++  const flows = offered(resources, 'flows', {whileLoading: true});
+   return [
+-    {id: 'map', titleKey: 'flow.tab.map'},
+-    {id: 'records', titleKey: 'flow.tab.records'}
++    ...(offered(resources, 'rules', {whileLoading: false}) ? [{id: 'bindings' as const, titleKey: 'rr.bindings' as const}] : []),
++    ...(flows
++      ? [
++          {id: 'map' as const, titleKey: 'flow.tab.map' as const},
++          {id: 'records' as const, titleKey: 'flow.tab.records' as const}
++        ]
++      : [])
+   ];
+ }
+diff --git a/src/features/flows/useFlowRecords.ts b/src/features/flows/useFlowRecords.ts
+index 40a0339..e01614f 100644
+--- a/src/features/flows/useFlowRecords.ts
++++ b/src/features/flows/useFlowRecords.ts
+@@ -2,7 +2,7 @@ import {useMemo} from 'react';
+ import {useCapabilities, useFlow, useFlows, useGroups, useOutboundNames, useRules, type FlowFilter} from '../../store';
+ import {connectionStates, outboundLabel} from '../../api/selectors';
+ import {useLang, useT} from '../../i18n';
+-import {within} from '../../shell/route';
++import {href, within} from '../../shell/route';
+ import {panelQuery, phoneQuery, useMediaQuery} from '../../ui/ui';
+ import type {PageProps} from '../../shell/routes';
+ import {flowsThrough, pinnedLabel} from './map';
+@@ -10,6 +10,7 @@ import {flowDetailView, flowRecordsView} from './view';
+ import {offered} from '../../api/capabilities';
+ import {outboundTag, recordingSettingsHref} from '../shared/link';
+ import {useQuickRule} from '../shared/useQuickRule';
++import {effectiveRules} from './effectiveRules';
+ 
+ export function useFlowRecords({go, query}: PageProps) {
+   const t = useT();
+@@ -28,14 +29,19 @@ export function useFlowRecords({go, query}: PageProps) {
+   const resource = useFlows({connection_id: connectionId, network, state}, offered(resources, 'flows', {whileLoading: true}));
+   const rulesListed = offered(resources, 'rules', {whileLoading: false});
+   const rules = useRules(rulesListed);
++  const listed = useMemo(() => effectiveRules(rules.data), [rules.data]);
++  const resourceRuleLinks = useMemo(
++    () => new Map((rules.data?.['x-lemonvpn-resource-rules'] ?? []).map(rule => [rule.rule_id, href('flows', {tab: 'bindings'})])),
++    [rules.data]
++  );
+   const names = useOutboundNames();
+   const id = params.get('id');
+   const detail = useFlow(id);
+   const pinned = params.get('path');
+   const shown = useMemo(() => {
+     const all = resource.data?.flows ?? [];
+-    return pinned ? flowsThrough(all, pinned, rules.data) : all;
+-  }, [resource.data, pinned, rules.data]);
++    return pinned ? flowsThrough(all, pinned, listed) : all;
++  }, [resource.data, pinned, listed]);
+   const generation = rules.data?.generation_id;
+   const view = useMemo(() => flowRecordsView(shown, resource.data, generation, names, t, lang), [shown, resource.data, generation, names, t, lang]);
+   const row = view.rows.find(flow => flow.id === id);
+@@ -63,6 +69,7 @@ export function useFlowRecords({go, query}: PageProps) {
+     phone,
+     id,
+     rulesListed,
++    resourceRuleLinks,
+     error: resource.error,
+     retry: resource.refetch,
+     loading: resource.loading && !resource.data,
+@@ -75,7 +82,7 @@ export function useFlowRecords({go, query}: PageProps) {
+     select: (value: string | null) => go('flows', within(query, {id: value}), {replace: id !== null}),
+     pinLabel: pinned
+       ? t('flow.mapFilter', {
+-          label: pinnedLabel(pinned, rules.data?.rules ?? [], names, name => (name === null ? t('ui.unknown') : outboundLabel(name, t)))
++          label: pinnedLabel(pinned, listed?.rules ?? [], names, name => (name === null ? t('ui.unknown') : outboundLabel(name, t)))
+         })
+       : null,
+     clearPin: () => go('flows', within(query, {path: null})),
+diff --git a/src/features/flows/useFlowsPage.ts b/src/features/flows/useFlowsPage.ts
+index a5e11f7..b25a7f4 100644
+--- a/src/features/flows/useFlowsPage.ts
++++ b/src/features/flows/useFlowsPage.ts
+@@ -7,8 +7,8 @@ export function useFlowsPage({go, query}: PageProps) {
+   const t = useT();
+   const capabilities = useCapabilities();
+   const view = flowsView(capabilities.data?.resources, query, t);
+-  // Flow records exist only while a client asks for them, and the tabs' `/flows` polls pause in a hidden browser tab.
+-  useFlowDemand(capabilities.data?.resources);
++  // Editing categories does not need to start flow recording.
++  useFlowDemand(view.tab === 'bindings' ? undefined : capabilities.data?.resources);
+   return {
+     ...view,
+     loading: capabilities.loading && !capabilities.data,
+diff --git a/src/features/flows/useRoutingMap.ts b/src/features/flows/useRoutingMap.ts
+index 54acfcd..7627bbb 100644
+--- a/src/features/flows/useRoutingMap.ts
++++ b/src/features/flows/useRoutingMap.ts
+@@ -6,6 +6,7 @@ import type {PageProps} from '../../shell/routes';
+ import {flowsThrough, routingTree, type TreeBy} from './map';
+ import {routingMapView} from './view';
+ import {offered} from '../../api/capabilities';
++import {effectiveRules} from './effectiveRules';
+ 
+ export function useRoutingMap({go, query}: PageProps) {
+   const t = useT();
+@@ -15,10 +16,11 @@ export function useRoutingMap({go, query}: PageProps) {
+   const groups = useGroups(offered(resources, 'groups', {whileLoading: false}));
+   const nodes = useNodes(offered(resources, 'nodes', {whileLoading: false}));
+   const rules = useRules(offered(resources, 'rules', {whileLoading: false}));
++  const listed = useMemo(() => effectiveRules(rules.data), [rules.data]);
+   const by: TreeBy = params.get('by') === 'client' ? 'client' : 'rule';
+   const tree = useMemo(
+-    () => routingTree(resource.data?.flows ?? [], groups.data ?? [], nodes.data ?? [], rules.data, by),
+-    [resource.data, groups.data, nodes.data, rules.data, by]
++    () => routingTree(resource.data?.flows ?? [], groups.data ?? [], nodes.data ?? [], listed, by),
++    [resource.data, groups.data, nodes.data, listed, by]
+   );
+   const pinned = params.get('path');
+   // Memoised tree tiles keep one `pin` across navigations; the query is read when the tile is pressed.
+@@ -27,7 +29,7 @@ export function useRoutingMap({go, query}: PageProps) {
+     latest.current = query;
+   }, [query]);
+   const pin = useCallback((path: string | null) => go('flows', within(latest.current, {path})), [go]);
+-  const count = useMemo(() => (pinned ? flowsThrough(resource.data?.flows ?? [], pinned, rules.data).length : 0), [resource.data, pinned, rules.data]);
++  const count = useMemo(() => (pinned ? flowsThrough(resource.data?.flows ?? [], pinned, listed).length : 0), [resource.data, pinned, listed]);
+   // The tree waits for every source so it is laid out once rather than growing or renaming tiles as each one lands.
+   const settled = [resource, rules, groups, nodes].every(item => item.data !== undefined || item.error || !item.loading);
+   return {
+diff --git a/src/features/flows/view.ts b/src/features/flows/view.ts
+index 2acdcbf..e55fa7e 100644
+--- a/src/features/flows/view.ts
++++ b/src/features/flows/view.ts
+@@ -367,7 +367,7 @@ export function treeGeometry(tree: RoutingTree, measured: number | null, t: Tran
+ }
+ 
+ type FlowsView = {tabs: {id: FlowTab; label: string}[]; tab: string; fallback: string | null};
+-// The map is the default tab; until the capabilities are known it is not fixed (null).
++// The default follows available management and flow capabilities.
+ export function flowsView(resources: Capabilities['resources'] | undefined, query: string, t: Translator): FlowsView {
+   const tabs = flowsTabs(resources).map(tab => ({id: tab.id, label: t(tab.titleKey)}));
+   const first = tabs[0]?.id ?? 'map';
+@@ -385,6 +385,11 @@ export function flowsView(resources: Capabilities['resources'] | undefined, quer
+ // records, and both share the pinned path. Left behind the map, which stays out of the address, a selected record or
+ // connection would read as an old records link and reopen the records.
+ export function flowsTabQuery(query: string, next: string, fallback: string | null): string {
+-  const left: Record<string, null> = next === 'map' ? {id: null, connection_id: null} : {by: null};
++  const left: Record<string, null> =
++    next === 'bindings'
++      ? {id: null, connection_id: null, by: null, path: null, network: null, state: null}
++      : next === 'map'
++        ? {id: null, connection_id: null, provider: null}
++        : {by: null, provider: null};
+   return tabQuery(within(query, left), next, fallback);
+ }
+diff --git a/src/features/nodes/Nodes.tsx b/src/features/nodes/Nodes.tsx
+index 0a4c7c5..2a3a124 100644
+--- a/src/features/nodes/Nodes.tsx
++++ b/src/features/nodes/Nodes.tsx
+@@ -236,7 +236,15 @@ export function Nodes(props: PageProps) {
+ 
+         {(dialog?.kind === 'editProvider' || dialog?.kind === 'editManagedProvider') && (
+           <Form id={dialogForm} className="rp-list" onSubmit={send}>
+-            <span className="rp-label">{t(dialog.kind === 'editManagedProvider' ? 'nodes.editManagedHelp' : 'nodes.editProviderHelp')}</span>
++            <span className="rp-label">
++              {t(
++                dialog.kind === 'editManagedProvider'
++                  ? dialog.item.kind === 'inline'
++                    ? 'nodes.editSnapshotHelp'
++                    : 'nodes.editManagedHelp'
++                  : 'nodes.editProviderHelp'
++              )}
++            </span>
+             <Suspense fallback={null}>
+               <SubscriptionFields
+                 nameReadOnly={dialog.kind === 'editManagedProvider'}
+diff --git a/src/features/nodes/useNodesPage.ts b/src/features/nodes/useNodesPage.ts
+index 5ed235e..8692143 100644
+--- a/src/features/nodes/useNodesPage.ts
++++ b/src/features/nodes/useNodesPage.ts
+@@ -16,6 +16,7 @@ import type {PageProps} from '../../shell/routes';
+ import {replaceRoute} from '../../shell/route';
+ import {
+   editableSource,
++  managedSnapshot,
+   joinableGroups,
+   subscriptionPlace,
+   subscriptionActionKind,
+@@ -206,7 +207,7 @@ export function useNodesPage({go, query}: PageProps) {
+       const tag = item.configTag ?? item.sourceTag;
+       const place = subscriptionPlace(tag ? (declared.get(tag) ?? []) : [], item, providers.data?.providers ?? []);
+       if (!place) {
+-        if (engineOf(version).id !== 'lemonvpn' || item.kind !== 'subscription' || !resources.providers.can_manage) return null;
++        if (engineOf(version).id !== 'lemonvpn' || !(item.kind === 'subscription' || managedSnapshot(item)) || !resources.providers.can_manage) return null;
+         return {
+           kind: 'edit' as const,
+           run: () => {
+diff --git a/src/features/nodes/useProviderTable.ts b/src/features/nodes/useProviderTable.ts
+index 96c975c..a0988cc 100644
+--- a/src/features/nodes/useProviderTable.ts
++++ b/src/features/nodes/useProviderTable.ts
+@@ -4,7 +4,7 @@ import {useProviderRefresh} from '../../store';
+ import {toast, toastFailure} from '../../ui/ui';
+ import {type MainSourceEdit} from '../../store/mainSource';
+ import {type SubscriptionText} from '../../dae/subscriptions';
+-import {providerRowView, type ProviderRow} from './view';
++import {managedSnapshot, providerRowView, type ProviderRow} from './view';
+ import type {useRefreshAll} from '../shared/useRefreshAll';
+ 
+ type ProviderTableInput = {
+@@ -35,7 +35,7 @@ export function useProviderTable(input: ProviderTableInput) {
+   const rows = input.rows.map(item => ({
+     ...providerRowView(item, intervals.get(item.configTag ?? item.sourceTag ?? ''), locale, t),
+     action: input.editAction(item),
+-    editLabel: t('nodes.edit', {name: item.displayName ?? item.name}),
++    editLabel: managedSnapshot(item) ? t('nodes.attachSubscription') : t('nodes.edit', {name: item.displayName ?? item.name}),
+     refreshable: item.kind === 'subscription' && input.canRefresh,
+     refreshing: refresh.busy === item.id,
+     refreshDisabled: !!refresh.busy,
+@@ -48,10 +48,10 @@ export function useProviderTable(input: ProviderTableInput) {
+         },
+         error => toastFailure(error, t, t('nodes.refreshFailed', {name: item.name}))
+       ),
+-    removable: input.canManage && (item.kind === 'subscription' || item.kind === 'file'),
++    removable: input.canManage && (item.kind === 'subscription' || item.kind === 'file' || managedSnapshot(item)),
+     removeReason: input.inInclude(item) ? t('nodes.removeInclude') : null,
+     remove: () => {
+-      if (item.kind === 'subscription' || item.kind === 'file') input.onRemove(item);
++      if (item.kind === 'subscription' || item.kind === 'file' || (item.kind === 'inline' && managedSnapshot(item))) input.onRemove(item);
+     }
+   }));
+   return {
+diff --git a/src/features/nodes/view.ts b/src/features/nodes/view.ts
+index 32790cf..cf7360f 100644
+--- a/src/features/nodes/view.ts
++++ b/src/features/nodes/view.ts
+@@ -90,6 +90,9 @@ export type ProviderRow = (Provider | (Omit<Provider, 'kind'> & {kind: 'builtin'
+   sourceTag?: string;
+   configTag?: string;
+ };
++// Managed snapshots live in providers.conf; ordinary inline configuration stays in its source editor.
++export const managedSnapshot = (item: ProviderRow): item is Provider & {kind: 'inline'} =>
++  item.kind === 'inline' && (item as ProviderRow & {'x-managed'?: boolean})['x-managed'] === true;
+ const latencyOf = (node: Node) => healthMillis(preferredHealth(node));
+ 
+ export const editableSource = (daeText: boolean, canWrite: boolean, source: ConfigSource, complete: boolean | null | undefined) =>
+@@ -293,10 +296,10 @@ export function providerRowView(item: ProviderRow, seconds: number | null | unde
+     id: item.id,
+     name,
+     url: item.url_redacted ?? undefined,
+-    kind: enumLabel(kinds, item.kind, t),
++    kind: managedSnapshot(item) ? t('nodes.kind.snapshot') : enumLabel(kinds, item.kind, t),
+     count: formatNumber(item.node_count, locale),
+     usage: used === null ? '—' : item.traffic?.total_bytes ? formatBytesFraction(used, item.traffic.total_bytes, locale, t) : formatBytes(used, locale),
+-    updatedAt: pseudo ? null : item.updated_at,
++    updatedAt: pseudo || item.updated_at?.startsWith('1970-01-01') ? null : item.updated_at,
+     expires: item.expires_at ? localTime(item.expires_at, locale) : '—',
+     // To the minute, for a card too narrow for the seconds; `expires` is its full form.
+     expiresShort: item.expires_at ? localMinute(item.expires_at, locale) : '—',
+diff --git a/src/features/rules/Rules.tsx b/src/features/rules/Rules.tsx
+index cf12650..82e80c8 100644
+--- a/src/features/rules/Rules.tsx
++++ b/src/features/rules/Rules.tsx
+@@ -1,7 +1,8 @@
+ import {Activity, Suspense, type ComponentProps, type ReactNode} from 'react';
+ import {useT} from '../../i18n';
+ import {useTraceForm} from './useTraceForm';
+-import {ErrorMessage, PageSkeleton, Tabs, type PageShape} from '../../ui/ui';
++import {ErrorMessage, Link, PageSkeleton, Tabs, Toolbar, type PageShape} from '../../ui/ui';
++import {href} from '../../shell/route';
+ import {useTabShown} from '../../ui/useTabShown';
+ import {LoadBoundary} from '../../ui/LoadBoundary';
+ import {preloadable} from '../../ui/preloadable';
+@@ -28,7 +29,11 @@ export function Rules(props: PageProps) {
+     list: (
+       <>
+         <RuleList {...props} />
+-        <ResourceManager kind="bindings" />
++        <Toolbar>
++          <Link appearance="button" href={href('flows', {tab: 'bindings'})}>
++            {t('rr.manageRouting')}
++          </Link>
++        </Toolbar>
+       </>
+     ),
+     providers: <ResourceManager kind="providers" />,
+diff --git a/src/features/settings/LanSettings.tsx b/src/features/settings/LanSettings.tsx
+index 70c2976..6735b13 100644
+--- a/src/features/settings/LanSettings.tsx
++++ b/src/features/settings/LanSettings.tsx
+@@ -99,6 +99,7 @@ export function LanSettingsCard() {
+               isDisabled={busy}
+             />
+           </div>
++          <TextField label={t('lan.advertisedAddress')} value={settings.advertised_address ?? ''} onChange={value => edit({advertised_address: value.trim() || null})} description={t('lan.advertisedHelp')} isDisabled={busy} />
+           <Switch
+             isSelected={!!auth}
+             isDisabled={busy}
+diff --git a/src/features/shared/resources/BuiltinProviders.tsx b/src/features/shared/resources/BuiltinProviders.tsx
+index f889fa7..bab2996 100644
+--- a/src/features/shared/resources/BuiltinProviders.tsx
++++ b/src/features/shared/resources/BuiltinProviders.tsx
+@@ -92,7 +92,7 @@ export function BuiltinProviders({model, close}: {model: RuntimeModel; close: ()
+               {id: 'github', label: t('rr.builtinGithubSource')}
+             ]}
+           />
+-          <OutboundSelect model={model} value={outbound} onChange={setOutbound} />
++          <OutboundSelect model={model} label={t('rr.downloadOutbound')} value={outbound} onChange={setOutbound} />
+         </div>
+         <p className="rp-note">{t('rr.builtinDownloadHelp')}</p>
+         <ErrorMessage error={error ?? model.actionError} />
+diff --git a/src/features/shared/resources/DnsWorkspace.tsx b/src/features/shared/resources/DnsWorkspace.tsx
+index af2ffb4..b6b9ba8 100644
+--- a/src/features/shared/resources/DnsWorkspace.tsx
++++ b/src/features/shared/resources/DnsWorkspace.tsx
+@@ -11,7 +11,19 @@ import {Check, Field, Grid, lines, OutboundSelect, RuntimeHeader, useRulesRuntim
+ 
+ type DnsStatistics = {
+   cache: {entries: number; bytes: number; pending: number; hits: number; misses: number; coalesced: number; stale: number};
+-  transport: {endpoints: {id: string; queries: number; failures: number; p50_ms: number | null; p95_ms: number | null; last_error: string | null}[]};
++  transport: {
++    endpoints: {
++      id: string;
++      name?: string;
++      server?: string;
++      queries: number;
++      failures: number;
++      p50_ms: number | null;
++      p95_ms: number | null;
++      last_error: string | null;
++    }[];
++  };
++  bootstrap?: {suppressed: number; failures: {domain: string; message: string; nodes: string[]; attempts: number; retry_after_seconds: number}[]};
+ };
+ export function DnsUpstreams() {
+   return (
+@@ -176,10 +188,40 @@ export function DnsLiveStats() {
+   const model = useRulesRuntime();
+   const stats = useResource({key: ['dnsWireStats'], every: 10000, fetch: signal => runtime<DnsStatistics>('GET', '/api/v1/dns/statistics', undefined, signal)});
+   const cache = stats.data?.cache;
++  const action = useAction<string>({shared: 'dns-bootstrap-retry'});
++  const retry = async (domain: string) => {
++    await action.run(domain, signal => runtime('POST', '/api/v1/dns/bootstrap/retry', {domain}, signal));
++    stats.refetch();
++  };
+   return (
+     <Card title={t('rr.actualStats')}>
+       <div className="rr-list">
+         <ErrorMessage error={stats.error} onRetry={stats.refetch} />
++        <ErrorMessage error={action.error} />
++        {!!stats.data?.bootstrap?.failures.length && (
++          <div className="rr-list">
++            <strong>{t('rr.bootstrapFailures')}</strong>
++            <p className="rp-note">{t('rr.bootstrapBackoffHint', {n: stats.data.bootstrap.suppressed})}</p>
++            {stats.data.bootstrap.failures.map(row => (
++              <div key={row.domain}>
++                <Toolbar>
++                  <strong className="rp-grow">{row.domain}</strong>
++                  <Badge>{t('rr.bootstrapRetryAfter', {n: row.retry_after_seconds})}</Badge>
++                  <Button small quiet isPending={action.busy === row.domain} isDisabled={!!action.busy} onPress={() => void retry(row.domain)}>
++                    {t('rr.bootstrapRetryNow')}
++                  </Button>
++                </Toolbar>
++                {!!row.nodes.length && (
++                  <p className="rp-note">
++                    {t('rr.bootstrapAffectedNodes')}
++                    {row.nodes.join('、')}
++                  </p>
++                )}
++                <p className="rp-note">{row.message}</p>
++              </div>
++            ))}
++          </div>
++        )}
+         {cache && (
+           <Toolbar>
+             <Badge>
+@@ -213,7 +255,8 @@ export function DnsLiveStats() {
+               {stats.data?.transport.endpoints.map(row => (
+                 <tr key={row.id}>
+                   <td>
+-                    {model.data?.document.resolvers.find(r => r.id === row.id)?.name ?? row.id}
++                    {model.data?.document.resolvers.find(r => r.id === row.id)?.name ?? row.name ?? row.id}
++                    {row.server && <p className="rp-note">{row.server}</p>}
+                     {row.last_error && <p className="rp-note">{row.last_error}</p>}
+                   </td>
+                   <td>{row.queries}</td>
+@@ -357,13 +400,13 @@ export function WireCache() {
+ export function FakeIpPolicySummary() {
+   const t = useT();
+   const model = useRulesRuntime();
+-  const rows = model.data?.document.policies.filter(p => p.enabled && p.address_mode !== 'inherit') ?? [];
++  const rows = model.data?.document.policies.filter(p => p.enabled) ?? [];
+   const action = useAction<string>({shared: 'dns-cache'});
+   const [confirm, setConfirm] = useState(false);
+   return (
+     <Card title={t('rr.fakeIpLink')}>
+       <div className="rr-list">
+-        <ErrorMessage error={action.error} />
++        <ErrorMessage error={model.error ?? action.error} onRetry={model.refetch} />
+         <p className="rp-note">{t('rr.fakeIpHint')}</p>
+         {rows.map(row => (
+           <div className="rr-item" key={row.id}>
+@@ -371,10 +414,10 @@ export function FakeIpPolicySummary() {
+               <strong>{row.name}</strong>
+               <p className="rp-note">{row.condition}</p>
+             </div>
+-            <Badge>{row.address_mode}</Badge>
++            <Badge>{row.address_mode === 'real-ip' ? t('rr.real') : row.address_mode === 'fake-ip' ? 'Fake-IP' : t('rr.inherit')}</Badge>
+           </div>
+         ))}
+-        {!rows.length && <Empty>{t('rr.noAddressPolicy')}</Empty>}
++        {model.data && !rows.length && <Empty>{t('rr.noAddressPolicy')}</Empty>}
+         <Toolbar>
+           <Link href={href('dns', {tab: 'policies'})}>{t('rr.editPolicies')}</Link>
+           <Button isDisabled={!!action.busy} onPress={() => setConfirm(true)}>
+diff --git a/src/features/shared/resources/ResourceManager.tsx b/src/features/shared/resources/ResourceManager.tsx
+index f3667d4..1f6cf77 100644
+--- a/src/features/shared/resources/ResourceManager.tsx
++++ b/src/features/shared/resources/ResourceManager.tsx
+@@ -1,6 +1,7 @@
+-import {useRef, useState} from 'react';
++import {useEffect, useRef, useState} from 'react';
+ import {useT, type Key} from '../../../i18n';
+-import {Button, Card, Empty, ErrorMessage, ModalDialog, Toolbar, Badge} from '../../../ui/ui';
++import {Button, Card, Empty, ErrorMessage, Link, ModalDialog, Toolbar, Badge} from '../../../ui/ui';
++import {href} from '../../../shell/route';
+ import {useAction} from '../../../store/action';
+ import {refetchAll} from '../../../store/resourceCore';
+ import {useDraftGuard} from '../../../shell/draft';
+@@ -32,7 +33,11 @@ const names: Record<ResourceKind, Key> = {
+   policies: 'rr.policies',
+   bindings: 'rr.bindings'
+ };
+-export function ResourceManager({kind, initialCondition}: {kind: ResourceKind; initialCondition?: string}) {
++const referencesProvider = (condition: string, id: string) =>
++  Array.from(condition.matchAll(/\bruleset\(\s*(?:'([^']+)'|"([^"]+)"|([a-zA-Z0-9_-]+))\s*\)/g)).some(
++    ([, single, double, bare]) => (single ?? double ?? bare) === id
++  );
++export function ResourceManager({kind, initialCondition, providerId}: {kind: ResourceKind; initialCondition?: string; providerId?: string | null}) {
+   const t = useT();
+   const model = useRulesRuntime();
+   const refreshAction = useAction<'refresh'>({shared: 'rule-provider-download'});
+@@ -58,12 +63,31 @@ export function ResourceManager({kind, initialCondition}: {kind: ResourceKind; i
+     }
+   };
+   const [editing, setEditing] = useState<ResourceRow | null>(null);
++  const openedProvider = useRef<string | null>(null);
+   const [deleting, setDeleting] = useState<ResourceRow | null>(null);
+   const [preview, setPreview] = useState<RuleProvider | null>(null);
+   const [builtin, setBuiltin] = useState(false);
+-  const [drop, setDrop] = useState('');
++  const [drop, setDrop] = useState<{id: string; after: boolean} | null>(null);
+   const drag = useRef('');
+   const rows = model.data?.document[kind] ?? [];
++  useEffect(() => {
++    if (kind !== 'bindings' || !providerId || !model.data || openedProvider.current === providerId) return;
++    const provider = model.data.document.providers.find(p => p.id === providerId);
++    if (!provider) return;
++    openedProvider.current = providerId;
++    const existing = model.data.document.bindings.find(b => referencesProvider(b.condition, providerId));
++    setEditing(
++      existing
++        ? structuredClone(existing)
++        : {
++            id: resourceId(),
++            name: provider.name,
++            enabled: true,
++            condition: `ruleset(${JSON.stringify(providerId)})`,
++            outbound: 'direct'
++          }
++    );
++  }, [kind, providerId, model.data]);
+   const add = () => {
+     const base = {id: resourceId(), name: '', enabled: true};
+     const condition = initialCondition ?? 'domain(suffix: example.com)';
+@@ -73,14 +97,14 @@ export function ResourceManager({kind, initialCondition}: {kind: ResourceKind; i
+         : kind === 'resolvers'
+           ? {...base, url: 'https://dns.alidns.com/dns-query', outbound: 'direct', bootstrap: ['223.5.5.5'], tls_name: '', timeout_ms: 3000}
+           : kind === 'pools'
+-            ? {...base, members: [], strategy: 'fallback'}
++            ? {...base, members: [], strategy: 'fallback', failover: ''}
+             : kind === 'policies'
+               ? {...base, condition, pool: model.data?.document.pools[0]?.id ?? '', address_mode: 'inherit'}
+               : {...base, condition, outbound: 'direct'};
+     setEditing(row);
+   };
+   const reorder = (id: string, before: string) => {
+-    setDrop('');
++    setDrop(null);
+     drag.current = '';
+     if (!model.data || model.busy || id === before) return;
+     const changed = rows.filter(r => r.id !== id);
+@@ -110,6 +134,7 @@ export function ResourceManager({kind, initialCondition}: {kind: ResourceKind; i
+       <div className="rr-list">
+         {rows.map((row, index) => {
+           const provider = kind === 'providers' ? (row as RuleProvider) : null;
++          const routes = provider ? (model.data?.document.bindings ?? []).filter(b => referencesProvider(b.condition, provider.id)) : [];
+           const resource = model.data?.resources.find(r => r.id === row.id);
+           const update = model.data?.updates[row.id];
+           const sortable = kind === 'policies' || kind === 'bindings';
+@@ -117,16 +142,24 @@ export function ResourceManager({kind, initialCondition}: {kind: ResourceKind; i
+             <div
+               className="rr-item"
+               key={row.id}
+-              data-drop={drop === row.id}
++              data-drop={drop?.id === row.id ? (drop.after ? 'after' : 'before') : undefined}
+               onDragOver={e => {
+                 if (sortable && drag.current) {
+                   e.preventDefault();
+-                  setDrop(row.id);
++                  const bounds = e.currentTarget.getBoundingClientRect();
++                  setDrop({id: row.id, after: e.clientY >= bounds.top + bounds.height / 2});
+                 }
+               }}
+               onDrop={e => {
+                 e.preventDefault();
+-                if (sortable) reorder(drag.current, row.id);
++                if (sortable && drag.current) {
++                  const bounds = e.currentTarget.getBoundingClientRect();
++                  const before = e.clientY >= bounds.top + bounds.height / 2 ? (rows[index + 1]?.id ?? '') : row.id;
++                  if (drag.current === row.id) {
++                    setDrop(null);
++                    drag.current = '';
++                  } else reorder(drag.current, before);
++                }
+               }}
+             >
+               {sortable && (
+@@ -139,7 +172,7 @@ export function ResourceManager({kind, initialCondition}: {kind: ResourceKind; i
+                   }}
+                   onEnd={() => {
+                     drag.current = '';
+-                    setDrop('');
++                    setDrop(null);
+                   }}
+                 />
+               )}
+@@ -161,6 +194,18 @@ export function ResourceManager({kind, initialCondition}: {kind: ResourceKind; i
+                   </p>
+                 )}
+                 {provider?.updated_at ? <p className="rp-note">{new Date(provider.updated_at * 1000).toLocaleString()}</p> : null}
++                {provider && (
++                  <p className="rp-note">
++                    {routes.length
++                      ? routes
++                          .map(
++                            b =>
++                              `${b.enabled ? '' : t('rr.routeDisabled')}${t('rr.trafficOutbound')}：${b.outbound === 'direct' ? t('rr.direct') : b.outbound === 'block' ? t('rr.block') : b.outbound}`
++                          )
++                          .join(' · ')
++                      : t('rr.routeUnbound')}
++                  </p>
++                )}
+                 {update && (
+                   <p role="status" className="rp-note">
+                     {t(
+@@ -182,9 +227,16 @@ export function ResourceManager({kind, initialCondition}: {kind: ResourceKind; i
+                     {model.data?.document.pools.find(p => p.id === row.pool)?.name ?? row.pool} · {row.address_mode}
+                   </Badge>
+                 )}
+-                {'outbound' in row && !provider && <Badge>{row.outbound === 'direct' ? t('rr.direct') : row.outbound}</Badge>}
++                {'outbound' in row && !provider && (
++                  <Badge>{row.outbound === 'direct' ? t('rr.direct') : row.outbound === 'block' ? t('rr.block') : row.outbound}</Badge>
++                )}
+               </div>
+               <div className="rp-cluster">
++                {provider && (
++                  <Link small appearance="button" href={href('flows', {tab: 'bindings', provider: provider.id})}>
++                    {t('rr.setRouting')}
++                  </Link>
++                )}
+                 {'enabled' in row && (
+                   <Check
+                     label={t('rr.enabled')}
+@@ -449,7 +501,7 @@ function ResourceEditor({kind, initial, model, close}: {kind: ResourceKind; init
+                     value={provider.interval}
+                     onChange={v => patch({interval: Number(v)})}
+                   />
+-                  <OutboundSelect model={model} value={provider.outbound} onChange={outbound => patch({outbound})} />
++                  <OutboundSelect model={model} label={t('rr.downloadOutbound')} value={provider.outbound} onChange={outbound => patch({outbound})} />
+                 </Grid>
+                 <Field label={t('rr.sha256')} value={provider.expected_sha256} onChange={expected_sha256 => patch({expected_sha256})} />
+                 <Field area label={t('rr.headers')} value={headers} onChange={setHeaders} hint={t('rr.headersHint')} />
+@@ -460,7 +512,7 @@ function ResourceEditor({kind, initial, model, close}: {kind: ResourceKind; init
+         {kind === 'resolvers' && (
+           <>
+             <Field label={t('rr.endpoint')} value={resolver.url} onChange={url => patch({url})} hint={t('rr.endpointHint')} />
+-            <OutboundSelect model={model} value={resolver.outbound} onChange={outbound => patch({outbound})} />
++            <OutboundSelect model={model} label={t('rr.dnsOutbound')} value={resolver.outbound} onChange={outbound => patch({outbound})} />
+             <details className="rr-details">
+               <summary>{t('rr.advanced')}</summary>
+               <div className="rr-list">
+@@ -496,6 +548,16 @@ function ResourceEditor({kind, initial, model, close}: {kind: ResourceKind; init
+                 {id: 'race', label: t('rr.race')}
+               ]}
+             />
++            <Select
++              label={t('rr.poolFailover')}
++              value={pool.failover ?? ''}
++              onChange={failover => patch({failover})}
++              items={[
++                {id: '', label: t('rr.poolFailoverNone')},
++                ...(model.data?.document.pools ?? []).filter(p => p.id !== pool.id).map(p => ({id: p.id, label: p.name}))
++              ]}
++            />
++            <p className="rp-note">{t('rr.poolFailoverHint')}</p>
+             <p className="rp-note">{t('rr.poolHint')}</p>
+             {(model.data?.document.resolvers ?? []).map(r => (
+               <Check
+@@ -563,7 +625,9 @@ function ResourceEditor({kind, initial, model, close}: {kind: ResourceKind; init
+             />
+           </Grid>
+         )}
+-        {kind === 'bindings' && <OutboundSelect model={model} value={binding.outbound} onChange={outbound => patch({outbound})} />}
++        {kind === 'bindings' && (
++          <OutboundSelect model={model} allowBlock label={t('rr.trafficOutbound')} value={binding.outbound} onChange={outbound => patch({outbound})} />
++        )}
+         <p className="rp-note">{t('rr.transactionHint')}</p>
+       </fieldset>
+     </ModalDialog>
+diff --git a/src/features/shared/resources/common.tsx b/src/features/shared/resources/common.tsx
+index 797d4b1..791ca87 100644
+--- a/src/features/shared/resources/common.tsx
++++ b/src/features/shared/resources/common.tsx
+@@ -51,15 +51,29 @@ export function RuntimeHeader({model}: {model: RuntimeModel}) {
+   );
+ }
+ export {Field, Select, Check, Grid} from '../../../ui/ResourceFields';
+-export function OutboundSelect({model, value, onChange}: {model: RuntimeModel; value: string; onChange: (value: string) => void}) {
++export function OutboundSelect({
++  model,
++  value,
++  onChange,
++  label,
++  allowBlock = false
++}: {
++  model: RuntimeModel;
++  value: string;
++  onChange: (value: string) => void;
++  label?: string;
++  allowBlock?: boolean;
++}) {
+   const t = useT();
+   return (
+     <Select
+-      label={t('rr.outbound')}
++      label={label ?? t('rr.outbound')}
+       value={value}
+       onChange={onChange}
+       disabled={model.busy}
+-      items={(model.data?.outbounds ?? []).filter(o => o.id !== 'block').map(o => ({id: o.id, label: o.id === 'direct' ? t('rr.direct') : o.id}))}
++      items={(model.data?.outbounds ?? [])
++        .filter(o => allowBlock || o.id !== 'block')
++        .map(o => ({id: o.id, label: o.id === 'direct' ? t('rr.direct') : o.id === 'block' ? t('rr.block') : o.id}))}
+     />
+   );
+ }
+diff --git a/src/features/shared/resources/resources.css b/src/features/shared/resources/resources.css
+index 9834888..414a552 100644
+--- a/src/features/shared/resources/resources.css
++++ b/src/features/shared/resources/resources.css
+@@ -66,9 +66,12 @@
+ .rr-item[draggable='true'] {
+   cursor: grab;
+ }
+-.rr-item[data-drop='true'] {
++.rr-item[data-drop='before'] {
+   border-top: 3px solid currentcolor;
+ }
++.rr-item[data-drop='after'] {
++  border-bottom: 3px solid currentcolor;
++}
+ .rr-main {
+   flex: 1 1 220px;
+   min-width: 0;
+diff --git a/src/i18n/locales/en.json b/src/i18n/locales/en.json
+index 12ba77d..3a2d8ef 100644
+--- a/src/i18n/locales/en.json
++++ b/src/i18n/locales/en.json
+@@ -1,4 +1,10 @@
+ {
++  "nodes.deleteNoChange": "Node was not deleted. Refresh and try again.",
++  "rr.bootstrapFailures": "Bootstrap lookup failures",
++  "rr.bootstrapBackoffHint": "Failed domains retry later; other domains continue. {n} duplicate requests suppressed.",
++  "rr.bootstrapRetryAfter": "Retry in {n}s",
++  "rr.bootstrapRetryNow": "Retry now",
++  "rr.bootstrapAffectedNodes": "Affected nodes: ",
+   "about.contract": "Contract commit",
+   "about.credits": "Fonts Noto Sans TC/SC (OFL); icons Adobe Spectrum (Apache-2.0); palettes from Rosé Pine, Catppuccin, Nord, Kary Pro Colors, Ant Design, Arco Design and Semi Design.",
+   "about.duck": "Pet me",
+@@ -697,8 +703,8 @@
+   "dns.fakeIpDiscard": "Discard / reload",
+   "dns.fakeIpFilterError": "Up to 256 excluded domains are allowed.",
+   "dns.fakeIpFilters": "Excluded domains",
+-  "dns.fakeIpFiltersHelp": "One per line; supports *.example.com and +.example.com. Up to 256 entries.",
+-  "dns.fakeIpHotHelp": "Saving applies immediately. Changing address pools rebuilds mappings.",
++  "dns.fakeIpFiltersHelp": "One per line; * matches one label, +. includes subdomains. Up to 256 entries.",
++  "dns.fakeIpHotHelp": "Applies immediately. Mode or pool changes reset mappings.",
+   "dns.fakeIpInactive": "TUN is off; these settings will be used when enabled",
+   "dns.fakeIpMode": "DNS mode",
+   "dns.fakeIpModeFake": "Fake-IP (virtual addresses)",
+@@ -1027,7 +1033,7 @@
+   "hint.connections": "Live connections, grouped by device",
+   "hint.dns": "Name resolution and cache contents",
+   "hint.events": "Backend state changes",
+-  "hint.flows": "Routing map and flow records",
++  "hint.flows": "Category routing, connection topology and flow records",
+   "hint.logs": "Live engine log",
+   "hint.nodes": "Node sources, usage and updates",
+   "hint.overview": "Service state and backend features",
+@@ -1051,11 +1057,11 @@
+   "lan.copyHttp": "Copy HTTP address",
+   "lan.copySocks": "Copy SOCKS5 address",
+   "lan.credentialsNeeded": "Enter the configured username and password on the device. Copied addresses exclude credentials.",
+-  "lan.deviceHelp": "Use manual proxy settings on the device: enter the server address and port below. Uses the current rules and outbound; HTTP/HTTPS and SOCKS5 TCP are supported.",
++  "lan.deviceHelp": "Enter the server and port on each device. Supports HTTP/HTTPS and SOCKS5 TCP/UDP.",
+   "lan.devices": "Connect another device",
+   "lan.disabled": "LAN sharing disabled",
+   "lan.enable": "Allow LAN connections",
+-  "lan.firewall": "Keep LemonVPN running. Allow the shared TCP port through your firewall; client isolation on Wi-Fi must be off. Only private IPv4 clients and public destinations are supported; this does not provide a gateway or UDP relay.",
++  "lan.firewall": "Private IPv4 clients and public targets only. Docker bridge requires publishing the same TCP/UDP port. Sharing changes recreate UDP associations.",
+   "lan.inactive": "Off",
+   "lan.noAddress": "No private IPv4 address found. Connect to Wi-Fi or Ethernet, then reload.",
+   "lan.noAuthentication": "No authentication. Only trusted devices should join this LAN.",
+@@ -1225,6 +1231,9 @@
+   "nodes.details": "Node details",
+   "nodes.edit": "Edit {name}",
+   "nodes.editAction": "Edit…",
++  "nodes.kind.snapshot": "Node snapshot",
++  "nodes.attachSubscription": "Set subscription URL",
++  "nodes.editSnapshotHelp": "This migrated snapshot has no subscription URL. Add one to enable refresh; existing nodes remain until refresh succeeds.",
+   "nodes.editManagedHelp": "Save the subscription URL and update options, then refresh to load new nodes. Existing nodes stay available until a successful refresh.",
+   "nodes.editMissing": "This subscription is no longer in its config file",
+   "nodes.editNodeHelp": "Updates the node link in its source. Renaming also updates exact node filters, default and final in that source.",
+@@ -1344,7 +1353,7 @@
+   "nodes.removeInclude": "Declared outside the main configuration file. Remove it from that file.",
+   "nodes.removeNodeHelp": "Delete this node and apply immediately. Subscription refreshes will keep it deleted.",
+   "nodes.removeNodeTitle": "Remove node {name}",
+-  "nodes.removeProviderHelp": "Deletes this node source and its nodes from the main configuration and reloads.",
++  "nodes.removeProviderHelp": "Remove this source and its nodes, clean up group membership, and apply immediately. Rules or chains referencing individual nodes must be reassigned first.",
+   "nodes.removeProviderTitle": "Remove node source {name}",
+   "nodes.removed": "{name} removed",
+   "nodes.renameElsewhere": "Another source refers to this node. Change those references before renaming.",
+@@ -1759,7 +1768,8 @@
+   "rr.applying": "Applying",
+   "rr.behavior": "Behavior",
+   "rr.bindingHelp": "Applied after user rules and before fallback; outbound modes take priority.",
+-  "rr.bindings": "Resource routing",
++  "rr.bindings": "Category routing",
++  "rr.manageRouting": "Manage category routing",
+   "rr.block": "block (reject connection)",
+   "rr.bootstrap": "Independent bootstrap DNS",
+   "rr.bootstrapHint": "Comma separated. Empty uses independent bootstrap DNS.",
+@@ -1818,7 +1828,7 @@
+   "rr.builtinTelegramHint": "Telegram messaging and media domains.",
+   "rr.builtinTelegramIp": "Telegram IP ranges",
+   "rr.builtinTelegramIpHint": "Telegram service networks.",
+-  "rr.builtinUsage": "After adding, use the rule set in routing rules or DNS policies.",
++  "rr.builtinUsage": "After adding, configure routing or reference the set in a DNS policy.",
+   "rr.builtinYoutube": "YouTube",
+   "rr.builtinYoutubeHint": "Video, media and related service domains.",
+   "rr.cacheEntries": "Entries",
+@@ -1917,7 +1927,13 @@
+   "rr.presetMissingGeo": "Requires GeoSite cn. Missing data leaves the previous configuration unchanged. Existing rules are preserved.",
+   "rr.presetRouting": "Also create matching routing bindings",
+   "rr.previous": "Previous",
+-  "rr.providerHelp": "Define matches once; reference them from routing, DNS and Fake-IP.",
++  "rr.downloadOutbound": "Download rule set via",
++  "rr.dnsOutbound": "Send DNS queries via",
++  "rr.trafficOutbound": "Matched traffic outbound",
++  "rr.setRouting": "Configure routing",
++  "rr.routeUnbound": "No traffic routing configured; a rule set alone does not change the outbound.",
++  "rr.routeDisabled": "Disabled · ",
++  "rr.providerHelp": "Rule sets define what to match. Configure routing to choose where matching traffic goes.",
+   "rr.providers": "Rule sets",
+   "rr.queries": "Queries",
+   "rr.race": "Race first two",
+@@ -2899,5 +2915,22 @@
+   "widgets.unpin": "Unpin panel",
+   "widgets.up": "Move up",
+   "wordmark.gradient": "Gradient",
+-  "wordmark.plain": "Plain"
++  "wordmark.plain": "Plain",
++  "dns.ipv6Enable": "IPv6 egress and AAAA",
++  "dns.ipv6Help": "Disable to capture IPv4 only and suppress AAAA replies.",
++  "dns.sniffEnable": "Domain sniffing",
++  "dns.sniffHelp": "Recover HTTP, TLS and QUIC domains for routing.",
++  "dns.listenerPort": "DNS port",
++  "dns.listenerTitle": "LAN DNS",
++  "dns.listenerEnable": "Share DNS",
++  "dns.listenerHelp": "TCP and UDP share a port; only permitted private clients can query.",
++  "dns.listenerNetworks": "Allowed networks (one CIDR per line)",
++  "dns.listenerCount": "Queries {queries} · failures {failures}",
++  "dns.listenerFake": "Uses the active TUN Fake-IP pool, exclusions and DNS policies.",
++  "dns.listenerReal": "Returns real addresses while TUN is off; uses the same mapping pool when enabled.",
++  "lan.advertisedAddress": "UDP advertised address (optional)",
++  "lan.advertisedHelp": "For Docker bridge, enter the host LAN IP and publish the same UDP port.",
++  "rr.poolFailover": "Failover pool",
++  "rr.poolFailoverNone": "No failover",
++  "rr.poolFailoverHint": "Use this pool if every upstream fails. NXDOMAIN does not trigger failover."
+ }
+diff --git a/src/i18n/locales/zh-CN.json b/src/i18n/locales/zh-CN.json
+index 6ffc1d2..10989f5 100644
+--- a/src/i18n/locales/zh-CN.json
++++ b/src/i18n/locales/zh-CN.json
+@@ -1,4 +1,10 @@
+ {
++  "nodes.deleteNoChange": "节点未删除，请刷新后重试",
++  "rr.bootstrapFailures": "引导解析异常",
++  "rr.bootstrapBackoffHint": "失败域名稍后重试，不影响其他域名。已合并或跳过 {n} 次重复请求。",
++  "rr.bootstrapRetryAfter": "{n} 秒后重试",
++  "rr.bootstrapRetryNow": "立即重试",
++  "rr.bootstrapAffectedNodes": "受影响节点：",
+   "about.contract": "契约提交",
+   "about.credits": "字体 Noto Sans TC／SC（OFL）；图标 Adobe Spectrum（Apache-2.0）；配色来自 Rosé Pine、Catppuccin、Nord、Kary Pro Colors、Ant Design、Arco Design 与 Semi Design。",
+   "about.duck": "摸摸我",
+@@ -616,8 +622,8 @@
+   "dns.fakeIpDiscard": "取消修改 / 重新加载",
+   "dns.fakeIpFilterError": "排除名单最多 256 项。",
+   "dns.fakeIpFilters": "排除名单",
+-  "dns.fakeIpFiltersHelp": "每行一个域名，支持 *.example.com 和 +.example.com，最多 256 项。",
+-  "dns.fakeIpHotHelp": "保存后立即热更新；地址池变更会重建映射。",
++  "dns.fakeIpFiltersHelp": "每行一项；* 匹配一级，+. 包含子域。最多 256 项。",
++  "dns.fakeIpHotHelp": "立即应用；切换模式或地址池会重建映射。",
+   "dns.fakeIpInactive": "TUN 未开启，设置会在开启时使用",
+   "dns.fakeIpMode": "DNS 模式",
+   "dns.fakeIpModeFake": "Fake-IP（虚拟地址）",
+@@ -910,7 +916,7 @@
+   "hint.connections": "当前的连接，按设备分组",
+   "hint.dns": "域名解析与缓存内容",
+   "hint.events": "后端状态变更记录",
+-  "hint.flows": "分流总览与流程记录",
++  "hint.flows": "分类分流、连接拓扑与流程记录",
+   "hint.logs": "引擎实时日志",
+   "hint.nodes": "节点来源、用量与更新",
+   "hint.overview": "服务状态与后端能力",
+@@ -934,11 +940,11 @@
+   "lan.copyHttp": "复制 HTTP 地址",
+   "lan.copySocks": "复制 SOCKS5 地址",
+   "lan.credentialsNeeded": "设备需填写上方用户名和密码，复制地址不包含密码。",
+-  "lan.deviceHelp": "设备选择手动代理，填写下方服务器地址和端口。沿用当前规则和出站，支持 HTTP/HTTPS、SOCKS5 TCP。",
++  "lan.deviceHelp": "设备填写服务器地址和端口，支持 HTTP/HTTPS、SOCKS5 TCP/UDP。",
+   "lan.devices": "其他设备连接",
+   "lan.disabled": "局域网共享已关闭",
+   "lan.enable": "允许局域网连接",
+-  "lan.firewall": "需保持 LemonVPN 运行，防火墙放行共享 TCP 端口，并关闭 Wi-Fi 客户端隔离。仅接收私网 IPv4 设备、代理公网目标；不提供网关或 UDP 转发。",
++  "lan.firewall": "仅接收私网 IPv4 设备并代理公网目标。Docker bridge 模式需同时发布同一 TCP/UDP 端口；UDP 关联在更改共享设置后重建。",
+   "lan.inactive": "未共享",
+   "lan.noAddress": "未找到局域网 IPv4 地址，请连接 Wi-Fi 或网线后刷新。",
+   "lan.noAuthentication": "未启用认证，请仅在可信局域网中使用。",
+@@ -1087,6 +1093,9 @@
+   "nodes.details": "节点详细信息",
+   "nodes.edit": "编辑 {name}",
+   "nodes.editAction": "编辑…",
++  "nodes.kind.snapshot": "节点快照",
++  "nodes.attachSubscription": "设置订阅地址",
++  "nodes.editSnapshotHelp": "迁移快照没有订阅地址。补填后可刷新；成功前保留现有节点。",
+   "nodes.editManagedHelp": "修改订阅地址和更新选项后保存，再刷新以获取新节点。更新成功前保留现有节点。",
+   "nodes.editMissing": "配置文件中已找不到此订阅",
+   "nodes.editNodeHelp": "更新来源中的节点链接。重命名时，同时更新同一来源中的精确节点筛选、default 和 final。",
+@@ -1191,7 +1200,7 @@
+   "nodes.removeInclude": "声明于主配置文件以外的文件，请在该文件中移除。",
+   "nodes.removeNodeHelp": "删除节点并立即生效，订阅刷新不会恢复此节点。",
+   "nodes.removeNodeTitle": "移除节点 {name}",
+-  "nodes.removeProviderHelp": "从主配置删除此节点来源及其节点，并重载。",
++  "nodes.removeProviderHelp": "移除此来源及其节点，清理所属组并热更新。直接引用这些节点的规则或链路需先更换出站。",
+   "nodes.removeProviderTitle": "移除节点来源 {name}",
+   "nodes.removed": "{name} 已移除",
+   "nodes.renameElsewhere": "其他来源引用此节点。请先修改引用，再重命名。",
+@@ -1583,6 +1592,7 @@
+   "rr.behavior": "匹配类型",
+   "rr.bindingHelp": "在用户路由规则之后、默认出站之前匹配；全局和直连模式优先。",
+   "rr.bindings": "分类分流",
++  "rr.manageRouting": "管理分类分流",
+   "rr.block": "block（阻断）",
+   "rr.bootstrap": "独立引导 DNS",
+   "rr.bootstrapHint": "逗号分隔；留空时使用独立引导 DNS。",
+@@ -1641,7 +1651,7 @@
+   "rr.builtinTelegramHint": "Telegram 消息与媒体域名。",
+   "rr.builtinTelegramIp": "Telegram IP",
+   "rr.builtinTelegramIpHint": "Telegram 服务网段。",
+-  "rr.builtinUsage": "添加后，在路由规则或 DNS 策略中引用。",
++  "rr.builtinUsage": "添加后，设置分流或在 DNS 策略中引用。",
+   "rr.builtinYoutube": "YouTube",
+   "rr.builtinYoutubeHint": "视频、媒体与相关服务域名。",
+   "rr.cacheEntries": "条目数",
+@@ -1740,7 +1750,13 @@
+   "rr.presetMissingGeo": "需要已加载 GeoSite cn；缺失时会提示并保持原配置。不会自动更改已有规则。",
+   "rr.presetRouting": "同时建立对应路由分流",
+   "rr.previous": "上一页",
+-  "rr.providerHelp": "资源定义匹配范围，路由、DNS 和 Fake-IP 共用引用。",
++  "rr.downloadOutbound": "下载规则集经由",
++  "rr.dnsOutbound": "DNS 查询经由",
++  "rr.trafficOutbound": "命中后出站",
++  "rr.setRouting": "设置分流",
++  "rr.routeUnbound": "未设置流量分流；规则集本身不会改变出站。",
++  "rr.routeDisabled": "已停用 · ",
++  "rr.providerHelp": "规则集定义匹配范围；点“设置分流”选择流量去向。",
+   "rr.providers": "规则集",
+   "rr.queries": "查询数",
+   "rr.race": "前两个竞速",
+@@ -2680,5 +2696,22 @@
+   "widgets.unpin": "取消固定面板",
+   "widgets.up": "上移",
+   "wordmark.gradient": "渐变",
+-  "wordmark.plain": "纯色"
++  "wordmark.plain": "纯色",
++  "dns.ipv6Enable": "IPv6 出口与 AAAA",
++  "dns.ipv6Help": "关闭后仅接管 IPv4，DNS 不返回 AAAA。",
++  "dns.sniffEnable": "域名嗅探",
++  "dns.sniffHelp": "从 HTTP、TLS、QUIC 恢复域名，用于分流。",
++  "dns.listenerPort": "DNS 端口",
++  "dns.listenerTitle": "局域网 DNS",
++  "dns.listenerEnable": "共享 DNS",
++  "dns.listenerHelp": "TCP / UDP 共用端口；仅向允许的私网设备提供解析。",
++  "dns.listenerNetworks": "允许网段（每行一个 CIDR）",
++  "dns.listenerCount": "查询 {queries} · 失败 {failures}",
++  "dns.listenerFake": "沿用 TUN 的 Fake-IP、排除名单和 DNS 分流。",
++  "dns.listenerReal": "TUN 关闭时仅返回真实地址；开启后使用同一映射池。",
++  "lan.advertisedAddress": "UDP 对外地址（可选）",
++  "lan.advertisedHelp": "Docker bridge 请填写宿主机局域网 IP，并发布同端口 UDP。",
++  "rr.poolFailover": "故障回退",
++  "rr.poolFailoverNone": "不使用备用池",
++  "rr.poolFailoverHint": "全部上游失败时转到备用池；NXDOMAIN 不回退。"
+ }
+diff --git a/src/shell/Backend.tsx b/src/shell/Backend.tsx
+index f2110de..1767d86 100644
+--- a/src/shell/Backend.tsx
++++ b/src/shell/Backend.tsx
+@@ -76,7 +76,7 @@ export function BackendIndicator({backend, honk, panel = false}: {backend: Backe
+       }}
+     />
+   );
+-  return hasDesktop && !panel ? (
++  return !panel ? (
+     <div className="rp-desktop-footer">
+       {indicator}
+       <Link appearance="button" quiet small icon href={href('settings')} label={t('nav.settings')} tip={t('nav.settings')}>
+diff --git a/src/shell/DesktopControls.tsx b/src/shell/DesktopControls.tsx
+index 01a6cf9..1a04bd8 100644
+--- a/src/shell/DesktopControls.tsx
++++ b/src/shell/DesktopControls.tsx
+@@ -2,19 +2,27 @@ import {useEffect, useState} from 'react';
+ import {useT} from '../i18n';
+ import {Button, Link} from '../ui/ui';
+ import {useCapabilities, useTun} from '../store';
+-import {tunAvailable, useDesktopStatus} from '../store/desktop';
+-import {desktop, invokeDesktop} from '../desktop';
++import {lanAvailable, tunAvailable, useDesktopStatus} from '../store/desktop';
++import {desktop, hasDesktop, invokeDesktop} from '../desktop';
++import {getApi} from '../api';
++import {useResource} from '../store/resource';
++import {useAction} from '../store/action';
+ import {href} from './route';
+ 
+ export function DesktopControls() {
+   const t = useT();
++  const api = getApi();
+   const caps = useCapabilities();
+-  const {proxy, enabled} = useDesktopStatus(caps.data?.resources);
++  const {proxy} = useDesktopStatus(caps.data?.resources);
+   const tunUsable = tunAvailable(caps.data?.resources);
+   const proxyUsable = desktop?.platform === 'windows' || desktop?.platform === 'macos' || (desktop?.platform === 'linux' && proxy.data?.supported === true);
+-  const tun = useTun(enabled && tunUsable);
++  const tun = useTun(tunUsable);
++  const lanUsable = !hasDesktop && lanAvailable(caps.data?.resources) && !!api.lanSettings && !!api.setLanSettings;
++  const lan = useResource({key: ['lanSettings'], every: 10000, fetch: signal => api.lanSettings!(signal)}, {enabled: lanUsable});
++  const lanAction = useAction<'set'>({shared: 'lan-settings', rethrow: true});
+   const [proxyBusy, setProxyBusy] = useState(false);
+   const [error, setError] = useState<Error | null>(null);
++  const [errorCard, setErrorCard] = useState('tun');
+   useEffect(() => {
+     const receive = (event: Event) => {
+       if (event instanceof CustomEvent && typeof event.detail?.message === 'string') setError(new Error(event.detail.message));
+@@ -35,6 +43,7 @@ export function DesktopControls() {
+     }
+   };
+   const changeTun = async () => {
++    setErrorCard('tun');
+     setError(null);
+     try {
+       await tun.set(!tun.data?.enabled);
+@@ -42,7 +51,19 @@ export function DesktopControls() {
+       setError(error instanceof Error ? error : new Error(String(error)));
+     }
+   };
+-  if (!proxyUsable && !tunUsable) return null;
++  const changeLan = async () => {
++    if (!lan.data) return;
++    setError(null);
++    setErrorCard('lan');
++    try {
++      const current = lan.data;
++      await lanAction.run('set', signal => api.setLanSettings!(current.revision, {...current.settings, enabled: !current.settings.enabled}, signal));
++      lan.refetch();
++    } catch (error) {
++      setError(error instanceof Error ? error : new Error(String(error)));
++    }
++  };
++  if (!proxyUsable && !tunUsable && !lanUsable) return null;
+   return (
+     <div className="rp-desktop-controls">
+       <div className="rp-desktop-control-grid">
+@@ -64,6 +85,24 @@ export function DesktopControls() {
+             <span>{t('desktop.systemProxy')}</span>
+           </Button>
+         )}
++        {lanUsable && (
++          <Button
++            appearance="plain"
++            className="rp-desktop-toggle"
++            isSelected={lan.data?.settings.enabled === true}
++            isDisabled={!lan.data || !!lanAction.busy}
++            onPress={() => void changeLan()}
++          >
++            <span className="rp-desktop-toggle-top">
++              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
++                <circle cx="12" cy="12" r="9" />
++                <path d="M3 12h18M12 3c5 5 5 13 0 18-5-5-5-13 0-18Z" />
++              </svg>
++              <span className="rp-desktop-toggle-track" aria-hidden="true" />
++            </span>
++            <span>{t('lan.title')}</span>
++          </Button>
++        )}
+         {tunUsable && (
+           <Button
+             appearance="plain"
+@@ -84,10 +123,10 @@ export function DesktopControls() {
+         )}
+       </div>
+       {proxy.data?.scope === 'session' && <p className="rp-note">{t('desktop.proxySessionHelp')}</p>}
+-      {error && (
++      {(error || (lanUsable && lan.error) || (tunUsable && tun.error)) && (
+         <div className="rp-desktop-control-error" role="alert">
+-          <span>{error.message}</span>
+-          <Link href={href('settings', {card: 'tun'})}>{t('settings.tun')}</Link>
++          <span>{(error ?? lan.error ?? tun.error)?.message}</span>
++          <Link href={href('settings', {card: error ? errorCard : lan.error ? 'lan' : 'tun'})}>{t('nav.settings')}</Link>
+         </div>
+       )}
+     </div>
+diff --git a/src/shell/Frame.tsx b/src/shell/Frame.tsx
+index 7f28fee..bbc1d13 100644
+--- a/src/shell/Frame.tsx
++++ b/src/shell/Frame.tsx
+@@ -18,7 +18,6 @@ import type {PageProps} from './routes';
+ import {RefusalWait} from './RefusalWait';
+ import {keepPages, type KeptPage} from './kept';
+ import {hasOpenOverlay, OverlayScopeContext, type OverlayScope} from '../ui/openOverlays';
+-import {hasDesktop} from '../desktop';
+ import '../ui/styles/desktop-sidebar.css';
+ 
+ export type FrameProps = {
+@@ -76,7 +75,7 @@ function Layout({lang, pickLang, ap, route, query, go, openSearch, mac, view}: F
+   const Page = view.current.Page;
+   const hub = view.groups.find(group => group.items.some(item => item.current));
+   return (
+-    <div className={`rp-shell${hasDesktop ? ' rp-desktop-shell' : ''}`}>
++    <div className="rp-shell rp-desktop-shell">
+       <TopBar
+         route={route}
+         lang={lang}
+diff --git a/src/shell/SideNav.tsx b/src/shell/SideNav.tsx
+index e1f6dd0..9ca38e2 100644
+--- a/src/shell/SideNav.tsx
++++ b/src/shell/SideNav.tsx
+@@ -1,11 +1,9 @@
+-import {memo, useState} from 'react';
++import {memo} from 'react';
+ import {SidebarWidgets} from './widgets/host';
+-import {readNavGroups, saveNavGroups} from './navGroups';
+-import {Disclosure, Link} from '../ui/ui';
++import {Link} from '../ui/ui';
+ import {useMoreBelow, useSlider} from '../ui/hooks';
+ import {warmPage} from './registry';
+ import type {BackendView, NavGroup} from './view';
+-import {hasDesktop} from '../desktop';
+ import {useT} from '../i18n';
+ import {DesktopControls} from './DesktopControls';
+ 
+@@ -21,7 +19,6 @@ type SideNavProps = {
+ // The marker's position is held here, so placing it on a page switch re-renders the navigation and not the page.
+ export const SideNav = memo(function SideNav({route, groups, busy, backend, honk}: SideNavProps) {
+   const t = useT();
+-  const [collapsed, setCollapsed] = useState(readNavGroups);
+   const [navRef, navPos] = useSlider(route, '[aria-current="page"]', true);
+   useMoreBelow(navRef);
+   const items = groups.flatMap(group => group.items);
+@@ -45,50 +42,19 @@ export const SideNav = memo(function SideNav({route, groups, busy, backend, honk
+     </Link>
+   );
+   return (
+-    <nav className={`rp-side${hasDesktop ? ' rp-desktop-side' : ''}`} aria-busy={busy || undefined}>
+-      {hasDesktop && <DesktopControls />}
++    <nav className="rp-side rp-desktop-side" aria-busy={busy || undefined}>
++      <DesktopControls />
+       <div className="rp-side-links rp-overlay-scroll" ref={navRef}>
+         {navPos && <span className="rp-nav-slider" style={{translate: `0 ${navPos.y}px`, height: navPos.h}} />}
+-        {hasDesktop
+-          ? desktopSections.map(section => (
+-              <div key={section.id} className="rp-desktop-nav-section">
+-                <p className="rp-desktop-nav-label">{section.label}</p>
+-                {section.paths.flatMap(path => {
+-                  const item = items.find(item => item.path === path);
+-                  return item ? [link(item)] : [];
+-                })}
+-              </div>
+-            ))
+-          : groups.map(group => (
+-              <div key={group.id} data-group={group.id}>
+-                <Disclosure
+-                  variant="nav"
+-                  title={group.label}
+-                  isExpanded={!collapsed.includes(group.id)}
+-                  onExpandedChange={expanded => {
+-                    const next = expanded ? collapsed.filter(id => id !== group.id) : [...collapsed, group.id];
+-                    setCollapsed(next);
+-                    saveNavGroups(next);
+-                  }}
+-                >
+-                  {group.items.map(item => (
+-                    <Link
+-                      key={item.id}
+-                      className="rp-nav"
+-                      href={item.href}
+-                      aria-current={item.current ? 'page' : undefined}
+-                      data-unavailable={item.unavailable ? '' : undefined}
+-                      aria-description={item.description}
+-                      onHoverStart={() => warmPage(item.id)}
+-                      onFocus={() => warmPage(item.id)}
+-                    >
+-                      <item.Icon />
+-                      {item.label}
+-                    </Link>
+-                  ))}
+-                </Disclosure>
+-              </div>
+-            ))}
++        {desktopSections.map(section => (
++          <div key={section.id} className="rp-desktop-nav-section">
++            <p className="rp-desktop-nav-label">{section.label}</p>
++            {section.paths.flatMap(path => {
++              const item = items.find(item => item.path === path);
++              return item ? [link(item)] : [];
++            })}
++          </div>
++        ))}
+       </div>
+       <SidebarWidgets route={route} backend={backend} honk={honk} />
+     </nav>
+diff --git a/src/shell/TopBar.tsx b/src/shell/TopBar.tsx
+index 301eea1..69cab6c 100644
+--- a/src/shell/TopBar.tsx
++++ b/src/shell/TopBar.tsx
+@@ -62,8 +62,6 @@ export const TopBar = memo(function TopBar({
+   reload,
+   honk,
+   backend,
+-  wordmark,
+-  versionText,
+   paletteSections,
+   menu
+ }: TopBarProps) {
+@@ -85,12 +83,9 @@ export const TopBar = memo(function TopBar({
+         <About
+           onHonk={honk}
+           trigger={
+-            <Button appearance="plain" className="rp-brand" tip={t('about.title')}>
++            <Button appearance="plain" className="rp-brand rp-desktop-brand" tip={t('about.title')}>
+               <img src={logo} alt="" />
+-              <span className="rp-brand-text">
+-                <span>{wordmark}</span>
+-                <span className="rp-brand-version">{versionText}</span>
+-              </span>
++              <span>{appName}</span>
+             </Button>
+           }
+         />
+diff --git a/src/shell/route.ts b/src/shell/route.ts
+index 2e48d5d..63a28f5 100644
+--- a/src/shell/route.ts
++++ b/src/shell/route.ts
+@@ -1,4 +1,3 @@
+-import {hasDesktop} from '../desktop';
+ import {startTransition, useCallback, useEffect, useLayoutEffect, useRef, useState} from 'react';
+ import {dropDrafts} from './draft';
+ import {shouldOpenSettings} from './preferences';
+@@ -19,7 +18,7 @@ export function parseHash(hash: string): Route {
+ function movedRoute(route: string, query: string): Route | null {
+   const params = new URLSearchParams(query);
+   const tab = params.get('tab');
+-  if (hasDesktop && route === 'connections') {
++  if (route === 'connections') {
+     params.set('section', 'connections');
+     return {route: 'activity', query: params.toString()};
+   }
+@@ -27,6 +26,8 @@ function movedRoute(route: string, query: string): Route | null {
+     params.set('tab', tab === 'flows' ? 'records' : 'map');
+   } else if (route === 'flows' && tab === null && (params.has('id') || params.has('connection_id'))) {
+     params.set('tab', 'records');
++  } else if (route === 'flows' && tab === null && (params.has('path') || params.has('by'))) {
++    params.set('tab', 'map');
+   } else if (route === 'settings' && params.get('card') === 'global') {
+     // The persistent global settings moved from a settings card to the configuration page's global tab.
+     params.delete('card');
+diff --git a/src/shell/view.ts b/src/shell/view.ts
+index 374a1af..24de2fd 100644
+--- a/src/shell/view.ts
++++ b/src/shell/view.ts
+@@ -155,7 +155,7 @@ export function shellView(
+           : versionError
+         : (capabilityError ?? versionError),
+     backend: {
+-      text: hasDesktop ? desktopText : engineText,
++      text: desktopText,
+       tone,
+       state: t(stateKey),
+       label: t('shell.backend.label', {engine: engineText, state: t(stateKey)}),
+diff --git a/src/shell/widgets/ContentNodes.tsx b/src/shell/widgets/ContentNodes.tsx
+index a9b9fa0..39e0d86 100644
+--- a/src/shell/widgets/ContentNodes.tsx
++++ b/src/shell/widgets/ContentNodes.tsx
+@@ -3,13 +3,12 @@ import {useT, useLang, LOCALE, formatNumber} from '../../i18n';
+ import {formatLatency} from '../../i18n/format';
+ import {useCapabilities, useNodes, useProviders, useGroups} from '../../store';
+ import {ResourceSamples} from '../../store/preview';
+-import {activityGroupView, nodeView, useActivityNode, GroupMenu} from '../../features/activity/widgets';
++import {useActivityNode, GroupMenu} from '../../features/activity/widgets';
+ import {latencyAverages, latencyGroups, latencyMax, latencyPlotRow, latencySummary, providerRowView} from '../../features/nodes/widgets';
+ import {MarkerPlot} from '../../ui/charts';
+ import {columns, ContextualHelp, Empty, ErrorMessage, Kv, Light, Meter} from '../../ui/ui';
+ import {contentLimit, WidgetSurface, type Widget} from './layout';
+ import {Reading} from './Reading';
+-import {hasDesktop} from '../../desktop';
+ import {GroupWidget} from './ContentPolicies';
+ 
+ // Only the inert previews render it without `onChange`, so their choice goes nowhere.
+@@ -164,36 +163,5 @@ export function Sources({item}: {item: Widget}) {
+   );
+ }
+ export function Groups({item, onChange}: {item: Widget; onChange?: (item: Widget) => void}) {
+-  if (hasDesktop) return <GroupWidget item={item} onChange={onChange} />;
+-  return <GroupList item={item} />;
+-}
+-function GroupList({item}: {item: Widget}) {
+-  const t = useT();
+-  const resources = useCapabilities().data?.resources;
+-  const groups = useGroups(resources?.groups.available === true);
+-  const nodes = useNodes(resources?.nodes.available === true);
+-  const rows = activityGroupView(groups.data ?? [], nodes.data ?? [], '', t)
+-    .options.filter(group => !item.group || group.id === item.group)
+-    .slice(0, item.rows ?? contentLimit(item.size));
+-  return (
+-    <Reading state={{...groups, error: groups.error ?? nodes.error, refetch: () => (groups.refetch(), nodes.refetch())}}>
+-      {!rows.length ? (
+-        <Empty>{t('dashboard.noGroups')}</Empty>
+-      ) : (
+-        <div className="rp-list rp-columns" style={columns(rows.length)}>
+-          {rows.map(group => {
+-            const health = nodeView(group.node ? [group.node] : [], '', t);
+-            return (
+-              <Kv
+-                key={group.id}
+-                compact
+-                row={item.size !== 'small'}
+-                items={[[group.label, t('ui.valuePair', {label: group.node?.name ?? '—', value: health.status ?? health.latency})]]}
+-              />
+-            );
+-          })}
+-        </div>
+-      )}
+-    </Reading>
+-  );
++  return <GroupWidget item={item} onChange={onChange} />;
+ }
+diff --git a/src/shell/widgets/ContentPolicies.tsx b/src/shell/widgets/ContentPolicies.tsx
+index 334fea2..adbdb0e 100644
+--- a/src/shell/widgets/ContentPolicies.tsx
++++ b/src/shell/widgets/ContentPolicies.tsx
+@@ -4,20 +4,18 @@ import {useGroups, useGroupControl, poll} from '../../store';
+ import {useMode, useAppliedMode} from '../../features/shared/useMode';
+ import {ModeSwitch, ModeApply} from '../../features/activity/widgets';
+ import {selectMember} from '../../features/shared/selectMember';
+-import {ActionHelp, Button, ChoiceMenu, Empty, ErrorMessage, Kv, Link, Segmented, WidestLabel} from '../../ui/ui';
++import {ActionHelp, Button, ChoiceMenu, ErrorMessage, Kv, Segmented, WidestLabel} from '../../ui/ui';
+ import {WidgetRow} from '../../ui/WidgetPanel';
+-import {href} from '../route';
+-import {hasDesktop} from '../../desktop';
+ import {SidebarWidget, WidgetSurface, type Widget} from './layout';
+ import {Reading} from './Reading';
+ import {ChainActivity} from '../../features/activity/widgets';
+ import {NodeName} from '../../ui/NodeName';
+ 
+-// Desktop panel controls apply the clicked mode or target immediately. Other surfaces keep their draft controls.
++// The sidebar applies the clicked mode or target immediately on every host.
+ export function ModeWidget({targetOnly, fill = false}: {targetOnly: boolean; fill?: boolean}) {
+   const t = useT();
+   const surface = useContext(WidgetSurface);
+-  const immediate = hasDesktop && surface === 'panel';
++  const immediate = surface === 'panel';
+   const m = useMode({immediate});
+   const sidebar = useContext(SidebarWidget);
+   const target = (
+@@ -71,16 +69,12 @@ export function ModeWidget({targetOnly, fill = false}: {targetOnly: boolean; fil
+ // Works without setup: the first manual group until the card picks another; with none, one jump to create a group.
+ export const cardGroup = <G extends {id: string; policy: {kind: string}}>(groups: readonly G[] | undefined, chosen: string | undefined) =>
+   groups?.find(group => group.id === chosen) ?? groups?.find(group => group.policy.kind === 'selector') ?? groups?.[0];
+-export function GroupWidget({item, onChange}: {item: Widget; onChange?: (item: Widget) => void}) {
++export function GroupWidget(_props: {item: Widget; onChange?: (item: Widget) => void}) {
+   const t = useT();
+   const groups = useGroups(true, poll.live);
+-  const mode = useAppliedMode(hasDesktop);
++  const mode = useAppliedMode();
+   const appliedTarget = mode.applied.mode === 'global' ? mode.applied.target : undefined;
+-  const selected = hasDesktop
+-    ? mode.applied.mode === 'global'
+-      ? groups.data?.find(group => group.name === appliedTarget)
+-      : undefined
+-    : cardGroup(groups.data, item.group);
++  const selected = mode.applied.mode === 'global' ? groups.data?.find(group => group.name === appliedTarget) : undefined;
+   return (
+     <Reading state={groups}>
+       <ErrorMessage error={mode.error} onRetry={mode.retry} />
+@@ -90,30 +84,13 @@ export function GroupWidget({item, onChange}: {item: Widget; onChange?: (item: W
+           refresh={groups.refetch}
+           picker={
+             <div className="rp-outbound-picker">
+-              {hasDesktop ? (
+-                <strong>
+-                  <NodeName name={selected.name} />
+-                </strong>
+-              ) : (
+-                <ChoiceMenu
+-                  quiet
+-                  label={t('nav.policies')}
+-                  value={selected.id}
+-                  items={(groups.data ?? []).map(group => ({
+-                    id: group.id,
+-                    label: group.name,
+-                    desc: t(group['x-lemonvpn-chain'] ? 'chain.title' : 'outbound.policies')
+-                  }))}
+-                  onChange={group => onChange?.({...item, group})}
+-                  searchLabel={t('ui.filterGroups')}
+-                >
+-                  <NodeName name={selected.name} />
+-                </ChoiceMenu>
+-              )}
++              <strong>
++                <NodeName name={selected.name} />
++              </strong>
+             </div>
+           }
+         />
+-      ) : hasDesktop ? (
++      ) : (
+         <span className="rp-label">
+           {t(
+             !mode.appliedReady
+@@ -125,13 +102,6 @@ export function GroupWidget({item, onChange}: {item: Widget; onChange?: (item: W
+                   : 'widgets.outboundNone'
+           )}
+         </span>
+-      ) : (
+-        <Empty>
+-          {t('widgets.noManualGroup')}
+-          <Link appearance="button" small href={href('policies', {new: '1'})}>
+-            {t('group.newGroup')}
+-          </Link>
+-        </Empty>
+       )}
+     </Reading>
+   );
+diff --git a/src/shell/widgets/ModuleControls.tsx b/src/shell/widgets/ModuleControls.tsx
+index 792b362..5ffee08 100644
+--- a/src/shell/widgets/ModuleControls.tsx
++++ b/src/shell/widgets/ModuleControls.tsx
+@@ -1,7 +1,6 @@
+ import {useState} from 'react';
+ import {useT, type Key} from '../../i18n';
+ import {useCapabilities, useGroups} from '../../store';
+-import {hasDesktop} from '../../desktop';
+ import {Button, ChoiceMenu, Segmented, Switch} from '../../ui/ui';
+ import {WidgetGalleryTile, type GalleryRow} from '../../ui/WidgetGalleryTile';
+ import {tileAttributes} from '../../ui/DashboardTile';
+@@ -45,7 +44,7 @@ export function ModuleGallery({items, add, surface = 'panel'}: {items: Widget[];
+   const cards = surface === 'dashboard' ? dashboardItems(dashboardDefaults()) : [];
+   return (Object.keys(registry) as WidgetId[])
+     .filter(id => surface === 'panel' || !onlyPanel(id))
+-    .filter(id => !hasDesktop || surface !== 'dashboard' || id !== 'global')
++    .filter(id => surface !== 'dashboard' || id !== 'global')
+     .map(id => {
+       const n = items.filter(item => item.id === id).length;
+       const card = cards.find(item => item.id === id) ?? defaultWidget(id);
+diff --git a/src/shell/widgets/WidgetCard.tsx b/src/shell/widgets/WidgetCard.tsx
+index bf3c8c0..b46c43c 100644
+--- a/src/shell/widgets/WidgetCard.tsx
++++ b/src/shell/widgets/WidgetCard.tsx
+@@ -1,7 +1,6 @@
+ import {lazy, Suspense} from 'react';
+ import {useT} from '../../i18n';
+ import {useGroups} from '../../store';
+-import {hasDesktop} from '../../desktop';
+ import {Card} from '../../ui/ui';
+ import {mainCard} from './dashboardLayout';
+ import {registry, WidgetSurface, type Widget} from './layout';
+@@ -12,7 +11,7 @@ const WidgetContent = lazy(() => import('./WidgetContent').then(module => ({defa
+ // The renderer follows the card's kind and display, never its size, so resizing keeps the same content mounted.
+ export function WidgetCard({item, preview = false, onChange = () => {}}: {item: Widget; preview?: boolean; onChange?: (item: Widget) => void}) {
+   const t = useT();
+-  const outboundCard = hasDesktop && (item.id === 'policyGroups' || item.id === 'group');
++  const outboundCard = item.id === 'policyGroups' || item.id === 'group';
+   const groups = useGroups(outboundCard);
+   const mode = useAppliedMode(outboundCard);
+   const appliedTarget = mode.applied.mode === 'global' ? mode.applied.target : undefined;
+diff --git a/src/shell/widgets/Widgets.tsx b/src/shell/widgets/Widgets.tsx
+index c8f02cd..2fcfebe 100644
+--- a/src/shell/widgets/Widgets.tsx
++++ b/src/shell/widgets/Widgets.tsx
+@@ -7,11 +7,7 @@ import {WidgetHeader, WidgetPanel} from '../../ui/WidgetPanel';
+ import {TitlesShown} from '../../ui/Card';
+ import {WidgetGrid, WidgetCell, cellSize} from '../../ui/WidgetGrid';
+ import {WidgetChartInset} from '../../ui/charts/compact';
+-import ChevronDown from '../../ui/icons/ChevronDown';
+-import PictureInPicture from '../../ui/icons/PictureInPicture';
+-import Pin from '../../ui/icons/Pin';
+ import {BackendIndicator} from '../Backend';
+-import {hasDesktop} from '../../desktop';
+ import type {BackendView} from '../view';
+ import {patchLayout, saveLayout, useWidgetLayout} from './settings';
+ import {WidgetContent} from './WidgetContent';
+@@ -65,7 +61,7 @@ export function PanelHost({
+       const min = height - (body?.clientHeight ?? 0) + (first?.getBoundingClientRect().height ?? 0);
+       // A sidebar whose links overflow anyway still lets the section reach its default share.
+       const room = links ? links.clientHeight - links.scrollHeight : 0;
+-      return {height, min, max: Math.max(min, height, height + room, (side?.clientHeight ?? 0) * (hasDesktop ? 0.6 : 0.45))};
++      return {height, min, max: Math.max(min, height, height + room, (side?.clientHeight ?? 0) * 0.6)};
+     },
+     (base, _dx, dy) => ({...base, height: Math.min(base.max, Math.max(base.min, base.height - dy))}),
+     next => patchLayout({dockHeight: Math.round(next.height)})
+@@ -89,7 +85,7 @@ export function PanelHost({
+         <div className="rp-dock-edge">{!collapsed && <ResizeHandle edge={{block: 'start'}} label={t('widgets.resizePanel')} {...dockResize.props} />}</div>
+         {header}
+         {!collapsed && (
+-          <SidebarWidget.Provider value={hasDesktop}>
++          <SidebarWidget.Provider value={true}>
+             <WidgetChartInset.Provider value={2}>
+               <SavedGrid />
+             </WidgetChartInset.Provider>
+@@ -217,9 +213,7 @@ export function PanelHeader({
+     <WidgetHeader
+       backend={
+         docked ? (
+-          hasDesktop ? (
+-            <span className="rp-desktop-widget-title">{t('widgets.title')}</span>
+-          ) : undefined
++          <span className="rp-desktop-widget-title">{t('widgets.title')}</span>
+         ) : honk ? (
+           <BackendIndicator backend={backend} honk={honk} panel />
+         ) : (
+@@ -236,11 +230,9 @@ export function PanelHeader({
+             label={t('widgets.panelOptions')}
+             actions={[
+               {id: 'edit', label: t('widgets.edit'), onAction: () => editorState.set(true)},
+-              ...(dockable && onDock && (!docked || hasDesktop) ? [{id: 'dock', label: t(docked ? 'widgets.undock' : 'widgets.dock'), onAction: onDock}] : []),
+-              ...(hasDesktop
+-                ? [{id: 'collapse', label: t(collapsed ? 'widgets.expand' : 'widgets.collapse'), onAction: () => patchLayout({collapsed: !collapsed})}]
+-                : []),
+-              ...(hasDesktop && !docked
++              ...(dockable && onDock ? [{id: 'dock', label: t(docked ? 'widgets.undock' : 'widgets.dock'), onAction: onDock}] : []),
++              {id: 'collapse', label: t(collapsed ? 'widgets.expand' : 'widgets.collapse'), onAction: () => patchLayout({collapsed: !collapsed})},
++              ...(!docked
+                 ? [{id: 'pin', label: t(layout.pinned ? 'widgets.unpin' : 'widgets.pin'), onAction: () => patchLayout({pinned: !layout.pinned})}]
+                 : []),
+               ...(docked
+@@ -250,35 +242,6 @@ export function PanelHeader({
+               {id: 'hide', label: t('widgets.hide'), onAction: () => patchLayout({visible: false})}
+             ]}
+           />
+-          {/* Docked, the pin's place undocks the panel. */}
+-          {!hasDesktop &&
+-            (docked ? (
+-              <Button quiet icon className="rp-widget-undock" label={t('widgets.undock')} onPress={onDock}>
+-                <PictureInPicture />
+-              </Button>
+-            ) : (
+-              <Button
+-                quiet
+-                icon
+-                isSelected={layout.pinned}
+-                label={t(layout.pinned ? 'widgets.unpin' : 'widgets.pin')}
+-                onPress={() => patchLayout({pinned: !layout.pinned})}
+-              >
+-                <Pin />
+-              </Button>
+-            ))}
+-          {!hasDesktop && (
+-            <Button
+-              quiet
+-              icon
+-              className="rp-widget-collapse"
+-              expanded={!collapsed}
+-              label={t(collapsed ? 'widgets.expand' : 'widgets.collapse')}
+-              onPress={() => patchLayout({collapsed: !collapsed})}
+-            >
+-              <ChevronDown />
+-            </Button>
+-          )}
+         </>
+       }
+     />
+diff --git a/src/shell/widgets/dashboardLayout.ts b/src/shell/widgets/dashboardLayout.ts
+index e5dd741..3525f59 100644
+--- a/src/shell/widgets/dashboardLayout.ts
++++ b/src/shell/widgets/dashboardLayout.ts
+@@ -1,5 +1,4 @@
+ import type {TileProps} from '../../ui/DashboardTile';
+-import {hasDesktop} from '../../desktop';
+ import {defaultWidget, instanceId, object, parseItems, registry, type Widget, type WidgetId} from './layout';
+ // Each section keeps one layout profile for good: adding, moving or resizing a card never switches another card's rules.
+ const profiles = ['quick', 'metrics', 'traffic', 'details', 'extensions'] as const;
+@@ -8,7 +7,7 @@ type Section = {id: Profile; items: Widget[]};
+ export type DashboardLayout = {version: 3; sections: Section[]};
+ // The default Activity cards; the extensions section only adds cards after them.
+ const mainSections: Record<Exclude<Profile, 'extensions'>, WidgetId[]> = {
+-  quick: ['mode', ...(hasDesktop ? [] : ['global' as const]), 'status'],
++  quick: ['mode', 'status'],
+   metrics: ['download', 'upload', 'connections', 'latency', 'cpu'],
+   traffic: ['history', 'outbounds'],
+   details: ['ranking', 'memory', 'notices']
+@@ -25,7 +24,7 @@ export const tileOf = (item: Widget): TileProps => ({
+   module: item.id,
+   size: item.size,
+   foot: footprint(item),
+-  width: hasDesktop && item.id === 'mode' ? (item.width ?? '2/3') : item.width,
++  width: item.id === 'mode' ? (item.width ?? '2/3') : item.width,
+   height: item.height
+ });
+ const mainWidget = (id: WidgetId): Widget => ({...defaultWidget(id), ...(mainForms[id] ? {form: mainForms[id]} : {})});
+@@ -46,18 +45,16 @@ export const dashboardDefaults = (): DashboardLayout =>
+ export const dashboardItems = (layout: DashboardLayout) => layout.sections.flatMap(section => section.items);
+ // Instance ids stay unique and capped across the whole page, so parse every section's cards as one list.
+ function sectioned(groups: Array<[Profile, unknown[]]>): DashboardLayout {
+-  if (hasDesktop) {
+-    let mode = groups.some(([, values]) => values.some(value => object(value) && value.id === 'mode'));
+-    groups = groups.map(([profile, values]) => [
+-      profile,
+-      values.flatMap(value => {
+-        if (!object(value) || value.id !== 'global') return [value];
+-        if (mode) return [];
+-        mode = true;
+-        return [{...value, id: 'mode'}];
+-      })
+-    ]);
+-  }
++  let mode = groups.some(([, values]) => values.some(value => object(value) && value.id === 'mode'));
++  groups = groups.map(([profile, values]) => [
++    profile,
++    values.flatMap(value => {
++      if (!object(value) || value.id !== 'global') return [value];
++      if (mode) return [];
++      mode = true;
++      return [{...value, id: 'mode'}];
++    })
++  ]);
+   const owner = new Map<string, Profile>();
+   for (const [id, values] of groups)
+     for (const value of values) if (object(value) && !owner.has(String(value.instance ?? value.id))) owner.set(String(value.instance ?? value.id), id);
+diff --git a/src/shell/widgets/layout.ts b/src/shell/widgets/layout.ts
+index ae4f30e..0757381 100644
+--- a/src/shell/widgets/layout.ts
++++ b/src/shell/widgets/layout.ts
+@@ -2,7 +2,6 @@ import {createContext} from 'react';
+ import type {Key} from '../../i18n';
+ import type {WidgetSize} from '../../ui/WidgetGrid';
+ import {clampPanelOffset, clampPanelSize, type PanelOffset, type PanelSize} from '../../ui/panelSize';
+-import {hasDesktop} from '../../desktop';
+ import type {Capabilities} from '../../api/model';
+ 
+ export type ModuleForm = 'area' | 'sparkline' | 'donut' | 'waffle' | 'dots' | 'ranked' | 'kv' | 'facts';
+@@ -175,14 +174,14 @@ export type Layout = {
+ export const defaults = (): Layout => ({
+   version: 4,
+   items: [defaultWidget('speed'), {id: 'memory', form: 'text', size: 'medium'}, defaultWidget('mode')],
+-  // A fresh panel starts as its header, so it covers no content until the reader opens it.
+-  collapsed: !hasDesktop,
++  // Desktop and web share the sidebar dock; narrow screens retain their drawer.
++  collapsed: false,
+   pinned: false,
+   visible: true,
+-  ...(hasDesktop ? {docked: true} : {})
++  docked: true
+ });
+-// Restore defaults puts the panel where a fresh profile has it: floating at its corner, at its own size.
+-export const restoredPanel = {size: undefined, offset: undefined, docked: hasDesktop ? true : undefined, dockHeight: undefined} satisfies Partial<Layout>;
++// Restore the shared sidebar dock without retaining a manually resized height.
++export const restoredPanel = {size: undefined, offset: undefined, docked: true, dockHeight: undefined} satisfies Partial<Layout>;
+ // Whether restoring the panel would change this layout: any of its placement fields is set.
+ export const changesPanel = (layout: Partial<Layout>) =>
+   (Object.keys(restoredPanel) as Array<keyof typeof restoredPanel>).some(key => layout[key] !== restoredPanel[key]);
+diff --git a/src/shell/widgets/settings.ts b/src/shell/widgets/settings.ts
+index ad87ebe..1ae9733 100644
+--- a/src/shell/widgets/settings.ts
++++ b/src/shell/widgets/settings.ts
+@@ -1,9 +1,7 @@
+ import {storageKeys} from '../../api/storage';
+ import {defaults, parseLayout, type Layout} from './layout';
+ import {storedLayout} from './storedLayout';
+-import {hasDesktop} from '../../desktop';
+ const store = storedLayout(storageKeys.widgets, parseLayout, defaults, (layout, _absent, persist) => {
+-  if (!hasDesktop) return layout;
+   try {
+     const key = 'lemonvpn-sidebar-widgets-v1';
+     let next = layout;
+diff --git a/src/store/desktop.ts b/src/store/desktop.ts
+index 2018714..3f54359 100644
+--- a/src/store/desktop.ts
++++ b/src/store/desktop.ts
+@@ -34,9 +34,9 @@ export function tunAvailable(resources: Capabilities['resources'] | undefined):
+ }
+ 
+ export function lanAvailable(resources: unknown): boolean {
+-  return hasDesktop && (resources as Record<string, {available?: boolean}> | undefined)?.['x-lan-sharing']?.available === true;
++  return (resources as Record<string, {available?: boolean}> | undefined)?.['x-lan-sharing']?.available === true;
+ }
+ 
+ export function dnsSettingsAvailable(resources: unknown): boolean {
+-  return hasDesktop && (resources as Record<string, {available?: boolean}> | undefined)?.['x-dns-settings']?.available === true;
++  return (resources as Record<string, {available?: boolean}> | undefined)?.['x-dns-settings']?.available === true;
+ }
+diff --git a/src/store/nodes.ts b/src/store/nodes.ts
+index f37fb49..0c026d5 100644
+--- a/src/store/nodes.ts
++++ b/src/store/nodes.ts
+@@ -1,7 +1,7 @@
+ import type {ProviderSettings} from '../api/api';
+ import {useCallback, useState} from 'react';
+ import {MAX_PAGE, poll} from './cadence';
+-import {ApiError} from '../api/error';
++import {ApiError, LocalError} from '../api/error';
+ import {getApi} from '../api/index';
+ import type {HealthObservation, Node, NodeCreate, OperationAccepted, ProviderCreate, ProviderList} from '../api/model';
+ import {gated, pageSize, useResource, walk} from './resource';
+@@ -173,7 +173,14 @@ export function useNodeManage(refetch: () => void) {
+     ),
+     removeProvider: useCallback((id: string) => run(id, signal => write('provider_delete', api.deleteProvider(id, signal), signal)), [api, run, write]),
+     addNode: useCallback((request: NodeCreate) => run('node', signal => write('node_create', api.createNode(request, signal), signal)), [api, run, write]),
+-    removeNode: useCallback((id: string) => run(id, signal => write('node_delete', api.deleteNode(id, signal), signal)), [api, run, write])
++    removeNode: useCallback(
++      (id: string) => run(id, async signal => {
++        const result = await write('node_delete', api.deleteNode(id, signal), signal);
++        if (result.deleted !== 1) throw new LocalError('nodes.deleteNoChange');
++        return result;
++      }),
++      [api, run, write]
++    )
+   };
+ }
+ export function useNodeProbe(refetch: () => void) {
+diff --git a/src/ui/styles/desktop-sidebar.css b/src/ui/styles/desktop-sidebar.css
+index c6cda6c..bcca7e3 100644
+--- a/src/ui/styles/desktop-sidebar.css
++++ b/src/ui/styles/desktop-sidebar.css
+@@ -11,7 +11,7 @@
+   .rp-desktop-shell .rp-top {
+     column-gap: 16px;
+   }
+-  .rp-desktop-side {
++  .rp-desktop-shell .rp-desktop-side {
+     --rp-sidebar-content-width: 100%;
+     --rp-sidebar-inset-end: 12px;
+     gap: 12px;
+@@ -19,7 +19,7 @@
+     overflow: hidden;
+     border-inline-end: 1px solid var(--rp-line);
+   }
+-  .rp-desktop-side > div + div {
++  .rp-desktop-shell .rp-desktop-side > div + div {
+     margin-block-start: 0;
+   }
+   .rp-desktop-side .rp-side-links {
+@@ -27,6 +27,14 @@
+     scrollbar-gutter: auto;
+     min-block-size: 100px;
+   }
++  .rp-desktop-side,
++  .rp-desktop-side * {
++    scrollbar-width: none;
++  }
++  .rp-desktop-side::-webkit-scrollbar,
++  .rp-desktop-side *::-webkit-scrollbar {
++    display: none;
++  }
+   .rp-desktop-side .rp-nav {
+     height: 34px;
+     gap: 10px;

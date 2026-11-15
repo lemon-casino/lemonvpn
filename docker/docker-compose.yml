@@ -8,6 +8,7 @@ services:
     ports:
       - "8080:8080"
       - "${LEMONVPN_LAN_PORT:-18081}:${LEMONVPN_LAN_PORT:-18081}"
+      - "${LEMONVPN_LAN_PORT:-18081}:${LEMONVPN_LAN_PORT:-18081}/udp"
     volumes:
       - ./data:/data
     environment:
@@ -16,18 +17,19 @@ services:
       LEMONVPN_LAN_ENABLED: "1"
       LEMONVPN_LAN_BIND: "0.0.0.0"
       LEMONVPN_LAN_PORT: ${LEMONVPN_LAN_PORT:-18081}
+      LEMONVPN_LAN_ADVERTISED_ADDRESS: ${LEMONVPN_LAN_ADVERTISED_ADDRESS:-}
       LEMONVPN_LAN_USERNAME: ${LEMONVPN_LAN_USERNAME:-}
       LEMONVPN_LAN_PASSWORD: ${LEMONVPN_LAN_PASSWORD:-}
       LEMONVPN_LAN_ALLOW_ANONYMOUS: ${LEMONVPN_LAN_ALLOW_ANONYMOUS:-0}
       LEMONVPN_TUN: "0"
       TZ: ${TZ:-UTC}
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18080/health"]
+      test: ["CMD", "/usr/local/bin/lemonvpn-healthcheck"]
       interval: 30s
       timeout: 5s
       start_period: 30s
       retries: 3
-    stop_grace_period: 20s
+    stop_grace_period: 35s
     logging:
       driver: json-file
       options:

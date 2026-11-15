@@ -93,6 +93,8 @@ jobs:
         run: git -C doona apply --whitespace=nowarn ../patches/doona-lemonvpn-lan-sharing.patch
       - name: Apply rules, DNS and Fake-IP management frontend
         run: git -C doona apply --whitespace=nowarn ../patches/doona-lemonvpn-rules-dns.patch
+      - name: Apply migration and LAN DNS management frontend
+        run: git -C doona apply --whitespace=nowarn ../patches/doona-lemonvpn-migration.patch
       - name: Stamp tag version into shell and lockfile
         run: node app/scripts/release.mjs stamp
       - name: Install pinned pnpm and locked dependencies

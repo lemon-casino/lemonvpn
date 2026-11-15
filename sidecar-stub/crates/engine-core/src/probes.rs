@@ -406,7 +406,10 @@ fn probe(node: &config::Node, kind: &str, version: &'static str) -> Outcome {
         _ => probe_tcp(node, version),
     };
     // A failure of just one address family does not prove the entire node unavailable.
-    if kind == "http" && outcome.state != "unknown" && (version == "any" || outcome.state == "healthy") {
+    if kind == "http"
+        && outcome.state != "unknown"
+        && (version == "any" || outcome.state == "healthy")
+    {
         crate::group_policy::probe_result(node, "tcp", outcome.state == "healthy", outcome.latency);
     }
     outcome
@@ -625,9 +628,8 @@ fn dns_query(name: &str) -> Vec<u8> {
 fn addresses(host: &str, version: &'static str) -> Result<Vec<IpAddr>, String> {
     let all = match host.parse::<IpAddr>() {
         Ok(ip) => vec![ip],
-        Err(_) => {
-            crate::dns::bootstrap_resolve(host).map_err(|error| format!("节点地址引导解析失败：{error}"))?
-        }
+        Err(_) => crate::dns::bootstrap_resolve(host)
+            .map_err(|error| format!("节点地址引导解析失败：{error}"))?,
     };
     let filtered: Vec<IpAddr> = all
         .into_iter()
@@ -719,7 +721,10 @@ fn record_health(
         // Its completed result supersedes old rows from the other family;
         // retaining an old IPv4 success can hide a new all-family failure.
         store().health.retain(|health| {
-            health.node_id != node_id || health.transport != "tcp" || health.kind != kind || health.ip_version == ip_version
+            health.node_id != node_id
+                || health.transport != "tcp"
+                || health.kind != kind
+                || health.ip_version == ip_version
         });
     }
     record_network_health(
@@ -879,13 +884,29 @@ pub fn accepted(id: String, kind: &str) -> Accepted {
 fn prune(store: &mut Store) {
     let now = SystemTime::now();
     store.operations.retain(|operation| {
-        now.duration_since(operation.created_at)
-            .map(|age| age < OPERATION_RETENTION)
-            .unwrap_or(true)
+        operation.finished_at.is_none_or(|finished_at| {
+            now.duration_since(finished_at)
+                .map(|age| age < OPERATION_RETENTION)
+                .unwrap_or(true)
+        })
     });
-    if store.operations.len() > MAX_OPERATIONS {
-        let excess = store.operations.len() - MAX_OPERATIONS;
-        store.operations.drain(..excess);
+    // Slow downloads must remain observable until completion. Bound only the
+    // terminal history and keep it for five minutes after the job finishes.
+    let completed = store
+        .operations
+        .iter()
+        .filter(|operation| operation.finished_at.is_some())
+        .count();
+    for _ in MAX_OPERATIONS..completed {
+        if let Some((index, _)) = store
+            .operations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, operation)| operation.finished_at.map(|at| (index, at)))
+            .min_by_key(|(_, at)| *at)
+        {
+            store.operations.remove(index);
+        }
     }
 }
 
@@ -934,7 +955,15 @@ mod tests {
         for prefix in [b"HTTP/1.1 204 ".as_slice(), b"HTTP/1.0 204 "] {
             assert!(super::validate_http_probe_status(prefix).is_ok());
         }
-        for prefix in [b"HTTP/1.1 403 ".as_slice(), b"HTTP/1.1 401 ", b"HTTP/1.1 302 ", b"HTTP/1.1 200 ", b"HTTP/1.1 502 ", b"H", b"arbitrary-data"] {
+        for prefix in [
+            b"HTTP/1.1 403 ".as_slice(),
+            b"HTTP/1.1 401 ",
+            b"HTTP/1.1 302 ",
+            b"HTTP/1.1 200 ",
+            b"HTTP/1.1 502 ",
+            b"H",
+            b"arbitrary-data",
+        ] {
             assert!(super::validate_http_probe_status(prefix).is_err());
         }
     }
@@ -942,8 +971,26 @@ mod tests {
     #[test]
     fn completed_any_family_failure_replaces_old_success() {
         let id = "node-expiry-any-family-regression";
-        super::record_health(id, "http", "ipv4", "warm", "healthy", Some(23), &None, "ipv4");
-        super::record_health(id, "http", "ipv6", "warm", "unavailable", None, &Some("probe_failed".to_owned()), "any");
+        super::record_health(
+            id,
+            "http",
+            "ipv4",
+            "warm",
+            "healthy",
+            Some(23),
+            &None,
+            "ipv4",
+        );
+        super::record_health(
+            id,
+            "http",
+            "ipv6",
+            "warm",
+            "unavailable",
+            None,
+            &Some("probe_failed".to_owned()),
+            "any",
+        );
         let health: serde_json::Value = serde_json::from_str(&super::health_json(id)).unwrap();
         assert_eq!(health.as_array().unwrap().len(), 1);
         assert_eq!(health[0]["state"], "unavailable");
@@ -953,8 +1000,26 @@ mod tests {
     #[test]
     fn explicit_family_probe_preserves_other_family_observations() {
         let id = "node-expiry-explicit-family-regression";
-        super::record_health(id, "http", "ipv4", "warm", "healthy", Some(23), &None, "ipv4");
-        super::record_health(id, "http", "ipv6", "warm", "unavailable", None, &Some("probe_failed".to_owned()), "ipv6");
+        super::record_health(
+            id,
+            "http",
+            "ipv4",
+            "warm",
+            "healthy",
+            Some(23),
+            &None,
+            "ipv4",
+        );
+        super::record_health(
+            id,
+            "http",
+            "ipv6",
+            "warm",
+            "unavailable",
+            None,
+            &Some("probe_failed".to_owned()),
+            "ipv6",
+        );
         let health: serde_json::Value = serde_json::from_str(&super::health_json(id)).unwrap();
         assert_eq!(health.as_array().unwrap().len(), 2);
         assert_eq!(health[0]["state"], "healthy");
@@ -977,7 +1042,10 @@ mod tests {
     fn finds_a_nested_target_without_matching_outer_braces() {
         let body = r#"{"extra":{"a":1},"target":{"type":"node","node_id":"node-a"}}"#;
         let target = object(body, "target").unwrap();
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&target).unwrap(), serde_json::json!({"type":"node","node_id":"node-a"}));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&target).unwrap(),
+            serde_json::json!({"type":"node","node_id":"node-a"})
+        );
     }
 
     #[test]

@@ -266,10 +266,10 @@ fn connect(
     host: &str,
     port: u16,
     attempt: usize,
-) -> io::Result<(TcpStream, Option<String>)> {
+) -> io::Result<(TcpStream, Option<String>, Option<crate::config::Decision>)> {
     match route {
         DownloadRoute::Direct => {
-            direct(host, port, attempt).map(|socket| (socket, Some("direct".into())))
+            direct(host, port, attempt).map(|socket| (socket, Some("direct".into()), None))
         }
         DownloadRoute::Routing => {
             let decision = crate::config::decide_connection(host, port, None, "tcp");
@@ -278,10 +278,10 @@ fn connect(
             } else {
                 crate::proxy::connect(&decision, host, port)
             }?;
-            Ok((socket, Some(decision.outbound)))
+            Ok((socket, Some(decision.outbound.clone()), Some(decision)))
         }
-        DownloadRoute::Outbound(name) => crate::config::connect_outbound(name, host, port)
-            .map(|socket| (socket, Some(name.clone()))),
+        DownloadRoute::Outbound(name) => crate::config::connect_outbound_tracked(name, host, port)
+            .map(|(socket, decision)| (socket, Some(name.clone()), Some(decision))),
     }
 }
 
@@ -297,14 +297,18 @@ fn once(
     let port = url
         .port_or_known_default()
         .ok_or_else(|| Failure::invalid("下载端口无效"))?;
-    let (mut socket, download_outbound) =
+    let (mut socket, download_outbound, decision) =
         connect(route, host, port, attempt).map_err(|e| Failure::io("连接下载服务器失败", e))?;
+    let transport_error = |label: &str, error: io::Error| {
+        if let Some(decision) = &decision { crate::config::infrastructure_failure(decision, &error); }
+        Failure::io(label, error)
+    };
     socket
         .set_read_timeout(Some(TIMEOUT))
-        .map_err(|e| Failure::io("设置下载超时失败", e))?;
+        .map_err(|e| transport_error("设置下载超时失败", e))?;
     socket
         .set_write_timeout(Some(TIMEOUT))
-        .map_err(|e| Failure::io("设置下载超时失败", e))?;
+        .map_err(|e| transport_error("设置下载超时失败", e))?;
     let mut target = url.path().to_string();
     if target.is_empty() {
         target.push('/')
@@ -334,25 +338,25 @@ fn once(
         while connection.is_handshaking() {
             connection
                 .complete_io(&mut socket)
-                .map_err(|e| Failure::io("下载 TLS 握手失败", e))?;
+                .map_err(|e| transport_error("下载 TLS 握手失败", e))?;
         }
         let mut stream = StreamOwned::new(connection, socket);
         stream
             .write_all(request.as_bytes())
-            .map_err(|e| Failure::io("发送下载请求失败", e))?;
+            .map_err(|e| transport_error("发送下载请求失败", e))?;
         stream
             .flush()
-            .map_err(|e| Failure::io("发送下载请求失败", e))?;
+            .map_err(|e| transport_error("发送下载请求失败", e))?;
         let mut response = read_response(&mut stream, max_bytes)?;
         response.download_outbound = download_outbound;
         Ok(response)
     } else {
         socket
             .write_all(request.as_bytes())
-            .map_err(|e| Failure::io("发送下载请求失败", e))?;
+            .map_err(|e| transport_error("发送下载请求失败", e))?;
         socket
             .flush()
-            .map_err(|e| Failure::io("发送下载请求失败", e))?;
+            .map_err(|e| transport_error("发送下载请求失败", e))?;
         let mut response = read_response(&mut socket, max_bytes)?;
         response.download_outbound = download_outbound;
         Ok(response)

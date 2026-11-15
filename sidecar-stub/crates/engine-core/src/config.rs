@@ -24,6 +24,9 @@ pub(crate) use memberships::{update_node_groups, update_nodes_groups};
 #[path = "group_removal.rs"]
 mod group_removal;
 pub(crate) use group_removal::remove_group;
+#[path = "node_removal.rs"]
+mod node_removal;
+pub(crate) use node_removal::{delete_managed_node, delete_managed_provider};
 #[path = "rule_management.rs"]
 mod rule_management;
 pub(crate) use rule_management::{manage_rules, rule_defaults_json};
@@ -89,6 +92,7 @@ pub enum Condition {
     SourcePort(Vec<(u16, u16)>),
     And(Vec<Condition>),
     Any(Vec<Condition>),
+    NoResolve(Box<Condition>),
     Network(Vec<String>),
     QueryType(Vec<String>),
 }
@@ -163,6 +167,7 @@ pub(crate) fn condition_matches_input(condition: &Condition, input: &RoutingInpu
         Condition::DomainKeyword(value) => host.contains(value),
         Condition::DomainPattern(pattern) => pattern.matches(host),
         Condition::RuleSet(set) => set.set.matches(input),
+        Condition::NoResolve(inner) => condition_matches_input(inner,input),
         Condition::GeoSite(set) => host.parse::<IpAddr>().is_err() && set.matches(host),
         Condition::GeoIp(set) => input
             .destination_ip
@@ -209,6 +214,7 @@ pub(crate) fn condition_matches_input(condition: &Condition, input: &RoutingInpu
 pub(crate) fn condition_known(condition: &Condition, input: &RoutingInput<'_>) -> bool {
     match condition {
         Condition::RuleSet(set) => set.set.known(input),
+        Condition::NoResolve(_) => true,
         Condition::Process(_) => input.process.is_some(),
         Condition::GeoIp(_) | Condition::IpCidr(..) => {
             input.destination_ip.is_some() || !input.answer_ips.is_empty()
@@ -707,7 +713,7 @@ fn process_names_for(config:&Config)->Vec<String>{
         match condition {
             Condition::Process(names) => values.extend(names.iter().cloned()),
             Condition::RuleSet(set)=>values.extend(set.set.process_names()),
-            Condition::Not(inner) => collect(inner, values),
+            Condition::Not(inner) | Condition::NoResolve(inner) => collect(inner, values),
             Condition::And(parts) | Condition::Any(parts) => {
                 for part in parts {
                     collect(part, values);
@@ -799,90 +805,6 @@ pub fn reload_providers() {
     crate::events::generation_changed(&previous, &generation);
 }
 
-/// A managed-node deletion is checked against the accepted source while its
-/// publication lock is held. Failed validation/storage leaves both stores intact.
-pub(crate) fn delete_managed_node(id: &str) -> Result<String, (u16, &'static str, String)> {
-    refresh();
-    let mut config = current();
-    let name = id.strip_prefix("node-").unwrap_or(id);
-    let Some(node) = config.nodes.iter().find(|node| node.name == name).cloned() else {
-        return Ok(r#"{"deleted":0}"#.to_owned());
-    };
-    if node.provider.is_none() {
-        return Err((
-            404,
-            "capability_not_supported",
-            "该节点在配置文件中声明，请在配置页删除".to_owned(),
-        ));
-    }
-    let mut references = config
-        .rules
-        .iter()
-        .chain(std::iter::once(&config.fallback))
-        .filter(|rule| rule.outbound == name)
-        .map(|rule| format!("路由规则 {}", rule.line))
-        .collect::<Vec<_>>();
-    references.extend(
-        config
-            .groups
-            .iter()
-            .filter(|group| {
-                [
-                    &group.default,
-                    &group.final_outbound,
-                    &group.dialer,
-                    &group.landing,
-                ]
-                .into_iter()
-                .any(|value| value.as_deref() == Some(name))
-            })
-            .map(|group| format!("出站 {}", group.name)),
-    );
-    if !references.is_empty() {
-        return Err((
-            409,
-            "state_conflict",
-            format!("节点仍被{}引用，请先更换引用再删除", references.join("、")),
-        ));
-    }
-    let names = parse(&config.content)
-        .nodes
-        .into_iter()
-        .map(|node| node.name)
-        .collect::<Vec<_>>();
-    let mut accepted = None;
-    let removed = crate::providers::remove_node_checked(&node, &names, |provider_nodes| {
-        let next = build_with_providers(config.content.clone(), config.modified, &provider_nodes);
-        let errors = next
-            .diagnostics
-            .iter()
-            .filter(|row| row.level == "error")
-            .map(|row| row.message.clone())
-            .collect::<Vec<_>>();
-        if !errors.is_empty() {
-            return Err(format!("删除会使出站或链路失效：{}", errors.join("；")));
-        }
-        accepted = Some(next);
-        Ok(())
-    })?;
-    if removed == 0 {
-        return Ok(r#"{"deleted":0}"#.to_owned());
-    }
-    let previous = config.generation.clone();
-    let next = accepted.expect("validated deletion snapshot");
-    let generation = next.generation.clone();
-    let groups = config
-        .groups
-        .iter()
-        .map(|group| group.name.clone())
-        .collect::<Vec<_>>();
-    crate::control::forget_member(&groups, name);
-    publish(&mut config, next);
-    drop(config);
-    crate::events::generation_changed(&previous, &generation);
-    Ok(r#"{"deleted":1}"#.to_owned())
-}
-
 /// Keep the accepted configuration and both Geo assets on one rollback boundary.
 pub(crate) fn replace_geodata(assets: &[(String, Vec<u8>)]) -> Result<String, String> {
     let _serial=crate::rules_runtime::APPLY.lock().unwrap_or_else(|p|p.into_inner());
@@ -912,6 +834,11 @@ pub(crate) fn replace_geodata(assets: &[(String, Vec<u8>)]) -> Result<String, St
 }
 
 /// Every node name the merged configuration currently offers.
+pub(crate) fn node_names_for_host(host: &str) -> Vec<String> {
+    refresh();
+    current().nodes.iter().filter(|n| n.host.trim_end_matches('.').eq_ignore_ascii_case(host)).map(|n|n.name.clone()).collect()
+}
+
 pub fn node_names() -> Vec<String> {
     refresh();
     current()
@@ -950,27 +877,42 @@ pub(crate) fn decide_connection_for(
     input.source_ip = source.map(|source| source.ip());
     input.source_port = source.map(|source| source.port());
     input.process = process.as_ref();
-    fn needs_ip(condition: &Condition) -> bool {
-        match condition {
-            Condition::RuleSet(set) => !set.set.domain_only,
-            Condition::GeoIp(_) | Condition::IpCidr(..) => true,
-            Condition::Not(part) => needs_ip(part),
-            Condition::And(parts) | Condition::Any(parts) => parts.iter().any(needs_ip),
-            _ => false,
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    input.host=&host;
+    for _ in 0..3 {
+        let (generation,rules)={let config=current();(config.generation.clone(),config.rules.clone())};
+        let mut addresses=Vec::new();let mut queried=false;let mut selected=None;
+        for rule in &rules {
+            let Some(condition)=&rule.condition else {continue};
+            let evaluation=RoutingInput{answer_ips:&addresses,..input};
+            if input.destination_ip.is_none() && !queried && condition_needs_resolution(condition,&evaluation) {
+                addresses=crate::dns::resolve(&host).unwrap_or_default();queried=true;
+            }
+            let evaluation=RoutingInput{answer_ips:&addresses,..input};
+            if condition_matches_input(condition,&evaluation) {selected=Some(rule.id.as_str());break;}
         }
+        let config=current();
+        if config.generation!=generation {continue;}
+        let rule=selected.and_then(|id|config.rules.iter().find(|r|r.id==id)).unwrap_or(&config.fallback);
+        return decision_for_rule(&config,rule,&RoutingInput{answer_ips:&addresses,..input},true);
     }
-    let resolve = input.destination_ip.is_none()
-        && current()
-            .rules
-            .iter()
-            .any(|rule| rule.condition.as_ref().is_some_and(needs_ip));
-    let addresses = if resolve {
-        crate::dns::resolve(host).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    input.answer_ips = &addresses;
-    decide_input(&current(), input, true)
+    let config=current();
+    let mut blocked=config.fallback.clone();blocked.outbound="block".into();
+    decision_for_rule(&config,&blocked,&input,true)
+
+}
+
+pub(crate) fn condition_needs_resolution(condition:&Condition,input:&RoutingInput<'_>)->bool {
+    if input.destination_ip.is_some() || !input.answer_ips.is_empty(){return false;}
+    match condition {
+        Condition::NoResolve(_)=>false,
+        Condition::RuleSet(set)=>set.set.needs_resolution(input),
+        Condition::GeoIp(_) | Condition::IpCidr(..)=>true,
+        Condition::Not(c)=>condition_needs_resolution(c,input),
+        Condition::And(parts)=>!parts.iter().any(|c|condition_known(c,input)&&!condition_matches_input(c,input)) && parts.iter().any(|c|condition_needs_resolution(c,input)),
+        Condition::Any(parts)=>!parts.iter().any(|c|condition_matches_input(c,input)) && parts.iter().any(|c|condition_needs_resolution(c,input)),
+        _=>false,
+    }
 }
 
 pub(crate) fn trace_input(input: RoutingInput<'_>) -> serde_json::Value {
@@ -1115,6 +1057,10 @@ fn decide_input(config: &Config, input: RoutingInput<'_>, advance: bool) -> Deci
                 .is_some_and(|condition| condition_matches_input(condition, &input))
         })
         .unwrap_or(&config.fallback);
+    decision_for_rule(config,rule,&input,advance)
+}
+
+fn decision_for_rule(config:&Config,rule:&Rule,input:&RoutingInput<'_>,advance:bool)->Decision {
     let (target, chain, dependencies) = resolve_outbound_for(
         config,
         &rule.outbound,
@@ -1244,7 +1190,7 @@ fn select_member_for(
         Policy::Fixed(index) => members.get(index).or_else(|| members.first()).cloned(),
         _ => crate::group_policy::select(group, &config.nodes, network, advance),
     }
-    .filter(|name| config.nodes.iter().any(|node| &node.name == name))
+    .filter(|name| matches!(name.as_str(), "direct"|"block") || config.nodes.iter().any(|node| &node.name == name) || config.groups.iter().any(|g| &g.name == name))
 }
 
 #[cfg(test)]
@@ -1301,14 +1247,24 @@ pub fn outbound_seed() -> Vec<(String, &'static str)> {
 
 /// Explicit infrastructure egress, without re-routing the resolver/provider
 /// server through the very DNS policy it is trying to establish.
-pub(crate) fn connect_outbound(name: &str, host: &str, port: u16) -> std::io::Result<std::net::TcpStream> {
+pub(crate) fn connect_outbound_tracked(name: &str, host: &str, port: u16) -> std::io::Result<(std::net::TcpStream, Decision)> {
     let decision = infrastructure_decision(name, "tcp")?;
     if decision.blocked() {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "下载和 DNS 请求不能使用阻断出站"));
     }
     // Include actual infrastructure connections in the same success/failure
     // feedback as user traffic, so recovery does not depend on the probe URL.
-    crate::proxy::connect(&decision, host, port)
+    crate::proxy::connect(&decision, host, port).map(|stream| (stream, decision))
+}
+/// A connected proxy socket is not proof that its encrypted destination works.
+/// Feed transport failures back to automatic selection; never retry via direct.
+pub(crate) fn infrastructure_failure(decision: &Decision, error: &std::io::Error) {
+    use std::io::ErrorKind::*;
+    if matches!(error.kind(), UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe | TimedOut | WouldBlock | NotConnected | WriteZero) {
+        if let Target::Node(node) = &decision.target {
+            crate::group_policy::dial_result(node, "tcp", false, std::time::Duration::ZERO);
+        }
+    }
 }
 pub(crate) fn infrastructure_decision(name: &str, network: &str) -> std::io::Result<Decision> {
     let config = current();
@@ -1614,14 +1570,15 @@ pub fn rules_json() -> String {
     refresh();
     let config = current();
     let mut entries = Vec::with_capacity(config.rules.len() + 1);
-    for rule in config.rules.iter().filter(|r|r.line>0).chain(std::iter::once(&config.fallback)) {
+    let mut resource_entries = Vec::new();
+    for rule in config.rules.iter().chain(std::iter::once(&config.fallback)) {
         let source = source_json(rule.line, rule.source_id.as_deref());
         let kind = if rule.condition.is_some() {
             "rule"
         } else {
             "fallback"
         };
-        entries.push(format!(
+        let entry = format!(
             r#"{{"rule_id":"{}","index":{},"expression":"{}","outbound":"{}","must":false,"source":{},"kind":"{}"}}"#,
             rule.id,
             rule.index,
@@ -1629,13 +1586,19 @@ pub fn rules_json() -> String {
             json::escape(&rule.outbound),
             source,
             kind
-        ));
+        );
+        if rule.line == 0 && rule.condition.is_some() {
+            resource_entries.push(entry);
+        } else {
+            entries.push(entry);
+        }
     }
     let fallback_source = source_json(config.fallback.line, config.fallback.source_id.as_deref());
     format!(
-        r#"{{"generation_id":"{}","rules":[{}],"fallback":{{"outbound":"{}","source":{}}}}}"#,
+        r#"{{"generation_id":"{}","rules":[{}],"x-lemonvpn-resource-rules":[{}],"fallback":{{"outbound":"{}","source":{}}}}}"#,
         config.generation,
         entries.join(","),
+        resource_entries.join(","),
         json::escape(&config.fallback.outbound),
         fallback_source
     )
@@ -1769,7 +1732,8 @@ fn group_selection(config: &Config, group: &Group) -> serde_json::Value {
         }
         select_member_for(group,config,network,false).map(|member|{
         let source=if crate::control::selection_override_for(&group.name,network).is_some(){if matches!(group.policy,Policy::Selector){"runtime"}else{"override"}}else{"policy"};
-        serde_json::json!({"member_id":format!("node-{member}"),"resolved_leaf_node_id":format!("node-{member}"),"source":source})
+        let leaf=resolve_outbound_for(config,&member,&mut vec![group.name.clone()],network,false).and_then(|(_,path,_)|path.last().map(|n|format!("node-{n}")));
+        serde_json::json!({"member_id":member_id(config,&member),"resolved_leaf_node_id":leaf,"source":source})
     })
     };
     serde_json::json!({"tcp":row("tcp"),"udp":row("udp")})
@@ -1823,11 +1787,7 @@ fn group_body(config: &Config, id: &str) -> Option<String> {
         .members
         .iter()
         .map(|member| {
-            format!(
-                r#"{{"id":"node-{}","name":"{}","kind":"node"}}"#,
-                json::escape(member),
-                json::escape(member)
-            )
+            serde_json::json!({"id":member_id(config,member),"name":member,"kind":if config.groups.iter().any(|g|g.name==*member){"group"}else{"node"}}).to_string()
         })
         .collect::<Vec<_>>()
         .join(",");
@@ -1839,7 +1799,7 @@ fn group_body(config: &Config, id: &str) -> Option<String> {
             r#""members":[{}],"#,
             r#""config":{{"default_member_id":{},"final_outbound":{},"check_url":null,"check_interval":null,"tolerance":null,"idle_timeout":null,"interrupt_connections":true}},"#,
             r#""runtime":{{"selection":{},"health":[]}},"#,
-            r#""capabilities":{{"can_select":{can_select},"can_override":{can_override},"supports_nested_groups":false,"mutable_config":{mutable},"probe_transports":{transports}}}}}"#
+            r#""capabilities":{{"can_select":{can_select},"can_override":{can_override},"supports_nested_groups":true,"mutable_config":{mutable},"probe_transports":{transports}}}}}"#
         ),
         json::escape(&group.name),
         json::escape(&group.name),
@@ -1850,7 +1810,7 @@ fn group_body(config: &Config, id: &str) -> Option<String> {
         group
             .default
             .as_ref()
-            .map(|member| format!("\"node-{}\"", json::escape(member)))
+            .map(|member| json::quoted(&member_id(config,member)))
             .unwrap_or_else(|| "null".to_string()),
         group
             .final_outbound
@@ -1874,6 +1834,9 @@ fn group_body(config: &Config, id: &str) -> Option<String> {
     let mut body: serde_json::Value = serde_json::from_str(&body).ok()?;
     body["x-lemonvpn-chain"] = proxy_chain::preview(config, group);
     Some(body.to_string())
+}
+fn member_id(config:&Config,name:&str)->String {
+    format!("{}-{name}",if config.groups.iter().any(|g|g.name==name){"group"}else{"node"})
 }
 
 /// One read boundary for current selections and actual retained connections.
@@ -2304,6 +2267,20 @@ fn resolve_groups(
             Vec::new()
         };
         for filter in &raw.filters {
+            // Explicit outbound references preserve a nested group's selection
+            // policy. group(...) remains the existing flattened roster filter.
+            if let Some(args)=filter.trim().strip_prefix("outbound(").and_then(|s|s.strip_suffix(')')) {
+                match crate::group_filter::split_top(args,",") {
+                    Ok(args)=>for arg in args {
+                        let name=unquote(arg);
+                        if !matches!(name.as_str(),"direct"|"block") && !nodes.iter().any(|n|n.name==name) && !raw_groups.iter().any(|g|g.name==name) {
+                            diagnostics.push(diagnostic(raw.line,"group_member",format!("嵌套出站 {name} 不存在")));
+                        } else if !members.contains(&name) {members.push(name);}
+                    },
+                    Err(e)=>diagnostics.push(diagnostic(raw.line,"group_member",e)),
+                }
+                continue;
+            }
             match crate::group_filter::evaluate(filter, &resolved, nodes) {
                 Ok(found) => {
                     for name in found {
@@ -2321,6 +2298,9 @@ fn resolve_groups(
         }
         if raw.dialer.is_some() && raw.landing.is_some() {
             members.clear();
+        }
+        if !matches!(policy,Policy::Selector|Policy::Fixed(_)) && members.iter().any(|name|!nodes.iter().any(|n|n.name==*name)) {
+            diagnostics.push(diagnostic(raw.line,"group_policy","嵌套出站成员请使用手动选择或固定选择策略".into()));
         }
         if let Some(default) = &raw.default {
             if !members.contains(default) {
@@ -2346,6 +2326,12 @@ fn resolve_groups(
         });
     }
     proxy_chain::validate(raw_groups, &resolved, nodes, diagnostics);
+    fn check(name:&str,groups:&[Group],path:&mut Vec<String>,work:&mut usize)->bool {
+        if *work==0 || path.len()>=16 || path.iter().any(|n|n==name){return false;}
+        *work-=1;let Some(group)=groups.iter().find(|g|g.name==name) else{return true};path.push(name.to_owned());
+        let okay=group.members.iter().all(|n|check(n,groups,path,work));path.pop();okay
+    }
+    for group in &resolved {if !check(&group.name,&resolved,&mut Vec::new(),&mut 20000){diagnostics.push(diagnostic(0,"group_cycle",format!("策略组 {} 存在循环、嵌套过深或引用过多",group.name)));}}
     resolved
 }
 
@@ -2663,7 +2649,7 @@ fn merge_includes(parsed: &mut Parsed, sources: &std::collections::HashMap<Strin
 pub(crate) fn routing_condition_supported(condition: &Condition) -> bool {
     match condition {
         Condition::QueryType(_) | Condition::Upstream(_) => false,
-        Condition::Not(inner) => routing_condition_supported(inner),
+        Condition::Not(inner) | Condition::NoResolve(inner) => routing_condition_supported(inner),
         Condition::And(conditions) | Condition::Any(conditions) => {
             conditions.iter().all(routing_condition_supported)
         }
@@ -2681,7 +2667,7 @@ pub(crate) fn dns_condition_supported(condition: &Condition, response: bool) -> 
         | Condition::GeoSite(_)
         | Condition::QueryType(_) => true,
         Condition::GeoIp(_) | Condition::IpCidr(..) | Condition::Upstream(_) => response,
-        Condition::Not(inner) => dns_condition_supported(inner, response),
+        Condition::Not(inner) | Condition::NoResolve(inner) => dns_condition_supported(inner, response),
         Condition::And(conditions) | Condition::Any(conditions) => conditions
             .iter()
             .all(|condition| dns_condition_supported(condition, response)),
@@ -2831,8 +2817,9 @@ fn parse_routing_line(text: &str, line: u32, parsed: &mut Parsed) {
 }
 
 fn outbound_name(text: &str) -> Option<String> {
+    let quoted=text.starts_with(['\'', '"']) && text.chars().last()==text.chars().next();
     let text = unquote(text.trim());
-    if text.is_empty() || text.contains(char::is_whitespace) {
+    if text.is_empty() || text.chars().any(char::is_control) || (!quoted && text.contains(char::is_whitespace)) {
         return None;
     }
     Some(text)
@@ -3360,7 +3347,7 @@ mod tests {
     }
 }
 
-pub(crate) fn condition_uses_geo(c:&Condition,kind:&str,id:&str)->bool{match c{Condition::GeoSite(g)if kind=="geosite"=>g.category(id),Condition::GeoIp(g)|Condition::SourceGeoIp(g)if kind=="geoip"=>g.category(id),Condition::RuleSet(set)=>set.set.uses_geo(kind,id),Condition::And(rows)|Condition::Any(rows)=>rows.iter().any(|c|condition_uses_geo(c,kind,id)),Condition::Not(c)=>condition_uses_geo(c,kind,id),_=>false}}
+pub(crate) fn condition_uses_geo(c:&Condition,kind:&str,id:&str)->bool{match c{Condition::GeoSite(g)if kind=="geosite"=>g.category(id),Condition::GeoIp(g)|Condition::SourceGeoIp(g)if kind=="geoip"=>g.category(id),Condition::RuleSet(set)=>set.set.uses_geo(kind,id),Condition::And(rows)|Condition::Any(rows)=>rows.iter().any(|c|condition_uses_geo(c,kind,id)),Condition::Not(c)|Condition::NoResolve(c)=>condition_uses_geo(c,kind,id),_=>false}}
 pub(crate) fn geo_references(kind:&str,id:&str)->Vec<serde_json::Value>{let snapshot=crate::rules_runtime::current();let config=current();let mut refs=Vec::new();
     for row in config.rules.iter().filter(|r|r.line>0&&r.condition.as_ref().is_some_and(|c|condition_uses_geo(c,kind,id))){refs.push(serde_json::json!({"name":row.expression,"scope":"routing"}));}
     for row in config.dns_rules.iter().chain(&config.dns_response_rules).filter(|r|condition_uses_geo(&r.condition,kind,id)){refs.push(serde_json::json!({"name":row.expression,"scope":"source-dns"}));}
@@ -3374,7 +3361,7 @@ pub(crate) fn collect_geo_codes(condition: &Condition, codes: &mut std::collecti
         Condition::GeoIp(g) | Condition::SourceGeoIp(g) => g.category_id().map(|id| ("geoip", id)),
         Condition::RuleSet(set) => {set.set.collect_geo_codes(codes); None},
         Condition::And(rows) | Condition::Any(rows) => {for row in rows {collect_geo_codes(row, codes);} None},
-        Condition::Not(row) => {collect_geo_codes(row, codes); None},
+        Condition::Not(row) | Condition::NoResolve(row) => {collect_geo_codes(row, codes); None},
         _ => None,
     };
     if let Some((kind, code)) = category {codes.entry(kind.into()).or_default().insert(code);}

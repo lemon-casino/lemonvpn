@@ -85,7 +85,15 @@ pub(crate) fn apply_dns_settings(settings: &crate::platform::dns_settings::DnsSe
     }
     Ok(())
 }
-pub(crate) fn flush_tun_dns()->io::Result<()>{for slot in [&BACKEND,&BACKEND_V6]{if let Some(backend)=slot.lock().unwrap().as_ref(){backend.process.request("POST","/cache/dns/flush",None)?;}}if let Some(bridge)=TUN.lock().unwrap().as_ref(){bridge.flush_dns()?;}Ok(())}
+pub(crate) fn dns_endpoint() -> io::Result<SocketAddr> {
+    TUN.lock().unwrap().as_ref().ok_or_else(||io::Error::other("Fake-IP DNS 需要开启 TUN"))?.dns_endpoint()
+}
+pub(crate) fn flush_tun_dns()->io::Result<()> {
+    let mut errors=Vec::new();
+    for slot in [&BACKEND,&BACKEND_V6] {if let Some(backend)=slot.lock().unwrap().as_ref(){if let Err(e)=backend.process.request("POST","/cache/dns/flush",None){errors.push(e.to_string());}}}
+    if let Some(bridge)=TUN.lock().unwrap().as_ref(){if let Err(e)=bridge.flush_dns(){errors.push(e.to_string());}}
+    if errors.is_empty(){Ok(())}else{Err(io::Error::other(errors.join("；")))}
+}
 
 fn base_config(
     entries: &BTreeMap<String, (Value, u16)>,
@@ -266,7 +274,8 @@ fn control(
 fn endpoint_addresses(host: &str) -> io::Result<Vec<String>> {
     let addresses = if let Ok(ip)=host.parse(){vec![ip]}else{crate::dns::bootstrap_resolve(host)?};
     let families = managed::egress_families();
-    let result: Vec<_> = addresses.into_iter().filter(|ip|ip.is_loopback() || families.map_or(true,|f|f[usize::from(ip.is_ipv6())]))
+    let ipv6=crate::dns_settings::current()?.ipv6_enabled;
+    let result: Vec<_> = addresses.into_iter().filter(|ip|ip.is_loopback() || (ip.is_ipv4() || ipv6) && families.map_or(true,|f|f[usize::from(ip.is_ipv6())]))
         .map(|ip|ip.to_string()).collect();
     if result.is_empty() { return Err(io::Error::new(io::ErrorKind::NotConnected,"没有对应地址族的可用出口")); }
     Ok(result)

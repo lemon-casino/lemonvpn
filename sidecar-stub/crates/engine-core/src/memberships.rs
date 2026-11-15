@@ -364,7 +364,7 @@ fn resolve_members(
     Ok(members)
 }
 
-fn uncomment(line: &str) -> (&str, &str) {
+pub(super) fn uncomment(line: &str) -> (&str, &str) {
     let mut quote = None;
     let mut escaped = false;
     for (index, c) in line.char_indices() {

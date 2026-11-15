@@ -64,3 +64,7 @@
 - [Apple route 实现与手册](https://github.com/apple-oss-distributions/network_cmds/tree/main/route.tproj)：双栈 ifscope 路由与 PROTO2 标记。
 - [mihomo Linux 绑定](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/component/dialer/bind_linux.go)、[macOS 绑定](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/component/dialer/bind_darwin.go)：辅助内核的接口控制行为。
 - [Desktop Entry 规范](https://specifications.freedesktop.org/desktop-entry/latest-single/)、[XDG Autostart](https://wiki.freedesktop.org/www/Specifications/autostart-spec/)：用户级自启与参数转义。
+
+## 2026-11-12 路由冲突防护
+
+Linux TUN 首次启动前检查 IPv4/IPv6 的捕获优先级 9000～9010 以及表 2022 的规则和路由。即使不存在 LemonVPN 网卡，也不把这些规则自动视为本项目的旧会话；发现占用时停止启用并给出冲突原因，避免随包内核初始化时清除其他 TUN 的规则。规则读取强制数字 ID，避免路由表别名隐藏占用。已有会话的网络恢复流程保持原入口。

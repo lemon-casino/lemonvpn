@@ -2,7 +2,9 @@
 import {spawnSync} from 'node:child_process';
 import {resolve, dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {migrationApplied} from './prepare-migration.mjs';
 export function rulesDnsApplied(frontendDir) {
+  if (migrationApplied(frontendDir)) return true;
   const patch = resolve(dirname(fileURLToPath(import.meta.url)), '../../patches/doona-lemonvpn-rules-dns.patch');
   return spawnSync('git', ['apply', '--reverse', '--check', patch], {cwd: frontendDir, encoding: 'utf8'}).status === 0;
 }

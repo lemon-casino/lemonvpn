@@ -273,13 +273,50 @@ const PROTOCOL: &str = "242";
 #[cfg(target_os = "linux")]
 fn rules(ipv6: bool) -> io::Result<Vec<serde_json::Value>> {
     let output = Command::new(network::ip_tool()?)
-        .args(["-j", if ipv6 { "-6" } else { "-4" }, "rule", "show"])
+        .args(["-j", "-N", if ipv6 { "-6" } else { "-4" }, "rule", "show"])
         .output()?;
     if !output.status.success() {
         return Err(io::Error::other("无法读取策略路由"));
     }
     serde_json::from_slice(&output.stdout).map_err(io::Error::from)
 }
+/// sing-tun removes all rules in its configured capture priority range on
+/// startup. Refuse occupied slots before launching it; an absent LemonVPN
+/// interface alone does not prove that another VPN's rules are ours to delete.
+#[cfg(target_os = "linux")]
+pub(crate) fn capture_slots_available() -> io::Result<()> {
+    for ipv6 in [false, true] {
+        let output = Command::new(network::ip_tool()?)
+            .args([
+                "-j",
+                "-N",
+                if ipv6 { "-6" } else { "-4" },
+                "route",
+                "show",
+                "table",
+                "all",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other("无法读取 TUN 路由表占用情况"));
+        }
+        let routes: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+        if routes.iter().any(|route| {
+            route["table"].as_u64() == Some(2022) || route["table"].as_str() == Some("2022")
+        }) || rules(ipv6)?.iter().any(|rule| {
+            rule["priority"]
+                .as_u64()
+                .is_some_and(|p| (9000..=9010).contains(&p))
+                || rule["table"].as_u64() == Some(2022)
+                || rule["table"].as_str() == Some("2022")
+        }) {
+            return Err(io::Error::new(io::ErrorKind::AddrInUse,
+                "TUN 策略路由槽位（9000～9010 / 表 2022）已被占用；请先关闭其他 TUN，或由管理员确认并清理旧规则，本软件不会自动删除归属不明的路由"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn ours(value: &serde_json::Value) -> bool {
     let protocol = &value["protocol"];
@@ -288,7 +325,8 @@ fn ours(value: &serde_json::Value) -> bool {
             .as_u64()
             .is_some_and(|p| (8750..8800).contains(&p))
         && value["oif"].is_string()
-        && (value["table"] == "main" || value["table"].as_u64() == Some(254))
+        // iproute2 -N serializes numeric table names as strings on Debian 13.
+        && (value["table"] == "main" || value["table"] == "254" || value["table"].as_u64() == Some(254))
 }
 
 #[cfg(target_os = "linux")]

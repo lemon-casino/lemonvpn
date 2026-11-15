@@ -20,6 +20,7 @@ fn broker_payload(mut value:Value)->io::Result<Value>{
     let started=std::time::Instant::now();
     if let Some(settings)=value.get("dns_settings"){
         let bytes=serde_json::to_vec(settings)?;
+        if bytes.len()>32*1024*1024{return Err(io::Error::other("DNS 域名产物超过 32 MiB 上限"));}
         if bytes.len()>64*1024{
             use sha2::{Digest,Sha256};
             let status=broker::request(&json!({"action":"status"}))?;
@@ -27,8 +28,12 @@ fn broker_payload(mut value:Value)->io::Result<Value>{
             let id=format!("{:x}",Sha256::digest(&bytes));
             broker::request(&json!({"action":"dns_artifact_begin","id":id,"size":bytes.len()}))?;
             for (i,chunk) in bytes.chunks(24*1024).enumerate(){
-                if started.elapsed()>Duration::from_secs(30){return Err(io::Error::new(io::ErrorKind::TimedOut,"DNS 域名产物传输超时"))}
-                let hex=chunk.iter().map(|b|format!("{b:02x}")).collect::<String>();
+                // Large domain lists span hundreds of authenticated IPC frames.
+                // Keep the overall transfer bounded without the former 30s cutoff.
+                if started.elapsed()>Duration::from_secs(120){return Err(io::Error::new(io::ErrorKind::TimedOut,"DNS 域名产物传输超时"))}
+                const DIGITS:&[u8;16]=b"0123456789abcdef";
+                let mut hex=String::with_capacity(chunk.len()*2);
+                for &byte in chunk{hex.push(DIGITS[(byte>>4) as usize] as char);hex.push(DIGITS[(byte&15) as usize] as char);}
                 broker::request(&json!({"action":"dns_artifact_part","id":id,"offset":i*24*1024,"hex":hex}))?;
             }
             broker::request(&json!({"action":"dns_artifact_commit","id":id}))?;
@@ -61,6 +66,12 @@ pub fn configuration(router_port: u16, dns_port: u16, password: &str) -> io::Res
         "dns":{"enable":true,"ipv6":true,"enhanced-mode":"fake-ip","fake-ip-range":"198.18.0.1/16","fake-ip-range6":"fc00::/18","default-nameserver":["223.5.5.5","1.1.1.1"],"nameserver":[format!("udp://127.0.0.1:{dns_port}")],"respect-rules":false},
         "profile":{"store-selected":false,"store-fake-ip":false},
     });
+    // LAN DNS uses this private endpoint, never the privileged controller.
+    // Reserve both transports before handing the chosen port to Mihomo.
+    let dns_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let local_port = dns_listener.local_addr()?.port();
+    let _dns_udp = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, local_port))?;
+    config["dns"]["listen"] = json!(format!("127.0.0.1:{local_port}"));
     #[cfg(target_os = "linux")]
     {
         // The egress broker owns priorities 8750..8799; capture follows them.
@@ -293,6 +304,17 @@ impl TunBridge {
                     ))
                 }),
         }
+    }
+    pub fn dns_endpoint(&self) -> io::Result<std::net::SocketAddr> {
+        let value = match &self.owner {
+            Owner::Local(_) => self.config["dns"]["listen"].clone(),
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+            Owner::Service => broker::request(&json!({"action":"dns_endpoint"}))?["address"].clone(),
+        };
+        let address = value.as_str().and_then(|s|s.parse::<std::net::SocketAddr>().ok())
+            .filter(|a|a.ip()==std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) && a.port()>=1024)
+            .ok_or_else(||io::Error::other("TUN DNS 入口不可用，请更新服务"))?;
+        Ok(address)
     }
     pub fn alive(&mut self) -> bool {
         if self.stopped {

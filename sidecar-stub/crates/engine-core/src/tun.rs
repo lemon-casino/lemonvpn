@@ -698,8 +698,10 @@ pub(crate) fn status_json() -> String {
         let ipv4 = crate::dns_settings::current().map(|settings|
             settings.ipv4_range.split('/').next().unwrap_or("198.18.0.1").to_owned()
         ).unwrap_or_else(|_|"198.18.0.1".to_owned());
+        let ipv6=crate::dns_settings::current().is_ok_and(|settings|settings.ipv6_enabled);
+        let address=if ipv6{format!("{ipv4} / fdfe:dcba:9876::1")}else{ipv4};
         return serde_json::json!({"enabled":crate::compat::tun_active(),"supported":true,"adapter":"LemonVPN",
-            "address":format!("{ipv4} / fdfe:dcba:9876::1"),"udp":"full","ipv6":true,"backend":"mihomo",
+            "address":address,"udp":"full","ipv6":ipv6,"backend":"mihomo",
             "recovering":crate::compat::tun_recovery()}).to_string();
     }
     if !supported() {

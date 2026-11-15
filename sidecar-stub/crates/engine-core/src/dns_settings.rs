@@ -106,6 +106,7 @@ pub(crate) fn update(body: &str) -> Result<String, (u16, &'static str, String)> 
     if update.revision != revision(&old) {
         return Err((409, "conflict", "DNS 设置已变更，请重新加载后保存".into()));
     }
+    drop(slot);
     if next != old {
         crate::compat::apply_dns_settings(
             &compose(next.clone(), &crate::rules_runtime::current())
@@ -128,13 +129,12 @@ pub(crate) fn update(body: &str) -> Result<String, (u16, &'static str, String)> 
                 },
             ));
         }
-        *slot = Some(next.clone());
+        *SETTINGS.lock().unwrap_or_else(|p|p.into_inner()) = Some(next.clone());
         crate::dns::flush();
         crate::events::emit(
             "runtime.updated",
             json!({"reason":"dns_settings","revision":revision(&next)}).to_string(),
         );
     }
-    drop(slot);
     status_json().map_err(|e| (500, "dns_settings_read_failed", e.to_string()))
 }

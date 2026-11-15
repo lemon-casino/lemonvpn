@@ -31,6 +31,8 @@ const LOG_CAPACITY: usize = 500;
 
 /// Restart attempts before the supervisor gives up and turns the proxy off.
 const MAX_RESTARTS: u32 = 5;
+/// Require repeated failed local checks before recovering a live but hung child.
+const MAX_HEALTH_FAILURES: u32 = 3;
 
 /// An engine that stays up this long earns a fresh restart budget.
 const STABLE_PERIOD: Duration = Duration::from_secs(60);
@@ -59,6 +61,7 @@ pub struct Engine {
     /// Set by `shutdown` so the supervisor does not fight an intentional stop.
     stopping: AtomicBool,
     restarts: Mutex<u32>,
+    health_failures: Mutex<u32>,
     last_start: Mutex<Option<Instant>>,
     path: Option<PathBuf>,
     data_dir: Option<PathBuf>,
@@ -89,6 +92,7 @@ impl Engine {
             started: Instant::now(),
             stopping: AtomicBool::new(false),
             restarts: Mutex::new(0),
+            health_failures: Mutex::new(0),
             last_start: Mutex::new(None),
             path,
             data_dir,
@@ -184,6 +188,7 @@ impl Engine {
                 };
                 self.log(&status.detail);
                 if status.state == "running" {
+                    *self.health_failures.lock().unwrap() = 0;
                     *self.last_start.lock().unwrap() = Some(Instant::now());
                     self.owned_datapath.store(true, Ordering::SeqCst);
                     *self.child.lock().unwrap() = Some(child);
@@ -217,12 +222,46 @@ impl Engine {
 
         match self.child_state() {
             ChildState::Running => {
-                if let Some(started) = *self.last_start.lock().unwrap() {
-                    if started.elapsed() >= STABLE_PERIOD {
-                        *self.restarts.lock().unwrap() = 0;
+                let pid = self.child.lock().unwrap().as_ref().map(Child::id);
+                let health = pid.map(|pid| probe(self.port, pid)).unwrap_or(Probe::Silent);
+                if matches!(health, Probe::Ready) {
+                    *self.health_failures.lock().unwrap() = 0;
+                    if let Some(started) = *self.last_start.lock().unwrap() {
+                        if started.elapsed() >= STABLE_PERIOD {
+                            *self.restarts.lock().unwrap() = 0;
+                        }
                     }
+                    return false;
                 }
-                return false;
+                let failures = {
+                    let mut count = self.health_failures.lock().unwrap();
+                    *count += 1;
+                    *count
+                };
+                if failures < MAX_HEALTH_FAILURES {
+                    self.log(format!("本机引擎健康检查失败 {failures}/{MAX_HEALTH_FAILURES}"));
+                    return false;
+                }
+                // Kill only the child we spawned. A different process answering
+                // on this port is never sent TUN/API commands or adopted.
+                if let Some(mut child) = self.child.lock().unwrap().take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                if matches!(health, Probe::Foreign) {
+                    self.owned_datapath.store(false, Ordering::SeqCst);
+                    *self.status.lock().unwrap() = EngineStatus {
+                        state: "port_in_use".into(),
+                        detail: "引擎端口由其他进程响应，已停止接管".into(),
+                    };
+                    return true;
+                }
+                self.log("引擎进程仍在，但本机接口连续无响应，开始恢复");
+                on_exit();
+                *self.status.lock().unwrap() = EngineStatus {
+                    state: "unhealthy".into(),
+                    detail: "本机引擎接口连续无响应".into(),
+                };
             }
             ChildState::Exited(code) => {
                 self.log(match code {
@@ -514,9 +553,14 @@ fn probe(port: u16, pid: u32) -> Probe {
 
     let mut response = Vec::new();
     let mut chunk = [0u8; 512];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut eof = false;
     while response.len() < 4096 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { break; }
+        let _ = stream.set_read_timeout(Some(READ_TIMEOUT.min(remaining)));
         match stream.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => { eof = true; break; }
             Ok(read) => response.extend_from_slice(&chunk[..read]),
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
@@ -529,10 +573,17 @@ fn probe(port: u16, pid: u32) -> Probe {
 
     let identity = format!(r#""instance":"lemonvpn-{pid}""#);
     if response.starts_with(b"HTTP/1.1 200") && contains(&response, identity.as_bytes()) {
-        Probe::Ready
-    } else {
-        Probe::Foreign
+        return Probe::Ready;
     }
+    let complete = response.windows(4).position(|b| b == b"\r\n\r\n").is_some_and(|end| {
+        let head = String::from_utf8_lossy(&response[..end]);
+        head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok()).flatten()
+        }).is_some_and(|length| length <= response.len() - end - 4)
+    });
+    if eof || complete { Probe::Foreign } else { Probe::Silent }
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

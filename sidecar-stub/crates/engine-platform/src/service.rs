@@ -226,7 +226,7 @@ pub fn request(value: &Value) -> io::Result<Value> {
                 .start::<&str>(&[])
                 .map_err(err)?;
         } else {
-            return Ok(json!({"ok":true,"enabled":false,"dns_settings_version":2}));
+            return Ok(json!({"ok":true,"enabled":false,"dns_settings_version":3}));
         }
     }
     let deadline = Instant::now() + Duration::from_secs(18);
@@ -363,7 +363,7 @@ fn handle(file: &mut File, owner: &str) -> io::Result<Value> {
                 settings.apply(&mut next);
                 crate::dns_settings::hot_apply(&session.process,&session.config,&next)?;
                 session.config = next;
-                Ok(json!({"ok":true,"enabled":true,"dns_settings_version":2,"dns_settings_sha256":crate::dns_artifact::settings_digest(&settings)?}))
+                Ok(json!({"ok":true,"enabled":true,"dns_settings_version":3,"dns_settings_sha256":crate::dns_artifact::settings_digest(&settings)?}))
             }
             "process_rules" => {
                 let names = crate::tun_bridge::process_list(&value)?;
@@ -379,6 +379,10 @@ fn handle(file: &mut File, owner: &str) -> io::Result<Value> {
                 session.process.request("POST", "/cache/fakeip/flush", None)?;
                 Ok(json!({"ok":true,"enabled":true}))
             }
+            "dns_endpoint" => {
+                let session = session.as_ref().ok_or_else(|| err("TUN 未运行"))?;
+                Ok(json!({"ok":true,"address":session.config["dns"]["listen"]}))
+            }
             "flush_dns" => {
                 let session = session.as_ref().ok_or_else(|| err("TUN 未运行"))?;
                 session.process.request("POST", "/cache/dns/flush", None)?;
@@ -393,7 +397,7 @@ fn handle(file: &mut File, owner: &str) -> io::Result<Value> {
                 if !enabled {
                     session.take();
                 }
-                Ok(json!({"ok":true,"enabled":enabled,"dns_settings_version":2}))
+                Ok(json!({"ok":true,"enabled":enabled,"dns_settings_version":3}))
             }
             _ => Err(err("未知服务操作")),
         }

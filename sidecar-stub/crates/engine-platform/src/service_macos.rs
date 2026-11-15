@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::{
     fs,
     io::{self, Read, Write},
-    os::unix::{fs::PermissionsExt, net::UnixListener},
+    os::unix::{fs::PermissionsExt, io::AsRawFd, net::UnixListener},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -315,7 +315,7 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
                 settings.apply(&mut next);
                 crate::dns_settings::hot_apply(&session.process,&session.config,&next)?;
                 session.config = next;
-                Ok(json!({"ok":true,"enabled":true,"dns_settings_version":2,"dns_settings_sha256":crate::dns_artifact::settings_digest(&settings)?}))
+                Ok(json!({"ok":true,"enabled":true,"dns_settings_version":3,"dns_settings_sha256":crate::dns_artifact::settings_digest(&settings)?}))
             }
             "process_rules" => {
                 let names = crate::tun_bridge::process_list(&value)?;
@@ -330,6 +330,10 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
                 let session = session.as_ref().ok_or_else(|| err("TUN 未运行"))?;
                 session.process.request("POST", "/cache/fakeip/flush", None)?;
                 Ok(json!({"ok":true,"enabled":true}))
+            }
+            "dns_endpoint" => {
+                let session = session.as_ref().ok_or_else(|| err("TUN 未运行"))?;
+                Ok(json!({"ok":true,"address":session.config["dns"]["listen"]}))
             }
             "flush_dns" => {
                 let session = session.as_ref().ok_or_else(|| err("TUN 未运行"))?;
@@ -346,7 +350,7 @@ fn handle(stream: &mut UnixStream, owner: u32) -> io::Result<Value> {
                 let recovering=session.as_mut().and_then(|s| {
                     if !s.process.alive() {Some("协议内核恢复中".to_owned())}else{s.recovering.clone()}
                 });
-                Ok(json!({"ok":true,"enabled":enabled,"recovering":recovering,"dns_settings_version":2}))
+                Ok(json!({"ok":true,"enabled":enabled,"recovering":recovering,"dns_settings_version":3}))
             }
             _ => Err(err("未知服务操作")),
         }
@@ -406,6 +410,20 @@ fn run(owner: u32) -> io::Result<()> {
     });
     listener.set_nonblocking(true)?;
     while !STOP.load(Ordering::Relaxed) {
+        // Large DNS artifacts use sequential frames; wake as soon as the next
+        // request arrives rather than adding a fixed delay to every frame.
+        let mut readiness = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut readiness, 1, 200) };
+        if ready <= 0 {
+            if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                thread::sleep(Duration::from_millis(100));
+            }
+            continue;
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 let mut stream = stream;
@@ -424,9 +442,7 @@ fn run(owner: u32) -> io::Result<()> {
                     );
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(200))
-            }
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
             Err(_) => thread::sleep(Duration::from_millis(100)),
         }
     }

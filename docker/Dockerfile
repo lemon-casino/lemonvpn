@@ -33,7 +33,7 @@ RUN test -n "$DOONA_REVISION" || { echo "DOONA_REVISION build arg is required" >
     && git -C doona remote add origin "$DOONA_REPOSITORY" \
     && git -C doona fetch --depth 1 origin "$DOONA_REVISION" \
     && git -C doona checkout -q FETCH_HEAD \
-    && for p in doona-lemonvpn-desktop doona-lemonvpn-proxy-health doona-lemonvpn-lan-sharing doona-lemonvpn-rules-dns; do \
+    && for p in doona-lemonvpn-desktop doona-lemonvpn-proxy-health doona-lemonvpn-lan-sharing doona-lemonvpn-rules-dns doona-lemonvpn-migration; do \
          git -C doona apply --binary --whitespace=nowarn "../patches/$p.patch"; \
        done
 
@@ -72,6 +72,7 @@ RUN set -eux; \
     chmod 755 /out/lemonvpn-engine /out/lemonvpn-service /out/lemonvpn-kernel
 
 FROM ${RUNTIME_IMAGE}
+ARG DEBIAN_FRONTEND=noninteractive
 ARG LEMONVPN_VERSION=dev
 ARG TARGETARCH
 
@@ -83,7 +84,7 @@ LABEL org.opencontainers.image.title="LemonVPN" \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-      nginx iproute2 procps ca-certificates curl openssl util-linux tini libcap2-bin \
+      nginx iproute2 iptables procps ca-certificates curl openssl util-linux tini libcap2-bin tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 1000 --user-group --create-home --home-dir /home/lemonvpn \
          --shell /usr/sbin/nologin lemonvpn
@@ -98,24 +99,29 @@ RUN set -eux; \
     rm -rf /out; \
     chmod 755 /usr/local/bin/lemonvpn-engine \
               /usr/local/lib/lemonvpn/lemonvpn-service \
-              /usr/local/lib/lemonvpn/lemonvpn-kernel
+              /usr/local/lib/lemonvpn/lemonvpn-kernel; \
+    setcap cap_net_bind_service=ep /usr/local/bin/lemonvpn-engine
 
 COPY docker/nginx.conf /etc/nginx/nginx.conf
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY docker/healthcheck.sh /usr/local/bin/lemonvpn-healthcheck
+COPY docker/tun-forward.sh /usr/local/bin/lemonvpn-tun-forward
 # A Windows checkout may carry CRLF; the container files are used verbatim.
-RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh /etc/nginx/nginx.conf \
-    && chmod 755 /usr/local/bin/entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh /usr/local/bin/lemonvpn-healthcheck /usr/local/bin/lemonvpn-tun-forward /etc/nginx/nginx.conf \
+    && chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/lemonvpn-healthcheck /usr/local/bin/lemonvpn-tun-forward
 
 ENV LEMONVPN_DATA_DIR=/data \
     LEMONVPN_ENGINE_PORT=18080 \
     LEMONVPN_RESOURCE_DIR=/usr/local/lib/lemonvpn
 
 VOLUME ["/data"]
-EXPOSE 8080 18081
+EXPOSE 8080 18081/tcp 18081/udp 1053/tcp 1053/udp
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:18080/health >/dev/null || exit 1
+  CMD ["/usr/local/bin/lemonvpn-healthcheck"]
 
 # The entrypoint starts as root so it can launch the standalone TUN broker; the
 # engine, nginx and all data files run as uid 1000.
-ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/entrypoint.sh"]
+# Signal only the supervisor first; it disables its own TUN before stopping
+# the engine and broker, instead of terminating all three simultaneously.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]

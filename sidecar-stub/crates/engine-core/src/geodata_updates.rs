@@ -375,13 +375,10 @@ fn download_asset(
     via: &fetch::DownloadRoute,
 ) -> Result<(Vec<u8>, AcceptedAsset), String> {
     crate::dns_transport::with_bootstrap(|| {
-        let response = fetch::get_routed(url, "LemonVPN-Geodata/1", MAX_ASSET, via)?;
-        if response.status != 200 || response.body.is_empty() {
-            return Err(format!("下载服务器返回 HTTP {} 或空文件", response.status));
-        }
-        let digest = crate::sha256::hex(&response.body);
-        let mut verified = false;
-        if settings.verify_checksum {
+        // Check the small digest first. Daily checks should not re-download
+        // tens of MB when the accepted asset is already identical.
+        let mut reused = None;
+        let expected = if settings.verify_checksum {
             let mut target = fetch::valid_url(url)?;
             let file = target
                 .path_segments()
@@ -390,16 +387,37 @@ fn download_asset(
                 .to_string();
             target.set_path(&format!("{}.sha256sum", target.path()));
             let sum = fetch::get_routed(target.as_str(), "LemonVPN-Geodata/1", 16 * 1024, via)?;
-            if sum.status == 200 {
-                let expected = checksum(&sum.body, &file)?;
-                if expected != digest {
-                    return Err("SHA256 不匹配，文件未替换".into());
-                }
-                verified = true;
-            } else if sum.status != 404 {
-                return Err(format!("校验文件返回 HTTP {}", sum.status));
+            if sum.status != 200 {
+                return Err(format!("SHA256 校验文件不可用（HTTP {}），文件未替换", sum.status));
             }
+            let expected = checksum(&sum.body, &file)?;
+            if let Ok(path) = crate::geodata::asset_path(kind) {
+                use std::io::Read;
+                if let Ok(file) = fs::File::open(path) {
+                    let mut bytes = Vec::new();
+                    if file.take(MAX_ASSET as u64 + 1).read_to_end(&mut bytes).is_ok()
+                        && bytes.len() <= MAX_ASSET && crate::sha256::hex(&bytes) == expected
+                        && crate::geodata::validate_asset(kind, &bytes).is_ok()
+                    {
+                        reused = Some(fetch::Response { status:200, headers:Vec::new(), body:bytes,
+                            download_outbound:sum.download_outbound, fetched_url:url.into() });
+                    }
+                }
+            }
+            Some(expected)
+        } else { None };
+        let response = match reused {
+            Some(response) => response,
+            None => fetch::get_routed(url, "LemonVPN-Geodata/1", MAX_ASSET, via)?,
+        };
+        if response.status != 200 || response.body.is_empty() {
+            return Err(format!("下载服务器返回 HTTP {} 或空文件", response.status));
         }
+        let digest = crate::sha256::hex(&response.body);
+        if expected.as_ref().is_some_and(|sum|sum != &digest) {
+            return Err("SHA256 不匹配，文件未替换".into());
+        }
+        let verified = expected.is_some();
         crate::geodata::validate_asset(kind, &response.body)?;
         let selected = response
             .download_outbound
