@@ -14,6 +14,7 @@ use std::time::Duration;
 
 mod memory;
 pub mod lan;
+pub mod udp_reply;
 pub mod dns_artifact;
 #[cfg(windows)]
 mod windows;

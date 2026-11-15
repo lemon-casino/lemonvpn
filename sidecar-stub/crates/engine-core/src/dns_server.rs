@@ -5,13 +5,13 @@ use serde_json::json;
 use std::{
     fs,
     io::{self, Read, Write},
-    net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,9 +112,49 @@ struct Metrics {
     errors: AtomicU64,
     last_error: Mutex<Option<String>>,
 }
+impl Metrics {
+    fn error(&self, error: impl ToString) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+        *self.last_error.lock().unwrap() = Some(error.to_string());
+    }
+}
+/// Retain each query's destination IP, including wildcard listeners on hosts
+/// with LAN, VPN and Docker interfaces. Never let routing choose a reply source.
+struct UdpReplies {
+    socket: crate::platform::udp_reply::Socket,
+}
+impl UdpReplies {
+    fn bind(address: SocketAddr) -> io::Result<Self> {
+        Ok(Self {
+            socket: crate::platform::udp_reply::Socket::bind(address)?,
+        })
+    }
+    fn reply(
+        &self,
+        bytes: &[u8],
+        received: &crate::platform::udp_reply::Received,
+    ) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            match self.socket.send_reply(bytes, received) {
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(1))
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
 struct Listener {
     tcp: TcpListener,
-    udp: UdpSocket,
+    udp: Arc<UdpReplies>,
     ready: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     task: Option<JoinHandle<()>>,
@@ -129,13 +169,12 @@ impl Listener {
             None => TcpListener::bind(address)?,
         };
         let udp = match same {
-            Some(p) => p.udp.try_clone()?,
-            None => UdpSocket::bind(address)?,
+            Some(p) => p.udp.clone(),
+            None => Arc::new(UdpReplies::bind(address)?),
         };
         tcp.set_nonblocking(true)?;
-        udp.set_nonblocking(true)?;
         let accept = tcp.try_clone()?;
-        let receive = udp.try_clone()?;
+        let receive = udp.clone();
         let ready = Arc::new(AtomicBool::new(false));
         let active = ready.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -154,28 +193,38 @@ impl Listener {
                     }
                     jobs.retain(|j| !j.is_finished());
                     if jobs.len() < 64 {
-                        if let Ok((n, peer)) = receive.recv_from(&mut bytes) {
-                            if n >= 12 && settings.accepts(peer.ip()) {
-                                let query = bytes[..n].to_vec();
+                        match receive.socket.recv(&mut bytes) {
+                            Ok(packet)
+                                if packet.len >= 12 && settings.accepts(packet.peer.ip()) =>
+                            {
+                                let query = bytes[..packet.len].to_vec();
                                 let m = counters.clone();
-                                if let Ok(socket) = receive.try_clone() {
-                                    jobs.push(thread::spawn(move || {
-                                        if let Some(mut reply) = answer(&query, &m) {
-                                            if reply.len() > 512 {
-                                                if let Ok(mut truncated) =
-                                                    crate::dns::empty_reply(&query, 0)
-                                                {
-                                                    truncated[2] |= 2;
-                                                    reply = truncated;
-                                                } else {
-                                                    return;
-                                                }
+                                let socket = receive.clone();
+                                jobs.push(thread::spawn(move || {
+                                    if let Some(mut reply) = answer(&query, &m) {
+                                        if reply.len() > 512 {
+                                            if let Ok(mut truncated) =
+                                                crate::dns::empty_reply(&query, 0)
+                                            {
+                                                truncated[2] |= 2;
+                                                reply = truncated;
+                                            } else {
+                                                return;
                                             }
-                                            let _ = socket.send_to(&reply, peer);
                                         }
-                                    }));
-                                }
+                                        if let Err(e) = socket.reply(&reply, &packet) {
+                                            m.error(format!("DNS UDP 回包失败：{e}"));
+                                        }
+                                    }
+                                }));
                             }
+                            Ok(_) => {}
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                                ) => {}
+                            Err(e) => counters.error(format!("DNS UDP 接收失败：{e}")),
                         }
                     }
                     if jobs.len() < 64 {
@@ -267,8 +316,7 @@ fn answer(query: &[u8], metrics: &Metrics) -> Option<Vec<u8>> {
     match result {
         Ok(reply) => Some(reply),
         Err(e) => {
-            metrics.errors.fetch_add(1, Ordering::Relaxed);
-            *metrics.last_error.lock().unwrap() = Some(e.to_string());
+            metrics.error(e);
             crate::dns::empty_reply(query, 2).ok()
         }
     }

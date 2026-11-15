@@ -1033,7 +1033,7 @@ index af2ffb4..b6b9ba8 100644
            <Link href={href('dns', {tab: 'policies'})}>{t('rr.editPolicies')}</Link>
            <Button isDisabled={!!action.busy} onPress={() => setConfirm(true)}>
 diff --git a/src/features/shared/resources/ResourceManager.tsx b/src/features/shared/resources/ResourceManager.tsx
-index f3667d4..1f6cf77 100644
+index f3667d4..efa2be8 100644
 --- a/src/features/shared/resources/ResourceManager.tsx
 +++ b/src/features/shared/resources/ResourceManager.tsx
 @@ -1,6 +1,7 @@
@@ -1183,7 +1183,7 @@ index f3667d4..1f6cf77 100644
 +                )}
                </div>
                <div className="rp-cluster">
-+                {provider && (
++                {provider && routes.length === 0 && (
 +                  <Link small appearance="button" href={href('flows', {tab: 'bindings', provider: provider.id})}>
 +                    {t('rr.setRouting')}
 +                  </Link>
