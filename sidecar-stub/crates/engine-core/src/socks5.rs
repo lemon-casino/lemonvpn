@@ -45,6 +45,7 @@ fn handle_inner(
     stop: Option<&std::sync::atomic::AtomicBool>,
 ) -> io::Result<()> {
     // A suspended datapath refuses new tunnels before the greeting; the API
+    let Some(_permit)=crate::admission::proxy() else {return Ok(())};
     // stays reachable so resume can still arrive on the same listener.
     if crate::control::suspended() {
         return Ok(());

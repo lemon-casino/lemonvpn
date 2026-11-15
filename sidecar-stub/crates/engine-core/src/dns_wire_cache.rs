@@ -33,6 +33,7 @@ type ResultCell = Arc<(Mutex<Option<Result<Packet, String>>>, Condvar)>;
 struct Store {
     entries: HashMap<String, Entry>,
     pending: HashMap<String, ResultCell>,
+    pending_names: HashMap<String,(String,u16)>,
     bytes: usize,
     clock: u64,
 }
@@ -115,7 +116,7 @@ fn question(query: &[u8]) -> Option<(String, usize)> {
     for byte in normalized.get_mut(10..end - 6)? {
         *byte = byte.to_ascii_lowercase();
     }
-    Some((format!("{}:{}", name, crate::sha256::hex(&normalized)), end))
+    Some((format!("{}:{}", name.to_ascii_lowercase(), crate::sha256::hex(&normalized)), end))
 }
 fn inspect(wire: &[u8]) -> Option<(u32, Vec<(usize, u32)>, bool)> {
     let (_, end) = crate::dns::read_name(wire, 12).ok()?;
@@ -217,6 +218,7 @@ pub fn flush() {
         wake.notify_all();
     }
     state.pending.clear();
+    state.pending_names.clear();
 }
 pub fn query(
     query: &[u8],
@@ -292,18 +294,20 @@ fn query_inner(
             }
             pending = Arc::new((Mutex::new(None), Condvar::new()));
             state.pending.insert(key.clone(), pending.clone());
+            if let Ok((name,end))=crate::dns::read_name(query,12){state.pending_names.insert(key.clone(),(name,u16at(query,end).unwrap_or(0)));}
             owner = true;
             MISSES.fetch_add(1, Ordering::Relaxed);
         }
     }
     if !owner {
         let (lock, wake) = &*pending;
-        let result = wake
-            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(30), |r| {
-                r.is_none()
-            })
-            .unwrap()
-            .0;
+        let started=Instant::now();let mut result=lock.lock().unwrap();
+        while result.is_none(){
+            let left=Duration::from_secs(30).saturating_sub(started.elapsed());
+            if left.is_zero(){return Err(io::Error::new(io::ErrorKind::TimedOut,"合并 DNS 查询超时"))}
+            let wait=crate::io_budget::remaining(left)?.min(Duration::from_millis(250));
+            result=wake.wait_timeout(result,wait).unwrap().0;
+        }
         let packet = result
             .as_ref()
             .ok_or_else(|| io::Error::other("合并 DNS 查询超时"))?
@@ -347,7 +351,7 @@ fn query_inner(
             if let Some((ttl, fields, negative)) =
                 inspect(wire).filter(|(_, _, n)| !*n || options.negative)
             {
-                crate::config::with_current(|active| {
+                crate::config::with_published(|active| {
                     if active.generation != generation {
                         return;
                     }
@@ -404,10 +408,12 @@ fn query_inner(
             .is_some_and(|p| Arc::ptr_eq(p, &pending))
         {
             state.pending.remove(&key);
+            state.pending_names.remove(&key);
         }
     }
     let (lock, wake) = &*pending;
     let mut cell = lock.lock().unwrap();
+    if let Some(Err(message))=cell.as_ref(){return Err(io::Error::new(io::ErrorKind::Interrupted,message.clone()));}
     if cell.is_none() {
         *cell = Some(
             result
@@ -442,6 +448,9 @@ pub fn prefetch(
     generation: String,
     network: impl FnOnce() -> io::Result<Packet> + Send + 'static,
 ) {
+    struct Reset {query:Vec<u8>,pool:String,generation:String}
+    impl Drop for Reset {fn drop(&mut self){if let Some((qkey,_))=question(&self.query){let key=format!("{}|{}|{}|{}|{}",self.generation,crate::dns_transport::epoch(),crate::dns_transport::route_key(&self.pool),self.pool,qkey);if let Some(entry)=store().entries.get_mut(&key){entry.prefetch=false;}}}}
+    let reset=Reset{query:query.clone(),pool:pool.clone(),generation:generation.clone()};
     {
         let mut rate = PREFETCH_RATE.lock().unwrap();
         let (now, count) = rate.get_or_insert((Instant::now(), 0));
@@ -458,25 +467,30 @@ pub fn prefetch(
         PREFETCH.fetch_sub(1, Ordering::AcqRel);
         return;
     }
-    std::thread::spawn(move || {
-        struct Permit;
-        impl Drop for Permit {
-            fn drop(&mut self) {
-                PREFETCH.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-        let _permit = Permit;
+    struct Permit;
+    impl Drop for Permit {fn drop(&mut self){PREFETCH.fetch_sub(1,Ordering::AcqRel);}}
+    let permit=Permit;
+    let _=std::thread::Builder::new().name("dns-prefetch".into()).spawn(move || {
+        let _reset=reset;
+        let _permit = permit;
         let _ = query_inner(&query, &pool, &generation, true, true, network);
     });
 }
 
 pub fn remove_name(name: &str) -> usize {
+    remove(name,&[])
+}
+pub(crate) fn remove(name:&str,types:&[String])->usize {
     let name = name.trim_end_matches('.').to_ascii_lowercase();
     let mut state = store();
+    // Prevent an older in-flight answer from repopulating a removed entry.
+    EPOCH.fetch_add(1,Ordering::AcqRel);
+    let cancelled=state.pending_names.iter().filter(|(_, (domain,kind))|domain.trim_end_matches('.').eq_ignore_ascii_case(&name)&&(types.is_empty()||crate::dns::type_name(*kind).is_some_and(|k|types.iter().any(|v|v==k)))).map(|(key,_)|key.clone()).collect::<Vec<_>>();
+    for key in cancelled {state.pending_names.remove(&key);if let Some(cell)=state.pending.remove(&key){let(lock,wake)=&*cell;*lock.lock().unwrap()=Some(Err("DNS 缓存已删除，请重试".into()));wake.notify_all();}}
     let keys = state
         .entries
         .iter()
-        .filter(|(_, e)| e.name.trim_end_matches('.').eq_ignore_ascii_case(&name))
+        .filter(|(_, e)| e.name.trim_end_matches('.').eq_ignore_ascii_case(&name) && (types.is_empty()||crate::dns::read_name(&e.wire,12).ok().and_then(|(_,end)|u16at(&e.wire,end)).and_then(crate::dns::type_name).is_some_and(|kind|types.iter().any(|v|v==kind))))
         .map(|(k, _)| k.clone())
         .collect::<Vec<_>>();
     let count = keys.len();

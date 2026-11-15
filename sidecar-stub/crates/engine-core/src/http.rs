@@ -12,23 +12,27 @@ use crate::logs;
 use crate::proxy;
 use crate::state;
 
+#[cfg(test)]
 pub fn handle(client: TcpStream) -> io::Result<()> {
-    handle_inner(client, false, None, None)
+    handle_inner(client, false, None, None, None)
 }
+pub(crate) fn handle_local(client:TcpStream,headers:crate::admission::Permit)->io::Result<()>{handle_inner(client,false,None,None,Some(headers))}
 pub(crate) fn handle_lan(
     client: TcpStream,
     auth: Option<&crate::lan::Credentials>,
     stop: &std::sync::atomic::AtomicBool,
 ) -> io::Result<()> {
-    handle_inner(client, true, auth, Some(stop))
+    handle_inner(client, true, auth, Some(stop), None)
 }
 fn handle_inner(
     mut client: TcpStream,
     lan: bool,
     auth: Option<&crate::lan::Credentials>,
     stop: Option<&std::sync::atomic::AtomicBool>,
+    headers_permit: Option<crate::admission::Permit>,
 ) -> io::Result<()> {
     let headers = proxy::read_headers(&mut client)?;
+    drop(headers_permit);
     let text = String::from_utf8_lossy(&headers).into_owned();
     let request_line = text.split("\r\n").next().unwrap_or("").to_string();
 
@@ -36,6 +40,9 @@ fn handle_inner(
     let method = parts.next().unwrap_or("").to_string();
     let target = parts.next().unwrap_or("").to_string();
     let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+    let management=!lan && target.starts_with('/');
+    let _permit=if management {crate::admission::api()} else {crate::admission::proxy()};
+    if _permit.is_none(){return respond(&mut client,503,r#"{"error":"connection_limit"}"#);}
 
     if method.is_empty() || target.is_empty() {
         return respond(&mut client, 400, r#"{"error":"bad_request"}"#);

@@ -200,10 +200,13 @@ pub fn statistics() -> Value {
     }).collect::<Vec<_>>()})
 }
 pub fn exchange_pool(id: &str, query: &[u8]) -> io::Result<Vec<u8>> {
+    let budget = crate::io_budget::Budget::new(Duration::from_secs(10));
+    let _scope = budget.enter();
     let snapshot = crate::rules_runtime::current();
     let mut id = id;
     let mut visited = std::collections::HashSet::new();
     loop {
+        budget.remaining()?;
         if !visited.insert(id) || visited.len() > 4 { return Err(invalid("DNS 故障回退循环")); }
         let pool = snapshot.document.pools.iter().find(|p| p.id == id)
             .ok_or_else(|| invalid("解析池不存在"))?;
@@ -228,28 +231,40 @@ fn exchange_pool_once(pool: &crate::rules_runtime::model::Pool, document: &crate
         .collect::<Vec<_>>();
     let mut last = invalid("没有可用 DNS 上游");
     if pool.strategy == "race" {
+        static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let budget = crate::io_budget::Budget::new(Duration::from_secs(10));
         let (tx, rx) = std::sync::mpsc::channel();
-        let count = members.len().min(8);
+        let mut count = 0;
         for resolver in members.iter().take(8) {
+            if !crate::admission::reserve(&ACTIVE,64) { last=invalid("DNS 并发查询已达上限");break; }
             let tx = tx.clone();
             let query = query.to_vec();
             let mut resolver = resolver.clone();
             resolver.timeout_ms = resolver.timeout_ms.min(10000);
-            std::thread::spawn(move || {
+            let worker_budget = budget.clone();
+            let spawned = std::thread::Builder::new().name("dns-race".into()).spawn(move || {
+                struct Permit;impl Drop for Permit {fn drop(&mut self){ACTIVE.fetch_sub(1,Ordering::AcqRel);}}let _permit=Permit;
+                let _scope = worker_budget.enter();
                 let result = exchange(&resolver, &query).map(|wire| (resolver.id, wire));
                 let _ = tx.send(result);
             });
+            if let Err(e)=spawned { ACTIVE.fetch_sub(1,Ordering::AcqRel);last=e;break; }
+            count += 1;
         }
         drop(tx);
-        for result in rx.iter().take(count) {
+        for _ in 0..count {
+            let left=match budget.remaining(){Ok(left)=>left,Err(error)=>{budget.cancel();return Err(error)}};
+            let result = match rx.recv_timeout(left) {Ok(result)=>result,Err(_)=>{budget.cancel();return Err(io::Error::new(io::ErrorKind::TimedOut,"DNS 竞速查询超时"));}};
             match result {
                 Ok((id, reply)) => {
+                    budget.cancel();
                     ENDPOINT.with(|v| *v.borrow_mut() = Some(id));
                     return Ok(reply);
                 }
                 Err(e) => last = e,
             }
         }
+        budget.cancel();
     } else {
         let budget = Instant::now();
         for mut resolver in members {
@@ -270,6 +285,8 @@ fn exchange_pool_once(pool: &crate::rules_runtime::model::Pool, document: &crate
     Err(last)
 }
 pub fn exchange(resolver: &Resolver, query: &[u8]) -> io::Result<Vec<u8>> {
+    let budget=crate::io_budget::Budget::new(Duration::from_millis(resolver.timeout_ms));
+    let _scope=budget.enter();
     let started = Instant::now();
     let question = crate::dns::read_name(query,12).ok().and_then(|(name,end)| {
         let kind=u16::from_be_bytes(query.get(end..end+2)?.try_into().ok()?);
@@ -306,6 +323,7 @@ pub fn exchange(resolver: &Resolver, query: &[u8]) -> io::Result<Vec<u8>> {
             ),
         )
     });
+    if crate::io_budget::cancelled(){return result;}
     let mut all = STATS.get_or_init(Default::default).lock().unwrap();
     if all.len() >= 256 && !all.contains_key(&resolver.id) {
         all.pop_first();
@@ -352,13 +370,13 @@ fn addresses(resolver: &Resolver, host: &str, port: u16) -> io::Result<Vec<Socke
 }
 fn connect(resolver: &Resolver, host: &str, port: u16) -> io::Result<(TcpStream, Option<crate::config::Decision>)> {
     let mut last = invalid("DNS 服务器无可用地址");
-    let timeout = Duration::from_millis(resolver.timeout_ms);
+    let timeout = crate::io_budget::remaining(Duration::from_millis(resolver.timeout_ms))?;
+    if resolver.outbound == "direct" {
+        return crate::dial::connect(addresses(resolver,host,port)?,timeout).map(|socket|(socket,None));
+    }
     for address in addresses(resolver, host, port)? {
-        let result = if resolver.outbound == "direct" {
-            crate::platform::current().connect_tcp(address, timeout).map(|socket| (socket, None))
-        } else {
-            crate::config::connect_outbound_tracked(&resolver.outbound, &address.ip().to_string(), port).map(|(socket, decision)| (socket, Some(decision)))
-        };
+        crate::io_budget::remaining(timeout)?;
+        let result = crate::config::connect_outbound_tracked(&resolver.outbound, &address.ip().to_string(), port).map(|(socket, decision)| (socket, Some(decision)));
         match result {
             Ok((socket, decision)) => {
                 socket.set_read_timeout(Some(timeout))?;
@@ -393,6 +411,7 @@ fn once_retry(resolver: &Resolver, query: &[u8], retry: bool) -> io::Result<Vec<
                     match relay.recv(&mut reply) {
                         Ok(value) => break value,
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            crate::io_budget::remaining(Duration::from_millis(resolver.timeout_ms))?;
                             if wait.elapsed() >= Duration::from_millis(resolver.timeout_ms) {
                                 return Err(io::Error::new(
                                     io::ErrorKind::TimedOut,
@@ -422,11 +441,11 @@ fn once_retry(resolver: &Resolver, query: &[u8], retry: bool) -> io::Result<Vec<
                 .parse()
                 .unwrap(),
             )?;
-            socket.set_read_timeout(Some(Duration::from_millis(resolver.timeout_ms)))?;
+            socket.set_read_timeout(Some(crate::io_budget::remaining(Duration::from_millis(resolver.timeout_ms))?))?;
             socket.connect(address)?;
             socket.send(query)?;
             let mut reply = vec![0; 65535];
-            match socket.recv(&mut reply) {
+            match crate::io_budget::recv_udp(&socket,&mut reply) {
                 Ok(n) => {
                     reply.truncate(n);
                     crate::dns::validate_wire(query, &reply)?;
@@ -481,9 +500,9 @@ fn once_retry(resolver: &Resolver, query: &[u8], retry: bool) -> io::Result<Vec<
                 ServerName::try_from(name).map_err(invalid)?,
             )
             .map_err(invalid)?;
-            Box::new(StreamOwned::new(connection, socket)) as Box<dyn Wire>
+            Box::new(StreamOwned::new(connection, crate::io_budget::Stream(socket))) as Box<dyn Wire>
         } else {
-            Box::new(socket) as Box<dyn Wire>
+            Box::new(crate::io_budget::Stream(socket)) as Box<dyn Wire>
         };
         (wire, monitor, decision)
     };
@@ -545,10 +564,11 @@ fn once_retry(resolver: &Resolver, query: &[u8], retry: bool) -> io::Result<Vec<
             return once_retry(resolver, query, false);
         }
         Err(e) => {
-            if let Some(decision) = &decision { crate::config::infrastructure_failure(decision, &e); }
+            if !crate::io_budget::cancelled(){if let Some(decision) = &decision { crate::config::infrastructure_failure(decision, &e); }}
             return Err(e);
         },
     };
+    if let Some(decision)=&decision{crate::config::infrastructure_success(decision);}
     if reusable && epoch == self::epoch() && generation == crate::config::generation() {
         let mut pool = POOL.get().unwrap().lock().unwrap();
         if pool.len() > 128 {

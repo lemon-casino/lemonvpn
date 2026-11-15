@@ -112,7 +112,7 @@ fn delete_managed(id: &str, whole_provider: bool) -> Result<String, Failure> {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     refresh();
-    let mut config = current();
+    let mut config = write_current();
     let name = id.strip_prefix("node-").unwrap_or(id);
     let nodes = config
         .nodes

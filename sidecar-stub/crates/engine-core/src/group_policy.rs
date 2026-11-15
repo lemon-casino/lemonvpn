@@ -95,7 +95,27 @@ struct State {
     health: HashMap<String, Health>,
     cursors: HashMap<(String, String), Cursor>,
     checks: HashMap<String, Instant>,
+    chains: HashMap<String, ChainHealth>,
 }
+struct ChainHealth {nodes:Vec<String>,network:String,successes:u64,failures:u64,last_success:Option<Instant>,last_failure:Option<Instant>,retry:Instant,touched:Instant}
+fn chain_key(nodes:&[Node],network:&str)->String {crate::sha256::hex(format!("{network}:{:?}",nodes.iter().map(identity).collect::<Vec<_>>()).as_bytes())}
+pub(crate) fn chain_result(nodes:&[Node],network:&str,good:bool){
+    let mut state=state();let now=Instant::now();
+    state.chains.retain(|_,v|v.touched.elapsed()<Duration::from_secs(3600));
+    if state.chains.len()>=512 && !state.chains.contains_key(&chain_key(nodes,network)){if let Some(key)=state.chains.iter().min_by_key(|(_,v)|v.touched).map(|(k,_)|k.clone()){state.chains.remove(&key);}}
+    let health=state.chains.entry(chain_key(nodes,network)).or_insert_with(||ChainHealth{nodes:nodes.iter().map(|n|n.name.clone()).collect(),network:network.into(),successes:0,failures:0,last_success:None,last_failure:None,retry:now,touched:now});
+    health.touched=now;
+    if good{health.successes+=1;health.last_success=Some(now);health.retry=now;}else{health.failures+=1;health.last_failure=Some(now);health.retry=now+FAILURE_COOLDOWN;}
+}
+pub(crate) fn chain_ready(nodes:&[Node],network:&str,reserve:bool)->bool {
+    let mut state=state();let Some(health)=state.chains.get_mut(&chain_key(nodes,network))else{return true};
+    if health.last_failure.is_some_and(|failure|health.last_success.is_none_or(|success|success<failure)){
+        if Instant::now()<health.retry{return false}
+        if reserve{health.retry=Instant::now()+FAILURE_COOLDOWN;}
+    }
+    true
+}
+pub(crate) fn chain_statistics()->serde_json::Value{let state=state();serde_json::json!({"scope":"whole chain; failing hop unknown","chains":state.chains.values().map(|v|serde_json::json!({"nodes":v.nodes,"network":v.network,"successes":v.successes,"failures":v.failures,"retry_after_ms":v.retry.saturating_duration_since(Instant::now()).as_millis()})).collect::<Vec<_>>()})}
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 fn state() -> MutexGuard<'static, State> {

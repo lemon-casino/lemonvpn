@@ -122,7 +122,7 @@ fn apply_updates(
     requests: Vec<Requested>,
 ) -> Result<serde_json::Value, SourceWriteError> {
     refresh();
-    let mut config = current();
+    let mut config = write_current();
     if generation != config.generation {
         return Err(conflict("配置或订阅已更新，请刷新节点后重新选择所属组"));
     }

@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::SystemTime;
 
 use crate::json;
@@ -231,6 +231,7 @@ pub(crate) fn condition_known(condition: &Condition, input: &RoutingInput<'_>) -
 }
 
 #[derive(Debug)]
+#[derive(Clone)]
 pub struct Diagnostic {
     pub level: &'static str,
     pub line: u32,
@@ -336,6 +337,7 @@ pub enum Target {
     },
 }
 
+#[derive(Clone)]
 pub struct Config {
     pub content: String,
     pub sha256: String,
@@ -404,6 +406,8 @@ impl Decision {
 }
 
 static CONFIG: OnceLock<Mutex<Config>> = OnceLock::new();
+static READ_CONFIG: OnceLock<RwLock<Arc<Config>>> = OnceLock::new();
+static ROUTING_PUBLICATION: RwLock<()> = RwLock::new(());
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 type SourceStamp = (String, Option<SystemTime>, Option<u64>);
 type RejectedSource = (Option<SystemTime>, usize, Vec<SourceStamp>);
@@ -459,19 +463,30 @@ pub fn start() {
         .and_then(|meta| meta.modified().ok());
     let config = build(content, modified);
     let _ = CONFIG.set(Mutex::new(config));
+    publish_read(&write_current());
 }
 
-fn current() -> MutexGuard<'static, Config> {
+fn write_current() -> MutexGuard<'static, Config> {
     CONFIG
         .get_or_init(|| Mutex::new(build(DEFAULT_CONFIG.to_string(), None)))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+fn current() -> Arc<Config> {
+    READ_CONFIG.get_or_init(||RwLock::new(Arc::new(write_current().clone())))
+        .read().unwrap_or_else(|p|p.into_inner()).clone()
+}
+fn publish_read(config:&Config){
+    *READ_CONFIG.get_or_init(||RwLock::new(Arc::new(config.clone()))).write().unwrap_or_else(|p|p.into_inner())=Arc::new(config.clone());
 }
 
 /// Every accepted write (including provider, membership, rule-order and Geo
 /// updates) crosses the same hot-application boundary. Compare executable
 /// values, not source digests: comments and source locations do not drop traffic.
 fn publish(config: &mut Config, mut next: Config) {
+    next.include_stamps = include_stamps(&next.include_contents);
+    let removed_groups=config.groups.iter().filter(|group|!next.groups.iter().any(|item|item.name==group.name)).map(|g|g.name.clone()).collect::<Vec<_>>();
+    let _publication=ROUTING_PUBLICATION.write().unwrap_or_else(|p|p.into_inner());
     let rules_equal = |left: &[Rule], right: &[Rule]| {
         left.len() == right.len()
             && left
@@ -498,13 +513,8 @@ fn publish(config: &mut Config, mut next: Config) {
         || config.dns_request_fallback != next.dns_request_fallback
         || config.dns_response_fallback != next.dns_response_fallback
         || config.resource_revision != next.resource_revision;
-    next.include_stamps = include_stamps(&next.include_contents);
-    for group in &config.groups {
-        if !next.groups.iter().any(|item| item.name == group.name) {
-            crate::control::forget_group(&group.name);
-        }
-    }
     *config = next;
+    publish_read(config);
     if changed {
         let count = if routing_changed {crate::connections::configuration_changed_selective(|entry| {
             let Some(previous)=&entry.route else{return false};
@@ -524,6 +534,8 @@ fn publish(config: &mut Config, mut next: Config) {
             ])),
         );
     }
+    drop(_publication);
+    for group in removed_groups {crate::control::forget_group(&group);}
 }
 
 /// Re-reads the source when its mtime or size changed. A failed read keeps the
@@ -562,10 +574,13 @@ pub fn refresh() {
     if content.len() > MAX_BYTES {
         return;
     }
-    let mut config = current();
+    // A control-plane transaction may already be preparing this file. Readers
+    // keep its accepted snapshot; the background watcher retries publication.
+    let Ok(mut config) = CONFIG.get().expect("configuration initialized").try_lock() else {return};
     if config.content == content && config.include_stamps == stamps {
         config.modified = modified;
         config.bytes = content.len();
+        publish_read(&config);
         return;
     }
     let next = build(content, modified);
@@ -600,6 +615,11 @@ pub fn refresh() {
 pub fn with_current<T>(reader: impl FnOnce(&Config) -> T) -> T {
     reader(&current())
 }
+/// Short cache commits share publication ordering without locking preparation.
+pub(crate) fn with_published<T>(reader:impl FnOnce(&Config)->T)->T{
+    let _publication=ROUTING_PUBLICATION.read().unwrap_or_else(|p|p.into_inner());
+    reader(&current())
+}
 
 /// The accepted main source text, for text-level rewrites.
 pub fn source_content() -> String {
@@ -621,7 +641,7 @@ pub(crate) fn force_reload_checked() -> Result<String, String> {
     let modified = fs::metadata(&path)
         .ok()
         .and_then(|meta| meta.modified().ok());
-    let mut config = current();
+    let mut config = write_current();
     let built = build(content, modified);
     let errors = built
         .diagnostics
@@ -796,7 +816,7 @@ pub fn rewrite_group(
 /// Rebuilds the accepted snapshot after the provider store changed. The source
 /// file, its digest and the revision stay as they were.
 pub fn reload_providers() {
-    let mut config = current();
+    let mut config = write_current();
     let previous = config.generation.clone();
     let next = build(config.content.clone(), config.modified);
     let generation = next.generation.clone();
@@ -880,9 +900,9 @@ pub(crate) fn decide_connection_for(
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     input.host=&host;
     for _ in 0..3 {
-        let (generation,rules)={let config=current();(config.generation.clone(),config.rules.clone())};
+        let snapshot=current();let generation=snapshot.generation.clone();let rules=&snapshot.rules;
         let mut addresses=Vec::new();let mut queried=false;let mut selected=None;
-        for rule in &rules {
+        for rule in rules {
             let Some(condition)=&rule.condition else {continue};
             let evaluation=RoutingInput{answer_ips:&addresses,..input};
             if input.destination_ip.is_none() && !queried && condition_needs_resolution(condition,&evaluation) {
@@ -891,11 +911,13 @@ pub(crate) fn decide_connection_for(
             let evaluation=RoutingInput{answer_ips:&addresses,..input};
             if condition_matches_input(condition,&evaluation) {selected=Some(rule.id.as_str());break;}
         }
+        let _publication=ROUTING_PUBLICATION.read().unwrap_or_else(|p|p.into_inner());
         let config=current();
         if config.generation!=generation {continue;}
         let rule=selected.and_then(|id|config.rules.iter().find(|r|r.id==id)).unwrap_or(&config.fallback);
         return decision_for_rule(&config,rule,&RoutingInput{answer_ips:&addresses,..input},true);
     }
+    let _publication=ROUTING_PUBLICATION.read().unwrap_or_else(|p|p.into_inner());
     let config=current();
     let mut blocked=config.fallback.clone();blocked.outbound="block".into();
     decision_for_rule(&config,&blocked,&input,true)
@@ -1259,14 +1281,18 @@ pub(crate) fn connect_outbound_tracked(name: &str, host: &str, port: u16) -> std
 /// A connected proxy socket is not proof that its encrypted destination works.
 /// Feed transport failures back to automatic selection; never retry via direct.
 pub(crate) fn infrastructure_failure(decision: &Decision, error: &std::io::Error) {
+    if crate::io_budget::cancelled(){return;}
     use std::io::ErrorKind::*;
     if matches!(error.kind(), UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe | TimedOut | WouldBlock | NotConnected | WriteZero) {
         if let Target::Node(node) = &decision.target {
             crate::group_policy::dial_result(node, "tcp", false, std::time::Duration::ZERO);
         }
+        if let Target::Chain{nodes,..}=&decision.target{crate::group_policy::chain_result(nodes,"tcp",false);}
     }
 }
+pub(crate) fn infrastructure_success(decision:&Decision){match &decision.target{Target::Node(node)=>crate::group_policy::relay_result(node,true),Target::Chain{nodes,..}=>crate::group_policy::chain_result(nodes,"tcp",true),_=>{}}}
 pub(crate) fn infrastructure_decision(name: &str, network: &str) -> std::io::Result<Decision> {
+    let _publication=ROUTING_PUBLICATION.read().unwrap_or_else(|p|p.into_inner());
     let config = current();
     let (target, chain, dependencies) = resolve_outbound_for(&config, name, &mut Vec::new(), network, false).ok_or_else(|| {
         let reason = match config.groups.iter().find(|group| group.name == name) {
@@ -1298,7 +1324,7 @@ pub(crate) fn apply_resources_checked(snapshot:std::sync::Arc<crate::rules_runti
     apply_resources_impl(snapshot, sources, expected, false)
 }
 fn apply_resources_impl(snapshot:std::sync::Arc<crate::rules_runtime::Snapshot>,sources:&std::collections::HashMap<String,String>,expected:Option<&str>,force:bool)->Result<String,String>{
-    let mut config=current();
+    let mut config=write_current();
     if expected.is_some_and(|g|g!=config.generation){return Err("配置已被其他写入修改，请重新加载".into())}
     if !force&&sources.is_empty()&&snapshot.signature==crate::rules_runtime::current().signature{crate::rules_runtime::persist(&snapshot)?;crate::rules_runtime::install(snapshot);return Ok(config.generation.clone())}
     let main=sources.get(SOURCE_PATH).cloned().unwrap_or_else(||config.content.clone());

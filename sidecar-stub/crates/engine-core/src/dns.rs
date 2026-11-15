@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -30,6 +30,7 @@ fn last_cache_hit()->bool{CACHE_SOURCE.with(|s|matches!(*s.borrow(),"cache"|"coa
 pub(crate) fn trace_steps()->Vec<serde_json::Value>{STEPS.with(|s|s.borrow().clone())}
 pub(crate) fn cache_source()->&'static str{CACHE_SOURCE.with(|s|*s.borrow())}
 fn routed_exchange(query:&[u8],name:&str,kind:Option<&str>,initial:Option<&str>,generation:&str,use_cache:bool)->io::Result<(Vec<u8>,Option<String>)>{
+    let budget=crate::io_budget::Budget::new(Duration::from_secs(10));let _scope=budget.enter();
     STEPS.with(|s|s.borrow_mut().clear());CACHE_SOURCE.with(|s|*s.borrow_mut()="error");
     let selected=initial.map(str::to_owned).or_else(||config::upstreams().first().map(|p|p.name.clone())).ok_or_else(||invalid("没有配置 DNS 上游"))?;
     let result=crate::dns_wire_cache::query(query,&selected,generation,use_cache,||{
@@ -96,6 +97,7 @@ struct Resolver {
 
 static RESOLVER: OnceLock<Mutex<Resolver>> = OnceLock::new();
 static QUERY_ID: AtomicU16 = AtomicU16::new(1);
+static CACHE_EPOCH:AtomicU64=AtomicU64::new(0);
 
 fn store() -> MutexGuard<'static, Resolver> {
     RESOLVER
@@ -194,6 +196,7 @@ pub(crate) fn forward_wire(query: &[u8]) -> io::Result<Vec<u8>> {
     let routed = config::dns_route_for(&name, kind);
     let forced = routed.as_ref().map(|(upstream, _)| upstream.as_str());
     let started = Instant::now();
+    let cache_epoch=CACHE_EPOCH.load(Ordering::Acquire);
     let (response, upstream) = routed_exchange(query, &name, kind, forced, &generation, true)?;
     if let Some(kind) = kind {
         if let Ok((status, answers)) = parse_response(&response) {
@@ -208,13 +211,14 @@ pub(crate) fn forward_wire(query: &[u8]) -> io::Result<Vec<u8>> {
                 &answers,
                 request_route(false, routed.as_ref()),
             );
-            let _ = cache_put_at(
+            let _ = cache_put_checked(
                 &name,
                 kind,
                 &status,
                 &answers,
                 upstream.as_deref(),
                 &generation,
+                cache_epoch,
             );
         }
     }
@@ -230,6 +234,7 @@ fn routed_exchange_uncached(
     initial: Option<&str>,
     generation: &str,
 ) -> io::Result<(Vec<u8>, Option<String>)> {
+    let budget=crate::io_budget::Budget::new(Duration::from_secs(10));let _scope=budget.enter();
     let upstreams = config::upstreams();
     let mut action = initial
         .map(str::to_owned)
@@ -332,8 +337,8 @@ pub(crate) fn validate_wire(query:&[u8],reply:&[u8])->io::Result<()> {
     Ok(())
 }
 
-/// Resolves a name for a direct dial. A and then AAAA are queried; the first
-/// family with addresses wins, matching how a dual-stack dialer would try them.
+/// Query both enabled address families concurrently. Allow a short collection
+/// window after the first positive answer, then cancel the remaining work.
 pub fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
     if let Ok(address) = host.parse::<IpAddr>() {
         return Ok(vec![address]);
@@ -345,54 +350,43 @@ pub fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
             .map(|addrs| addrs.map(|addr| addr.ip()).collect());
     }
     let name = canonical(host)?;
-    let mut last = None;
     let families = crate::platform::managed::egress_families();
-    let mut collected = Vec::new();
-    for kind in ["A", "AAAA"] {
-        if kind=="AAAA" && !crate::dns_settings::current()?.ipv6_enabled { continue; }
-        if families.is_some_and(|f|!f[usize::from(kind=="AAAA")]) { continue; }
-        match lookup(&name, kind, None, true) {
-            Ok(result) => {
-                record(
-                    None,
-                    &name,
-                    kind,
-                    &result.status,
-                    result.cached,
-                    result.upstream.as_deref(),
-                    result.elapsed_ms,
-                    &result.answers,
-                    result.route.clone(),
-                );
-                let addresses: Vec<IpAddr> = result
-                    .answers
-                    .iter()
-                    .filter_map(|answer| answer.data.parse().ok())
-                    .collect();
-                if !addresses.is_empty() {
-                    if families.is_none() { return Ok(addresses); }
-                    collected.extend(addresses);
-                }
+    let ipv6 = crate::dns_settings::current()?.ipv6_enabled;
+    let budget=crate::io_budget::Budget::new(Duration::from_secs(10));
+    let (sender,receiver)=std::sync::mpsc::channel();
+    let mut pending=0;
+    static ACTIVE:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
+    for kind in ["A","AAAA"] {
+        if kind=="AAAA" && !ipv6 || families.is_some_and(|f|!f[usize::from(kind=="AAAA")]) {continue;}
+        if !crate::admission::reserve(&ACTIVE,64){continue;}
+        let domain=name.clone();let tx=sender.clone();let worker_budget=budget.clone();
+        struct Permit;impl Drop for Permit {fn drop(&mut self){ACTIVE.fetch_sub(1,Ordering::AcqRel);}}
+        let permit=Permit;
+        if std::thread::Builder::new().name("dns-address".into()).spawn(move||{
+            let _permit=permit;let _scope=worker_budget.enter();
+            let result=lookup(&domain,kind,None,true);
+            match &result {
+                Ok(answer)=>record(None,&domain,kind,&answer.status,answer.cached,answer.upstream.as_deref(),answer.elapsed_ms,&answer.answers,answer.route.clone()),
+                Err(_) if !crate::io_budget::cancelled()=>record(None,&domain,kind,"ERROR",false,None,0,&[],request_route(false,None)),
+                _=>{}
             }
-            Err(error) => {
-                record(
-                    None,
-                    &name,
-                    kind,
-                    "ERROR",
-                    false,
-                    None,
-                    0,
-                    &[],
-                    request_route(false, None),
-                );
-                last = Some(error);
-            }
+            let result=result.map(|answer|answer.answers.into_iter().filter(|a|a.kind==kind).filter_map(|a|a.data.parse::<IpAddr>().ok()).collect::<Vec<_>>());
+            let _=tx.send(result);
+        }).is_ok(){pending+=1;}
+    }
+    drop(sender);
+    let mut addresses=Vec::new();let mut last=io::Error::new(io::ErrorKind::NotFound,format!("{host} 没有解析结果"));
+    let mut grace=None;
+    for _ in 0..pending {
+        let left=match budget.remaining(){Ok(left)=>left,Err(error)=>{last=error;break}};
+        let wait=grace.map_or(left,|until:Instant|until.saturating_duration_since(Instant::now()).min(left));
+        match receiver.recv_timeout(wait){
+            Ok(Ok(found))=>{if !found.is_empty()&&grace.is_none(){grace=Some(Instant::now()+Duration::from_millis(200));}addresses.extend(found);},
+            Ok(Err(e))=>last=e,Err(_)=>break
         }
     }
-    if !collected.is_empty() { return Ok(collected); }
-    Err(last
-        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{host} 没有解析结果"))))
+    budget.cancel();
+    if addresses.is_empty(){Err(last)}else{Ok(addresses)}
 }
 
 struct Lookup {
@@ -432,19 +426,21 @@ fn lookup(
     let started = Instant::now();
     let code = type_code(kind).ok_or_else(|| invalid("未知 DNS 类型"))?;
     let query = encode_query(QUERY_ID.fetch_add(1, Ordering::Relaxed), &name, code)?;
+    let cache_epoch=CACHE_EPOCH.load(Ordering::Acquire);
     let (response, final_upstream) =
         routed_exchange(&query, &name, Some(kind), Some(&selected), &generation, use_cache)?;
     let (status, answers) = parse_response(&response)?;
     let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
     let entry_id = if use_cache && status == "NOERROR" && !answers.is_empty() {
-        cache_put_at(
+        cache_put_checked(
             &name,
             kind,
             &status,
             &answers,
             final_upstream.as_deref(),
             &generation,
+            cache_epoch,
         )
     } else {
         None
@@ -490,7 +486,7 @@ fn bind_udp(local: SocketAddr) -> io::Result<UdpSocket> {
 }
 
 fn connect_tcp(address: SocketAddr) -> io::Result<TcpStream> {
-    crate::platform::current().connect_tcp(address, QUERY_TIMEOUT)
+    crate::platform::current().connect_tcp(address, crate::io_budget::remaining(QUERY_TIMEOUT)?)
 }
 
 fn udp_exchange(upstream: &config::Upstream, query: &[u8]) -> io::Result<Vec<u8>> {
@@ -504,11 +500,11 @@ fn udp_exchange(upstream: &config::Upstream, query: &[u8]) -> io::Result<Vec<u8>
         "0.0.0.0:0".parse().unwrap()
     };
     let socket = bind_udp(local)?;
-    socket.set_read_timeout(Some(QUERY_TIMEOUT))?;
+    socket.set_read_timeout(Some(crate::io_budget::remaining(QUERY_TIMEOUT)?))?;
     socket.connect(address)?;
     socket.send(query)?;
     let mut buffer = vec![0u8; 65535];
-    let length = socket.recv(&mut buffer)?;
+    let length = crate::io_budget::recv_udp(&socket,&mut buffer)?;
     buffer.truncate(length);
     Ok(buffer)
 }
@@ -518,9 +514,7 @@ fn tcp_exchange(upstream: &config::Upstream, query: &[u8]) -> io::Result<Vec<u8>
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| invalid("DNS 上游没有可用地址"))?;
-    let mut stream = connect_tcp(address)?;
-    stream.set_read_timeout(Some(QUERY_TIMEOUT))?;
-    stream.set_write_timeout(Some(QUERY_TIMEOUT))?;
+    let mut stream = crate::io_budget::Stream(connect_tcp(address)?);
     stream.write_all(&(query.len() as u16).to_be_bytes())?;
     stream.write_all(query)?;
     let mut length = [0u8; 2];
@@ -575,6 +569,9 @@ fn cache_put_at(
     upstream: Option<&str>,
     generation: &str,
 ) -> Option<String> {
+    cache_put_checked(name,kind,status,answers,upstream,generation,CACHE_EPOCH.load(Ordering::Acquire))
+}
+fn cache_put_checked(name:&str,kind:&'static str,status:&str,answers:&[Answer],upstream:Option<&str>,generation:&str,epoch:u64)->Option<String>{
     if status != "NOERROR" || answers.is_empty() {
         return None;
     }
@@ -589,11 +586,12 @@ fn cache_put_at(
     }
     // Serialize the generation check and insertion with publication/flush. A
     // reply that finishes after a hot change cannot repopulate the old cache.
-    config::with_current(|config| {
+    config::with_published(|config| {
         if config.generation != generation {
             return None;
         }
         let mut resolver = store();
+        if CACHE_EPOCH.load(Ordering::Acquire)!=epoch{return None;}
         resolver.cache.retain(|entry| {
             !(entry.domain == name && entry.kind == kind && entry.upstream.as_deref() == upstream)
         });
@@ -947,9 +945,13 @@ fn cache_entry_json(entry: &Entry) -> String {
 
 pub fn delete_entry(id: &str) -> String {
     let mut resolver = store();
+    CACHE_EPOCH.fetch_add(1,Ordering::AcqRel);
+    let selected=resolver.cache.iter().find(|entry|entry.id==id).map(|entry|(entry.domain.clone(),entry.kind.to_owned()));
     let before = resolver.cache.len();
     resolver.cache.retain(|entry| entry.id != id);
     let deleted = before - resolver.cache.len();
+    drop(resolver);
+    if let Some((name,kind))=selected{crate::dns_wire_cache::remove(&name,&[kind]);}
     format!(r#"{{"deleted":{deleted}}}"#)
 }
 
@@ -967,13 +969,21 @@ pub fn delete_name(query: &str) -> Result<String, (u16, &'static str, String)> {
         .collect();
     let mut resolver = store();
     let before = resolver.cache.len();
+    CACHE_EPOCH.fetch_add(1,Ordering::AcqRel);
     resolver.cache.retain(|entry| {
         let matches = entry.domain == canonical
             && (types.is_empty() || types.iter().any(|kind| entry.kind == kind));
         !matches
     });
     let deleted = before - resolver.cache.len();
+    drop(resolver);
+    crate::dns_wire_cache::remove(&canonical,&types);
     Ok(format!(r#"{{"matched":{deleted},"deleted":{deleted}}}"#))
+}
+pub(crate) fn delete_wire_name(name:&str)->io::Result<usize>{
+    let canonical=canonical(name)?;
+    {let mut resolver=store();CACHE_EPOCH.fetch_add(1,Ordering::AcqRel);resolver.cache.retain(|entry|entry.domain!=canonical);}
+    Ok(crate::dns_wire_cache::remove_name(&canonical))
 }
 
 pub fn flush() -> String {
@@ -982,6 +992,7 @@ pub fn flush() -> String {
     bootstrap::flush();
     let mut resolver = store();
     let deleted = resolver.cache.len();
+    CACHE_EPOCH.fetch_add(1,Ordering::AcqRel);
     resolver.cache.clear();
     format!(r#"{{"matched":{deleted},"deleted":{deleted}}}"#)
 }
@@ -1093,7 +1104,7 @@ fn type_code(kind: &str) -> Option<u16> {
     })
 }
 
-fn type_name(code: u16) -> Option<&'static str> {
+pub(crate) fn type_name(code: u16) -> Option<&'static str> {
     Some(match code {
         1 => "A",
         2 => "NS",

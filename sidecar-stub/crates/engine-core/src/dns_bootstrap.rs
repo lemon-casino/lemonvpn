@@ -166,14 +166,14 @@ pub(super) fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
     }
     if !owner {
         let (lock, wake) = &*cell;
-        let reply = wake
-            .wait_timeout_while(
-                lock.lock().unwrap_or_else(|e| e.into_inner()),
-                LOOKUP_BUDGET + Duration::from_secs(3),
-                |r| r.is_none(),
-            )
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
+        let budget = crate::io_budget::Budget::new(LOOKUP_BUDGET + Duration::from_secs(3));
+        let mut reply = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while reply.is_none() {
+            reply = wake
+                .wait_timeout(reply, budget.remaining()?.min(Duration::from_millis(250)))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
         return reply
             .clone()
             .unwrap_or_else(|| Err("合并引导 DNS 查询超时".into()))
@@ -185,7 +185,8 @@ pub(super) fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
     };
     let result = lookup(&domain, &roots, &generation, ipv6)
         .map_err(|error| format!("域名“{domain}”引导解析失败：{error}"));
-    let active = config::generation() == generation
+    let active = !crate::io_budget::cancelled()
+        && config::generation() == generation
         && dns_transport::epoch() == epoch
         && rules_runtime::current().document.bootstrap == roots
         && crate::dns_settings::current().is_ok_and(|s| s.ipv6_enabled == ipv6);
@@ -248,57 +249,131 @@ pub(super) fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
     result.map_err(io::Error::other)
 }
 fn lookup(host: &str, roots: &[String], generation: &str, ipv6: bool) -> io::Result<Vec<IpAddr>> {
-    let started = Instant::now();
-    let mut result = Vec::new();
-    let mut last = "没有可用引导 DNS".to_owned();
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    let budget = crate::io_budget::Budget::new(LOOKUP_BUDGET);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut pending = 0;
     for (kind, code) in [("A", 1), ("AAAA", 28)] {
         if kind == "AAAA" && !ipv6 {
             continue;
         }
-        let query = encode_query(
-            QUERY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            host,
-            code,
-        )?;
-        for (i, url) in roots.iter().enumerate() {
-            let left = LOOKUP_BUDGET.saturating_sub(started.elapsed()).as_millis() as u64;
-            if left < 250 {
+        if !crate::admission::reserve(&ACTIVE, 64) {
+            continue;
+        }
+        struct Permit;
+        impl Drop for Permit {
+            fn drop(&mut self) {
+                ACTIVE.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let permit = Permit;
+        let host = host.to_owned();
+        let roots = roots.to_vec();
+        let generation = generation.to_owned();
+        let tx = tx.clone();
+        let budget = budget.clone();
+        if std::thread::Builder::new()
+            .name("dns-bootstrap".into())
+            .spawn(move || {
+                let _permit = permit;
+                let _scope = budget.enter();
+                let result = lookup_kind(&host, &roots, &generation, kind, code);
+                let _ = tx.send(result);
+            })
+            .is_ok()
+        {
+            pending += 1;
+        }
+    }
+    drop(tx);
+    let mut addresses = Vec::new();
+    let mut grace = None;
+    let mut last = io::Error::other("没有可用引导 DNS 查询资源");
+    for _ in 0..pending {
+        let left = match budget.remaining() {
+            Ok(left) => left,
+            Err(error) => {
+                last = error;
                 break;
             }
-            let resolver = rules_runtime::model::Resolver {
-                id: format!("bootstrap-{i}"),
-                name: "引导解析".into(),
-                url: url.clone(),
-                timeout_ms: left.min(2000),
-                ..Default::default()
-            };
-            let cache_key = format!("__bootstrap_{i}_{}", crate::sha256::hex(url.as_bytes()));
-            match dns_wire_cache::query(&query, &cache_key, generation, true, || {
-                dns_transport::exchange(&resolver, &query).map(|wire| dns_wire_cache::Packet {
-                    wire,
-                    upstream: Some(resolver.id.clone()),
-                })
-            }) {
-                Ok(reply) => {
-                    match parse_response(&reply.wire) {
-                        Ok((status, answers)) => {
-                            let addresses: Vec<IpAddr> = answers
-                                .into_iter()
-                                .filter(|a| a.kind == kind)
-                                .filter_map(|a| a.data.parse().ok())
-                                .collect();
-                            if addresses.is_empty() {
-                                last = format!("{kind} {status}，未返回地址");
-                            }
-                            result.extend(addresses);
-                            // NXDOMAIN and NODATA are valid answers, not upstream outages.
-                            break;
-                        }
-                        Err(e) => last = e.to_string(),
-                    }
+        };
+        let wait = grace.map_or(left, |until: Instant| {
+            until.saturating_duration_since(Instant::now()).min(left)
+        });
+        match rx.recv_timeout(wait) {
+            Ok(Ok(found)) => {
+                if !found.is_empty() && grace.is_none() {
+                    grace = Some(Instant::now() + Duration::from_millis(200));
                 }
-                Err(e) => last = e.to_string(),
+                addresses.extend(found);
             }
+            Ok(Err(error)) => last = error,
+            Err(_) => break,
+        }
+    }
+    budget.cancel();
+    if addresses.is_empty() {
+        Err(last)
+    } else {
+        Ok(addresses)
+    }
+}
+fn lookup_kind(
+    host: &str,
+    roots: &[String],
+    generation: &str,
+    kind: &str,
+    code: u16,
+) -> io::Result<Vec<IpAddr>> {
+    let budget = crate::io_budget::Budget::new(LOOKUP_BUDGET);
+    let _scope = budget.enter();
+    let started = Instant::now();
+    let mut result = Vec::new();
+    let mut last = "没有可用引导 DNS".to_owned();
+    let query = encode_query(
+        QUERY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        host,
+        code,
+    )?;
+    for (i, url) in roots.iter().enumerate() {
+        let left = LOOKUP_BUDGET.saturating_sub(started.elapsed()).as_millis() as u64;
+        if left < 250 {
+            break;
+        }
+        let resolver = rules_runtime::model::Resolver {
+            id: format!("bootstrap-{i}"),
+            name: "引导解析".into(),
+            url: url.clone(),
+            timeout_ms: left.min(2000),
+            ..Default::default()
+        };
+        let cache_key = format!("__bootstrap_{i}_{}", crate::sha256::hex(url.as_bytes()));
+        match dns_wire_cache::query(&query, &cache_key, generation, true, || {
+            dns_transport::exchange(&resolver, &query).map(|wire| dns_wire_cache::Packet {
+                wire,
+                upstream: Some(resolver.id.clone()),
+            })
+        }) {
+            Ok(reply) => {
+                match parse_response(&reply.wire) {
+                    Ok((status, answers)) => {
+                        let addresses: Vec<IpAddr> = answers
+                            .into_iter()
+                            .filter(|a| a.kind == kind)
+                            .filter_map(|a| a.data.parse().ok())
+                            .collect();
+                        if addresses.is_empty() {
+                            last = format!("{kind} {status}，未返回地址");
+                        }
+                        result.extend(addresses);
+                        // NXDOMAIN and NODATA are valid answers, not upstream outages.
+                        break;
+                    }
+                    Err(e) => last = e.to_string(),
+                }
+            }
+            Err(e) => last = e.to_string(),
         }
     }
     if result.is_empty() {

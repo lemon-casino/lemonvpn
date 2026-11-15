@@ -185,6 +185,7 @@ pub(crate) fn lan_datagram_target(decision: &config::Decision, host: &str) -> io
 }
 
 pub fn connect(decision: &config::Decision, host: &str, port: u16) -> io::Result<TcpStream> {
+    if let config::Target::Chain{nodes,..}=&decision.target {if !crate::group_policy::chain_ready(nodes,"tcp",true){return Err(io::Error::new(io::ErrorKind::NotConnected,"链路处于失败退避期，稍后自动恢复"));}}
     let started = Instant::now();
     let result = match &decision.target {
         config::Target::Direct => dial(host, port),
@@ -197,10 +198,11 @@ pub fn connect(decision: &config::Decision, host: &str, port: u16) -> io::Result
     };
     if let config::Target::Node(node) = &decision.target {
         if result.is_err() || !crate::compat::available() {
-            crate::group_policy::dial_result(node, "tcp", result.is_ok(), started.elapsed());
+            if !crate::io_budget::cancelled(){crate::group_policy::dial_result(node, "tcp", result.is_ok(), started.elapsed());}
         }
     }
-    if result.is_err() {
+    if result.is_err() && !crate::io_budget::cancelled() {
+        if let config::Target::Chain{nodes,..}=&decision.target{crate::group_policy::chain_result(nodes,"tcp",false);}
         outbounds::record_error(decision);
     }
     result
@@ -226,24 +228,7 @@ pub fn dial(host: &str, port: u16) -> io::Result<TcpStream> {
     } else {
         (host, port).to_socket_addrs()?.collect()
     };
-    let mut last = io::Error::new(
-        io::ErrorKind::AddrNotAvailable,
-        format!("{host}:{port} 没有可用地址"),
-    );
-
-    for addr in addrs {
-        match dial_physical(addr) {
-            Ok(stream) => return Ok(stream),
-            Err(err) => last = err,
-        }
-    }
-
-    Err(last)
-}
-
-/// TUN 模式开启时,引擎自身的拨号绑定物理网卡,避免回流进隧道。
-fn dial_physical(addr: SocketAddr) -> io::Result<TcpStream> {
-    crate::platform::current().connect_tcp(addr, CONNECT_TIMEOUT)
+    crate::dial::connect(addrs, CONNECT_TIMEOUT)
 }
 
 /// Reads a request header block up to and including the terminating CRLFCRLF.
@@ -318,7 +303,8 @@ pub fn tunnel(
         sockets: [client.try_clone()?, upstream.try_clone()?],
     });
     let feedback = match &decision.target {
-        config::Target::Node(node) if crate::compat::available() => Some(node.as_ref().clone()),
+        config::Target::Node(node) if crate::compat::available() => Some(Feedback::Node(node.as_ref().clone())),
+        config::Target::Chain{nodes,..}=>Some(Feedback::Chain(nodes.clone())),
         _ => None,
     };
     let outbound = meter.handle();
@@ -374,7 +360,7 @@ pub fn tunnel(
         && counters.download.load(Ordering::Relaxed) == 0;
     if no_response {
         if let Some(node) = &feedback {
-            crate::group_policy::relay_result(node, false);
+            node.record(false);
         }
     }
     if download.is_err() {
@@ -518,8 +504,11 @@ struct Counted<R> {
     outbound: Option<outbounds::Handle>,
     upload: bool,
     relay: Arc<RelayState>,
-    feedback: Option<config::Node>,
+    feedback: Option<Feedback>,
 }
+#[derive(Clone)]
+enum Feedback {Node(config::Node),Chain(Vec<config::Node>)}
+impl Feedback{fn record(&self,good:bool){match self{Self::Node(node)=>crate::group_policy::relay_result(node,good),Self::Chain(nodes)=>crate::group_policy::chain_result(nodes,"tcp",good)}}}
 
 impl<R: Read> Read for Counted<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -551,7 +540,7 @@ impl<R: Read> Read for Counted<R> {
             };
             counter.fetch_add(count as u64, Ordering::Relaxed);
             if let Some(node) = self.feedback.take() {
-                crate::group_policy::relay_result(&node, true);
+                node.record(true);
             }
             if let Some(outbound) = &self.outbound {
                 if self.upload {

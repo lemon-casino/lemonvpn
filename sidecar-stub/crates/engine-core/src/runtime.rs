@@ -195,6 +195,7 @@ fn serve(listener: TcpListener, shutdown: Shutdown) {
         }
         match listener.accept() {
             Ok((stream, _)) => {
+                let Some(permit) = crate::admission::client() else { continue; };
                 // Windows accepted sockets inherit FIONBIO from the listener.
                 // Protocol handlers use blocking IO on every platform.
                 if stream.set_nonblocking(false).is_err() {
@@ -203,7 +204,8 @@ fn serve(listener: TcpListener, shutdown: Shutdown) {
                 let Ok(socket) = stream.try_clone() else {
                     continue;
                 };
-                let task = thread::spawn(move || {
+                let task = thread::Builder::new().name("local-client".into()).spawn(move || {
+                    let _permit=permit;
                     if let Err(err) = dispatch(stream) {
                         if !matches!(
                             err.kind(),
@@ -220,6 +222,7 @@ fn serve(listener: TcpListener, shutdown: Shutdown) {
                         }
                     }
                 });
+                let Ok(task)=task else {continue};
                 clients.push((socket, task));
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -258,6 +261,7 @@ fn serve(listener: TcpListener, shutdown: Shutdown) {
 }
 
 fn dispatch(mut stream: TcpStream) -> io::Result<()> {
+    let Some(header_permit)=crate::admission::headers() else {return Ok(())};
     if stopping() {
         return Ok(());
     }
@@ -265,6 +269,7 @@ fn dispatch(mut stream: TcpStream) -> io::Result<()> {
     match proxy::peek_protocol(&mut stream) {
         Ok(None) => Ok(()),
         Ok(Some(first)) if first == socks5::VERSION => {
+            drop(header_permit);
             logs::debug(
                 "engine::inbound",
                 "Inbound connection accepted.",
@@ -272,7 +277,7 @@ fn dispatch(mut stream: TcpStream) -> io::Result<()> {
             );
             socks5::handle(stream)
         }
-        Ok(Some(_)) => http::handle(stream),
+        Ok(Some(_)) => http::handle_local(stream,header_permit),
         Err(err) => Err(err),
     }
 }

@@ -23,6 +23,10 @@ static ROUTER: AtomicU16 = AtomicU16::new(0);
 static DNS_PORT: AtomicU16 = AtomicU16::new(0);
 static BACKEND: Mutex<Option<Backend>> = Mutex::new(None);
 static BACKEND_V6: Mutex<Option<Backend>> = Mutex::new(None);
+static UDP_LEASES:Mutex<BTreeMap<u16,usize>>=Mutex::new(BTreeMap::new());
+struct UdpLease(u16);
+impl UdpLease{fn new(port:u16)->Self{*UDP_LEASES.lock().unwrap_or_else(|p|p.into_inner()).entry(port).or_default()+=1;Self(port)}}
+impl Drop for UdpLease{fn drop(&mut self){let mut leases=UDP_LEASES.lock().unwrap_or_else(|p|p.into_inner());if let Some(count)=leases.get_mut(&self.0){*count-=1;if *count==0{leases.remove(&self.0);}}}}
 fn backend_slot(ipv6: bool) -> &'static Mutex<Option<Backend>> {
     if ipv6 && managed::egress_families().is_some() { &BACKEND_V6 } else { &BACKEND }
 }
@@ -39,13 +43,15 @@ pub(crate) fn hot_apply_json() -> String {
     json!({"available":true,"configuration":true,"group_selection":true,
         "existing_connections":"reconnect","dns_cache":"invalidate",
         "kernel_sync_pending":HOT_PENDING.load(Ordering::Acquire),
-        "kernel_sync_error":*HOT_ERROR.lock().unwrap()})
+        "kernel_sync_error":*HOT_ERROR.lock().unwrap(),"chain_health":crate::group_policy::chain_statistics()})
     .to_string()
 }
 
 struct Backend {
     process: CoreProcess,
     entries: BTreeMap<String, (Value, u16)>,
+    used: BTreeMap<String, Instant>,
+    collected: Instant,
     direct_port: u16,
     uplink: Option<String>,
     ipv6: bool,
@@ -105,6 +111,7 @@ fn base_config(
         json!({"name":"lemonvpn-direct","type":"socks","listen":"127.0.0.1","port":direct_port,"udp":true,"proxy":"DIRECT"}),
     ];
     let mut proxies = Vec::new();
+    let mut hosts=serde_json::Map::new();
     if managed::egress_families().is_some() {
         proxies.push(json!({"name":"LemonVPN-Direct","type":"direct","ip-version":if ipv6 {"ipv6"}else{"ipv4"}}));
         listeners[0]["proxy"] = "LemonVPN-Direct".into();
@@ -114,6 +121,7 @@ fn base_config(
         if let Some(hops) = node.as_array() {
             for (index, hop) in hops.iter().enumerate() {
                 let mut hop = hop.clone();
+                register_endpoint(&mut hop,&mut hosts);
                 hop["name"] = if index + 1 == hops.len() {
                     name.clone()
                 } else {
@@ -127,12 +135,16 @@ fn base_config(
             }
         } else {
             let mut node = node.clone();
+            register_endpoint(&mut node,&mut hosts);
             node["name"] = name.clone().into();
             proxies.push(node);
         }
         listeners.push(json!({"name":name,"type":"socks","listen":"127.0.0.1","port":port,"udp":true,"proxy":format!("node-{key}")}));
     }
     let mut config = json!({"ipv6":true,"allow-lan":false,"mode":"rule","log-level":"warning","find-process-mode":"off","listeners":listeners,"proxies":proxies,"rules":["MATCH,REJECT"],"tun":{"enable":false},"profile":{"store-selected":false,"store-fake-ip":false},"dns":{"enable":true,"ipv6":true,"enhanced-mode":"redir-host","default-nameserver":["223.5.5.5","1.1.1.1"],"nameserver":["223.5.5.5","1.1.1.1"]}});
+    config["tcp-concurrent"]=true.into();
+    config["hosts"]=Value::Object(hosts);
+    config["dns"]["use-hosts"]=true.into();
     if let Some(name) = uplink {
         config["interface-name"] = name.clone().into();
     }
@@ -150,12 +162,27 @@ fn listener(node: Option<&config::Node>, address: Option<&str>) -> io::Result<u1
         return Err(io::Error::new(io::ErrorKind::Interrupted, "引擎正在停止"));
     }
     // Render outside the backend lock; parsing config/providers must never invert locks.
-    let selected = match node {
-        Some(node) => Some(endpoint_addresses(address.unwrap_or(&node.host))?.into_iter().next().ok_or_else(||io::Error::other("节点没有可用地址"))?),
-        _ => address.map(str::to_owned),
-    };
-    let rendered = node.map(|node| render_node(node, selected.as_deref())).transpose()?;
+    let rendered = node.map(|node| {
+        let addresses=endpoint_addresses(address.unwrap_or(&node.host))?;
+        render_endpoints(node,addresses)
+    }).transpose()?;
     listener_rendered(rendered)
+}
+
+/// Keep bootstrap answers explicit; the protocol core races those addresses
+/// without recursively consulting the DNS policy that needs this very node.
+fn render_endpoints(node:&config::Node,mut addresses:Vec<String>)->io::Result<Value>{
+    let first=addresses.first().ok_or_else(||io::Error::other("节点没有可用地址"))?.clone();
+    if managed::egress_families().is_some(){let ipv6=first.parse::<std::net::IpAddr>().unwrap().is_ipv6();addresses.retain(|a|a.parse::<std::net::IpAddr>().is_ok_and(|ip|ip.is_ipv6()==ipv6));}
+    let mut value=render_node(node,Some(&first))?;
+    if addresses.len()>1{value["_lemonvpn_addresses"]=json!(addresses);}
+    Ok(value)
+}
+fn register_endpoint(value:&mut Value,hosts:&mut serde_json::Map<String,Value>){
+    if let Some(addresses)=value.as_object_mut().and_then(|v|v.remove("_lemonvpn_addresses")){
+        let alias=format!("endpoint-{}.invalid",crate::sha256::hex(addresses.to_string().as_bytes()));
+        hosts.insert(alias.clone(),addresses);value["server"]=alias.into();
+    }
 }
 
 fn listener_rendered(rendered: Option<Value>) -> io::Result<u16> {
@@ -193,6 +220,8 @@ fn listener_rendered(rendered: Option<Value>) -> io::Result<u16> {
         *guard = Some(Backend {
             process,
             entries,
+            used: BTreeMap::new(),
+            collected: Instant::now(),
             direct_port,
             uplink,
             ipv6,
@@ -217,11 +246,16 @@ fn listener_rendered(rendered: Option<Value>) -> io::Result<u16> {
         return Ok(backend.direct_port);
     };
     if let Some((_, port)) = backend.entries.get(&key) {
+        backend.used.insert(key.clone(),Instant::now());
         return Ok(*port);
+    }
+    if let Err(error)=collect_entries(backend,backend.entries.len()>=1024){
+        if backend.entries.len()>=1024{return Err(error)}
+        crate::logs::warn("engine::protocols","空闲配置回收暂未完成，保留原配置。",None);
     }
     if backend.entries.len() >= 1024 {
         return Err(io::Error::other(
-            "活动协议配置超过 1024 项，请重启引擎释放旧配置",
+            "同时使用的协议配置已达 1024 项，请稍后重试",
         ));
     }
     let port = managed::free_port()?;
@@ -229,11 +263,33 @@ fn listener_rendered(rendered: Option<Value>) -> io::Result<u16> {
         .entries
         .insert(key.clone(), (rendered.unwrap(), port));
     let payload = base_config(&backend.entries, backend.direct_port, &backend.uplink, backend.ipv6);
-    if let Err(error) = backend.process.configure(payload) {
+    if let Err(error) = backend.process.configure_incremental(payload) {
         backend.entries.remove(&key);
         return Err(error);
     }
+    backend.used.insert(key,Instant::now());
     Ok(port)
+}
+
+/// Only retire idle listeners absent from the core's TCP/UDP tracker snapshot.
+/// A grace period also covers handshakes not yet visible to that tracker.
+fn collect_entries(backend:&mut Backend,force:bool)->io::Result<()> {
+    if backend.entries.is_empty() || (!force && backend.collected.elapsed()<Duration::from_secs(60)){return Ok(())}
+    backend.collected=Instant::now();
+    let text=backend.process.request("GET","/connections",None)?;
+    let snapshot:Value=serde_json::from_str(&text).map_err(io::Error::other)?;
+    let rows=snapshot["connections"].as_array().ok_or_else(||io::Error::other("内核连接快照无效，保留协议配置"))?;
+    let active=rows.iter().filter_map(|v|v["chains"].as_array()).flatten().filter_map(Value::as_str).collect::<std::collections::HashSet<_>>();
+    let leases=UDP_LEASES.lock().unwrap_or_else(|p|p.into_inner());
+    let remove=backend.entries.keys().filter(|key|!leases.contains_key(&backend.entries[*key].1) && backend.used.get(*key).is_some_and(|at|at.elapsed()>Duration::from_secs(120)) && !active.contains(format!("node-{key}").as_str()) && !active.iter().any(|name|name.starts_with(&format!("hop-{key}-")))).cloned().collect::<Vec<_>>();
+    drop(leases);
+    if remove.is_empty(){return Ok(())}
+    let old=backend.entries.clone();
+    for key in &remove{backend.entries.remove(key);}
+    if let Err(error)=backend.process.configure_incremental(base_config(&backend.entries,backend.direct_port,&backend.uplink,backend.ipv6)){backend.entries=old;return Err(error)}
+    for key in &remove{backend.used.remove(key);}
+    crate::logs::info("engine::protocols","已回收空闲协议配置。",Some(crate::logs::fields(&[("released",&remove.len().to_string())])));
+    Ok(())
 }
 
 fn control(
@@ -242,12 +298,13 @@ fn control(
     host: &str,
     target_port: u16,
 ) -> io::Result<(TcpStream, SocketAddr)> {
-    let mut stream = TcpStream::connect_timeout(
+    let budget=crate::io_budget::Budget::new(Duration::from_secs(12));
+    let _scope=budget.enter();
+    let stream = TcpStream::connect_timeout(
         &SocketAddr::from(([127, 0, 0, 1], port)),
-        Duration::from_secs(3),
+        crate::io_budget::remaining(Duration::from_secs(3))?,
     )?;
-    stream.set_read_timeout(Some(Duration::from_secs(12)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(12)))?;
+    let mut stream=crate::io_budget::Stream(stream);
     stream.write_all(&[5, 1, 0])?;
     let mut method = [0; 2];
     stream.read_exact(&mut method)?;
@@ -266,9 +323,9 @@ fn control(
         )));
     }
     let address = read_address(&mut stream, head[3])?;
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
-    Ok((stream, address))
+    stream.0.set_read_timeout(None)?;
+    stream.0.set_write_timeout(None)?;
+    Ok((stream.0, address))
 }
 
 fn endpoint_addresses(host: &str) -> io::Result<Vec<String>> {
@@ -291,7 +348,9 @@ pub(crate) fn connect(
         if let Some(node) = node {
             let mut last = io::Error::other("节点没有可用地址");
             for endpoint in endpoint_addresses(address.unwrap_or(&node.host))? {
-                let result = listener(Some(node),Some(&endpoint)).and_then(|p|control(p,1,host,port));
+                let mut endpoints=endpoint_addresses(address.unwrap_or(&node.host))?;
+                endpoints.retain(|a|a!=&endpoint);endpoints.insert(0,endpoint);
+                let result = render_endpoints(node,endpoints).and_then(|v|listener_rendered(Some(v))).and_then(|p|control(p,1,host,port));
                 match result { Ok((stream,_))=>return Ok(stream),Err(e)=>last=e }
             }
             return Err(last);
@@ -309,11 +368,13 @@ fn chain_listener_at(nodes: &[config::Node], network: &str, endpoint:Option<&str
     if let Some(error) = chain_error(nodes, network) {
         return Err(io::Error::new(io::ErrorKind::Unsupported, error));
     }
-    let mut proxies: Vec<_> = nodes.iter().map(|node|render_node(node,None)).collect::<io::Result<_>>()?;
-    for(proxy,node)in proxies.iter_mut().zip(nodes){proxy["server"]=endpoint_addresses(&node.host)?[0].clone().into();}
-    if managed::egress_families().is_some() {
-        proxies[0]["server"] = endpoint.map(str::to_owned).map(Ok).unwrap_or_else(||endpoint_addresses(&nodes[0].host).map(|a|a[0].clone()))?.into();
-    }
+    let proxies: Vec<_> = nodes.iter().enumerate().map(|(index,node)|{
+        let mut addresses=endpoint_addresses(&node.host)?;
+        if index==0 {if let Some(endpoint)=endpoint {addresses.retain(|a|a!=endpoint);addresses.insert(0,endpoint.into());}}
+        // Only the first hop is physically dialed here. Later hops must use a
+        // real address: upstream proxy protocols may resolve their target remotely.
+        if index==0{render_endpoints(node,addresses)}else{render_node(node,Some(&addresses[0]))}
+    }).collect::<io::Result<_>>()?;
     listener_rendered(Some(Value::Array(proxies)))
 }
 
@@ -371,19 +432,23 @@ pub(crate) fn chain_error(nodes: &[config::Node], network: &str) -> Option<Strin
 }
 
 pub(crate) struct Datagram {
+    _lease:UdpLease,
     control: TcpStream,
     socket: UdpSocket,
     host: String,
     port: u16,
     policy_node: Option<config::Node>,
+    policy_chain: Vec<config::Node>,
     first_reply: AtomicBool,
     opened_at: Instant,
 }
 impl Datagram {
     pub(crate) fn open(decision: &config::Decision, host: &str, port: u16) -> io::Result<Self> {
+        if let config::Target::Chain{nodes,..}=&decision.target{if !crate::group_policy::chain_ready(nodes,"udp",true){return Err(io::Error::new(io::ErrorKind::NotConnected,"UDP 链路处于失败退避期"));}}
         let started = Instant::now();
         let result = Self::open_inner(decision, host, port);
-        if result.is_err() {
+        if result.is_err() && !crate::io_budget::cancelled() {
+            if let config::Target::Chain{nodes,..}=&decision.target{crate::group_policy::chain_result(nodes,"udp",false);}
             if let config::Target::Node(node) = &decision.target {
                 crate::group_policy::dial_result(node, "udp", false, started.elapsed());
             }
@@ -402,7 +467,8 @@ impl Datagram {
             config::Target::Direct => None,
             config::Target::Node(node) => Some(node.as_ref()),
             config::Target::Chain { nodes, .. } => {
-                return Self::open_port(chain_listener(nodes, "udp")?, None, host, port)
+                let mut relay=Self::open_port(chain_listener(nodes, "udp")?, None, host, port)?;
+                relay.policy_chain=nodes.clone();return Ok(relay)
             }
         };
         Self::open_target(node, None, host, port)
@@ -452,11 +518,13 @@ impl Datagram {
         socket.set_nonblocking(true)?;
         control.set_nonblocking(true)?;
         Ok(Self {
+            _lease:UdpLease::new(listener),
             control,
             socket,
             host: host.to_owned(),
             port,
             policy_node: node.cloned(),
+            policy_chain: Vec::new(),
             first_reply: AtomicBool::new(false),
             opened_at: Instant::now(),
         })
@@ -466,6 +534,7 @@ impl Datagram {
         match self.control.peek(&mut byte) {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             _ => {
+                if !self.policy_chain.is_empty()&&!crate::runtime::stopping(){crate::group_policy::chain_result(&self.policy_chain,"udp",false);}
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
                     "UDP 中继已关闭",
@@ -481,6 +550,7 @@ impl Datagram {
         let size = self.socket.recv(buffer)?;
         let (host, port, offset) = parse_datagram(&buffer[..size])?;
         if !self.first_reply.swap(true, Ordering::Relaxed) {
+            if !self.policy_chain.is_empty(){crate::group_policy::chain_result(&self.policy_chain,"udp",true);}
             if let Some(node) = &self.policy_node {
                 crate::group_policy::dial_result(node, "udp", true, self.opened_at.elapsed());
             }
@@ -599,6 +669,7 @@ pub(crate) fn bridge_process(
 pub(crate) fn refresh_tun_processes() {
     // Query accepted configuration before acquiring the bridge lock (fixed lock order).
     let names = remember_process_names();
+    for slot in [&BACKEND,&BACKEND_V6] {if let Ok(mut guard)=slot.try_lock(){if let Some(backend)=guard.as_mut(){let _=collect_entries(backend,false);}}}
     if !HOT_PENDING.swap(false, Ordering::AcqRel) {
         return;
     }
@@ -747,9 +818,9 @@ fn render_node(node: &config::Node, address: Option<&str>) -> io::Result<Value> 
     result.as_object_mut().unwrap().remove("interface-name");
     result.as_object_mut().unwrap().remove("routing-mark");
     if result.get("tls").and_then(Value::as_bool) == Some(true)
-        || matches!(node.protocol.as_str(), "trojan" | "hysteria2" | "tuic")
+        || matches!(node.protocol.as_str(), "trojan" | "hysteria" | "hysteria2" | "tuic")
     {
-        let sni_key = if matches!(node.protocol.as_str(), "hysteria2" | "tuic") {
+        let sni_key = if matches!(node.protocol.as_str(), "hysteria" | "hysteria2" | "tuic") {
             "sni"
         } else {
             "servername"

@@ -227,12 +227,17 @@ impl CoreProcess {
         api(self.api_port, &self.secret, method, path, body)
     }
     /// Reloads must retain the private controller and its authentication.
-    pub fn configure(&self, mut config: Value) -> io::Result<()> {
+    pub fn configure(&self, config: Value) -> io::Result<()> {
+        self.configure_with_force(config,true)
+    }
+    /// Preserve identical listeners while changing the protocol roster.
+    pub fn configure_incremental(&self,config:Value)->io::Result<()>{self.configure_with_force(config,false)}
+    fn configure_with_force(&self, mut config: Value, force:bool) -> io::Result<()> {
         config["external-controller"] = format!("127.0.0.1:{}", self.api_port).into();
         config["secret"] = self.secret.clone().into();
         self.request(
             "PUT",
-            "/configs?force=true",
+            if force {"/configs?force=true"} else {"/configs?force=false"},
             Some(&serde_json::json!({"payload":config.to_string()})),
         )?;
         self.persistent_dns.store(

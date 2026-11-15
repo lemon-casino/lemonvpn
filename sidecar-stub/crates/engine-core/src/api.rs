@@ -109,8 +109,9 @@ pub fn handle(
             };
         }
         ("DELETE", "/api/v1/dns/wire-cache") => {
-            let request:serde_json::Value=serde_json::from_str(&body).unwrap_or_default();
-            let removed=if let Some(name)=request["domain"].as_str(){crate::dns_wire_cache::remove_name(name)}else{let count=crate::dns_wire_cache::statistics()["entries"].as_u64().unwrap_or(0) as usize;match crate::dns::flush_all(){Ok(_)=>{},Err(e)=>return error(&mut client,503,"dns_cache_partial_failure",&e.to_string(),cors)};count};
+            let request:serde_json::Value=match serde_json::from_str(&body){Ok(v)=>v,Err(_)=>return error(&mut client,400,"invalid_request","请求须为 JSON 对象",cors)};
+            if !request.is_object() || !request.get("domain").is_some_and(|v|v.is_null()||v.is_string()){return error(&mut client,422,"invalid_request","domain 须为域名；清空全部须显式传入 null",cors);}
+            let removed=if let Some(name)=request["domain"].as_str(){match crate::dns::delete_wire_name(name){Ok(n)=>n,Err(e)=>return error(&mut client,422,"invalid_domain",&e.to_string(),cors)}}else{let count=crate::dns_wire_cache::statistics()["entries"].as_u64().unwrap_or(0) as usize;match crate::dns::flush_all(){Ok(_)=>{},Err(e)=>return error(&mut client,503,"dns_cache_partial_failure",&e.to_string(),cors)};count};
             return http::respond_with(&mut client,200,&serde_json::json!({"removed":removed}).to_string(),&format!("{CACHE_HEADERS}{cors}"));
         }
         ("POST", "/api/v1/dns/wire-cache/fakeip/flush") => {

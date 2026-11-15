@@ -6,6 +6,7 @@
 //! There is currently one configuration and platform backend per process.
 
 mod api;
+mod admission;
 mod base64;
 mod compat;
 mod config;
@@ -13,6 +14,8 @@ mod connections;
 mod control;
 mod crypto;
 mod dns;
+mod dial;
+mod io_budget;
 mod dns_settings;
 mod dns_server;
 mod dns_transport;
